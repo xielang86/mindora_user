@@ -51,19 +51,19 @@ class QueryProfileRequest:
 
 @dataclass
 class UpdateProfileRequest:
-  uid: str
   action: str = "update_profile"
-  uid_emb: List[float] = field(default_factory=list)
-  long_term_profile: List[Tuple[str, float]] = field(default_factory=list)
-  behaviors: Dict[str, List[Tuple[int, Any]]] = field(default_factory = dict)
+  user_profile: UserProfile = field(default_factory=UserProfile)
 
   def to_dict(self) -> Dict[str, Any]:
     return asdict(self)
 
   @staticmethod
   def from_dict(data: Dict[str, Any]) -> 'UpdateProfileRequest':
-    return UpdateProfileRequest(uid=data["uid"], behaviors=data["behaviors"], long_term_profile=data["long_term_profile"])
-    
+    user_profile = UserProfile.from_dict(data["user_profile"])
+    return UpdateProfileRequest(
+      action=data.get("action", "update_profile"),  # 兼容可能的 action 字段
+      user_profile=user_profile
+    )
 # --- 响应类 ---
 
 @dataclass

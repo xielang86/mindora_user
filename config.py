@@ -1,4 +1,5 @@
 class Config:
-  HOST = "localhost"
-  PORT = 9101
-  DB_PATH = "data/level_db"
+  HOST="0.0.0.0"
+  PORT = 9102
+  DB_PATH = "data/userprofile_level_db"
+  MaxServerConcurrent = 32
