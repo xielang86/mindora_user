@@ -112,14 +112,7 @@ class UserServerHttpClient:
     async with ClientSession() as session:
       try:
         # 构造请求数据（仅包含非None的字段）
-        payload = {"uid": user_profile.uid}
-        if user_profile.uid_emb is not None:
-          payload["uid_emb"] = user_profile.uid_emb
-        if user_profile.long_term_profile is not None:
-          payload["long_term_profile"] = user_profile.long_term_profile
-        if user_profile.behaviors is not None:
-          payload["behaviors"] = user_profile.behaviors
-        payload = {"action":"update_profile", "user_profile":payload} 
+        payload = {"action":"update_profile", "user_profile":user_profile.to_dict()} 
         # 发送POST请求
         async with session.post(
           self.update_endpoint,
@@ -136,7 +129,8 @@ class UserServerHttpClient:
         raise Exception(f"更新用户画像失败: {str(e)}") from e
 
 async def http_demo():
-  client = UserServerHttpClient("http://localhost:9102")
+  # client = UserServerHttpClient("http://localhost:9102")
+  client = UserServerHttpClient("http://192.168.0.221:9102")
   try:
     for user_profile in all_profiles:
       update_result = await client.update_user_profile(user_profile)
