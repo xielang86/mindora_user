@@ -115,10 +115,10 @@ async def handle_auth(request: AuthRequest):
     # Here we use email for simplicity.
     if data.email in mock_db["users"]:
       del mock_db["users"][data.email]
-      return AuthResponse(request_type=req_type, code=0, msg="User deleted")
+      return AuthResponse(request_type=AuthRequestType(req_type), code=0, msg="User deleted")
     
     # return AuthResponse(request_type=AuthRequestType(req_type), code=1, msg="User not found")
-    return AuthResponse(request_type=req_type, code=0, msg="User deleted")
+    return AuthResponse(request_type=AuthRequestType(req_type), code=0, msg="User deleted")
 
   raise HTTPException(status_code=400, detail="Unsupported request type")
 
