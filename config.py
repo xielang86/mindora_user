@@ -3,3 +3,4 @@ class Config:
   PORT = 9102
   DB_PATH = "data/userprofile_level_db"
   MaxServerConcurrent = 32
+  Mode = 0

@@ -1,22 +1,23 @@
 import asyncio
 import json
 import logging
-from typing import Dict, Any, Optional
-from datetime import datetime
+from typing import Optional
 import websockets
 from aiohttp import web
-import plyvel  # LevelDB的Python绑定
+import plyvel
 from user_profile import UserProfile
 from config import Config
 from common import util
 from user_profile import (
-  UserProfile, QueryProfileRequest, UpdateProfileRequest,
-  QueryProfileResponse, UpdateProfileResponse, ErrorResponse, BaseResponse
+  UserProfile, QueryProfileRequest, LoginRequest, UpdateProfileRequest,
+  QueryProfileResponse, UpdateProfileResponse, LoginResponse, ErrorResponse, BaseResponse
 )
+
+from uid.uuid import get_or_create_uuid, generate_user_uuid
 import logger
 
 # all bloking sync api
-class UserServ:
+class UserProfileServ:
   MAX_BEHAVIOR_LEN = 1024
   def __init__(self):
     # 初始化LevelDB（若路径不存在则自动创建）
@@ -52,7 +53,7 @@ class UserServ:
       else:
         old_behaviors[behavior_type] = values
 
-      if len(old_behaviors[behavior_type]) > UserServ.MAX_BEHAVIOR_LEN:
+      if len(old_behaviors[behavior_type]) > UserProfileServ.MAX_BEHAVIOR_LEN:
         old_behaviors[behavior_type] = old_behaviors[behavior_type][len(old_behaviors) - UserServer.MAX_BEHAVIOR_LEN:]
 
     logging.info(f"after update {old_behaviors}")
@@ -83,6 +84,16 @@ class UserServ:
     logging.info(f"Behavior data for uid '{new_profile.uid}' updated")
     return True
   
+  def insert_new_user(self, uid: str) -> bool:
+    profile = self.get_profile(uid)
+    if profile is not None:
+      logging.warning(f"dedup uid: {uid}")
+      return False
+    
+    empty_profile = UserProfile(uid=uid)
+    self.update_profile(empty_profile)
+    return True
+  
   def close(self):
     self.db.close()
 
@@ -91,8 +102,11 @@ class UserServer:
     server_semaphore = asyncio.Semaphore(Config.MaxServerConcurrent)
     self.host = Config.HOST
     self.port = Config.PORT
-    self.user_serv = UserServ()
+    self.user_serv = UserProfileServ()
     self.app = web.Application()
+    self.active_uid = ""
+    self.system_uid = get_or_create_uuid()
+
     self.setup_routes()
 
   def close(self):
@@ -102,6 +116,7 @@ class UserServer:
     """设置HTTP路由"""
     self.app.router.add_post('/query_profile', self.handle_query_profile_http)
     self.app.router.add_post('/update_profile', self.handle_update_profile_http)
+    self.app.router.add_post('/login', self.handle_login_http)
 
   def handle_query_profile(self, request: QueryProfileRequest) -> BaseResponse:
     """查询用户画像（从LevelDB按需读取）"""
@@ -120,6 +135,25 @@ class UserServer:
       return UpdateProfileResponse(status="success", message=f"Behavior data for req '{request}' updated")
     else:
       return ErrorResponse(status="error", message=f"invalid reqest")
+
+
+  def handle_login(self, request: LoginRequest) -> BaseResponse:
+    uuid = request.uuid
+    if uuid is None or len(uuid) < 2:
+      if request.email is None or len(request.email) < 7:
+        logging.error("empty login/register request")
+      else:  # register new email
+        uid = generate_user_uuid(self.system_uid, request.email)
+        if not self.user_serv.insert_new_user(uid):
+          # we must let it happend, for user may change they phone, then need to use email to login again
+          logging.warning(f"user:{request.email} has been registered already")
+
+        return LoginResponse(status="success", message=f"succ login for '{request.email}'", uuid = self.active_uid)
+    else:
+      self.active_uid = request.uuid
+      return LoginResponse(status="success", message=f"succ login", uuid = self.active_uid)
+
+    return ErrorResponse(status="error", message=f"invalid reqest")
 
   async def handle_request(self, websocket, path=None):
     try:
@@ -146,34 +180,45 @@ class UserServer:
       logging.error("Connection closed.")
 
   async def handle_query_profile_http(self, request: web.Request) -> web.Response:
-      try:
-          data = await request.json()
-          req = QueryProfileRequest.from_dict(data)
-          response_obj = self.handle_query_profile(req)
-      except (json.JSONDecodeError, TypeError, KeyError) as e:
-          response_obj = ErrorResponse(message=f"Invalid request format: {e}")
-      
-      return web.json_response(response_obj.to_dict())
+    try:
+      data = await request.json()
+      req = QueryProfileRequest.from_dict(data)
+      response_obj = self.handle_query_profile(req)
+    except (json.JSONDecodeError, TypeError, KeyError) as e:
+      response_obj = ErrorResponse(message=f"Invalid request format: {e}")
+    
+    return web.json_response(response_obj.to_dict())
 
   async def handle_update_profile_http(self, request: web.Request) -> web.Response:
-      try:
-          data = await request.json()
-          req = UpdateProfileRequest.from_dict(data)
-          response_obj = self.handle_update_profile(req)
-      except (json.JSONDecodeError, TypeError, KeyError) as e:
-          response_obj = ErrorResponse(message=f"Invalid request format: {e}")
-      
-      return web.json_response(response_obj.to_dict())
+    try:
+      data = await request.json()
+      req = UpdateProfileRequest.from_dict(data)
+      response_obj = self.handle_update_profile(req)
+    except (json.JSONDecodeError, TypeError, KeyError) as e:
+      response_obj = ErrorResponse(message=f"Invalid request format: {e}")
+    
+   
+    return web.json_response(response_obj.to_dict())
+
+  async def handle_login_http(self, request: web.Request) -> web.Response:
+    try:
+      data = await request.json()
+      req = LoginRequest.from_dict(data)
+      response_obj = self.handle_login(req)
+    except (json.JSONDecodeError, TypeError, KeyError) as e:
+      response_obj = ErrorResponse(message=f"Invalid request format: {e}")
+    
+    return web.json_response(response_obj.to_dict())
 
   async def start_http(self):
-      """启动HTTP服务器"""
-      runner = web.AppRunner(self.app)
-      await runner.setup()
-      site = web.TCPSite(runner, self.host, self.port)
-      await site.start()
-      logging.info(f"UserServer (LevelDB) started on http://{self.host}:{self.port}")
-      # 保持服务运行
-      await asyncio.Event().wait()
+    """启动HTTP服务器"""
+    runner = web.AppRunner(self.app)
+    await runner.setup()
+    site = web.TCPSite(runner, self.host, self.port)
+    await site.start()
+    logging.info(f"UserServer (LevelDB) started on http://{self.host}:{self.port}")
+    # 保持服务运行
+    await asyncio.Event().wait()
 
   async def start(self):
     async with websockets.serve(self.handle_request, self.host, self.port):
