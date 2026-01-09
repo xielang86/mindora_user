@@ -110,7 +110,7 @@ async def handle_auth(request: AuthRequest):
     )
 
   # 4. DELETE USER
-  elif req_type == AuthRequestType.DELETE:
+  elif req_type == AuthRequestType.DELETE_USER:
     # For security, delete usually requires email or valid JWT. 
     # Here we use email for simplicity.
     if data.email in mock_db["users"]:
