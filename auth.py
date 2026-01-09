@@ -17,7 +17,7 @@ class AuthRequestType(str, Enum):
   SEND_VERIFY_CODE = "send_verify_code"  # 发送验证码
   LOGIN_WITH_EMAIL_VERIFY_CODE = "login_with_email_verify_code"   # email+验证码登录
   LOGIN_WITH_JWT = "login_with_jwt"      # JWT令牌登录: cloud & mindora
-  DELETE = "delete_user"
+  DELETE_USER = "delete_user"
 
 class AuthData(BaseModel):
   """autho data model（merge send verify_code /login with email verify code/JWT login）- Pydantic v2"""
@@ -116,7 +116,7 @@ class AuthRequest(BaseModel):
         )
 
     # 场景3：JWT登录（login_with_jwt）
-    elif req_type == AuthRequestType.LOGIN_WITH_JWT or req_type == AuthRequestType.DELETE:
+    elif req_type == AuthRequestType.LOGIN_WITH_JWT or req_type == AuthRequestType.DELETE_USER:
       if data.jwt_token is None:
         raise ValueError(
           f"request_type={req_type}时，data.jwt_token必填"
