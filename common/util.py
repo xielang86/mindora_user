@@ -19,3 +19,10 @@ def merge_two_sorted(a, b):
   merged.extend(a[i:])
   merged.extend(b[j:]) 
   return merged
+
+
+def normalize_email(email: str) -> str:
+  """邮箱标准化：转小写+去首尾空格"""
+  if not email:
+    raise ValueError("邮箱不能为空")
+  return email.strip().lower()

@@ -3,19 +3,12 @@ import os
 import typing, logging
 from cryptography.fernet import Fernet, InvalidToken
 import hashlib
-
+from common.util import normalize_email
 # -------------------------- 配置项（可自定义） --------------------------
 # 加密文件路径（存储uuid1的加密内容）
 UUID_ENCRYPT_FILE = "uuid_mac_time.enc"
 # Fernet加密密钥（可自行生成替换，生成方法见下方说明）
 ENCRYPT_KEY = b'scHtsUOJBon6_RHMOIbkDDx_EDObXiPh8AUMV1c7ch4='  # 需是32位base64编码字符串
-
-# ------------------- 工具函数：邮箱标准化+UID生成 -------------------
-def normalize_email(email: str) -> str:
-  """邮箱标准化：转小写+去首尾空格"""
-  if not email:
-    raise ValueError("邮箱不能为空")
-  return email.strip().lower()
 
 
 def generate_uid_and_salt(email: str) -> tuple[str, str]:
