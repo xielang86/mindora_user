@@ -10,7 +10,25 @@ from pydantic import (
 )
 from uuid import UUID
 from enum import Enum
-import datetime
+from datetime import datetime
+
+class UserData(BaseModel):
+  # 核心字段：与MySQL字段名一致，指定类型
+  uid: str
+  email: str
+  salt: str
+  # 可选字段：MySQL中允许为空/有默认值的字段
+  status: Optional[int] = Field(default=1)  # 默认值匹配MySQL的DEFAULT 1
+  device_list: str
+  # 时间字段：自动将MySQL返回的字符串/ datetime 对象转为 datetime 类型
+  register_time: datetime
+  update_time: Optional[datetime] = None
+
+  # 【可选】字段名映射（若MySQL是下划线，想返回驼峰JSON）
+  model_config = {
+      "alias_generator": lambda x: x.replace("_", " ").title().replace(" ", ""),  # 下划线转驼峰
+      "populate_by_name": True  # 允许通过原字段名（如register_time）赋值
+  }
 
 # 定义请求类型枚举（区分不同操作）
 class AuthRequestType(str, Enum):
@@ -135,7 +153,7 @@ class AuthRequest(BaseModel):
     if v is not None:
       if not isinstance(v, int) or v <= 0:
         raise ValueError("timestamp must be positive number in secs")
-      current_ts = int(datetime.datetime.now().timestamp())
+      current_ts = int(datetime.now().timestamp())
       if v > current_ts + 120 or v < current_ts - 120:
         raise ValueError(f"timestamp eror; currrent timestamp：{current_ts} and v = {v}）")
     return v
@@ -240,7 +258,7 @@ class AuthResponse(BaseModel):
   )
 
 def test_request(): 
-  ts = int(datetime.datetime.now().timestamp())
+  ts = int(datetime.now().timestamp())
   # 测试1：合法场景 - send_verify_code（email+device_id必填）
   valid_send_code = {
     "request_type": "send_verify_code",
