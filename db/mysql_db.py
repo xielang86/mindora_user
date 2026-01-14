@@ -147,15 +147,16 @@ def insert_or_restore_user(email: str, uid: str, salt: str, device_list: str) ->
   try:
     # 4. 执行SQL并判断结果
     row_count = mysql_db.execute(sql, params)
+    logging.info(f"insert row count = {row_count}")
     # row_count=1 → 新插入；row_count=2 → 冲突后更新（仅软删除用户会真更新）
     if row_count == 1:
       return {"code": 0, "msg": "新用户创建成功", "data": {"uid": uid}}
     elif row_count == 2:
       # 检查用户当前状态，判断是“恢复账号”还是“账号已存在”
-      user = get_user_by_email_or_uid(uid)
-      if user["status"] == 1:
+      user = get_user_by_email_or_uid(uid=uid)
+      if user.status == 1:
         # 说明是正常用户冲突，未执行任何更新
-        return {"code": 401, "msg": "账号已存在（正常状态），未执行更新", "data": {"uid": uid}}
+        return {"code": 200, "msg": "账号已存在（正常状态），未执行更新", "data": {"uid": uid}}
       else:
         return {"code": 0, "msg": "软删除账号已恢复", "data": {"uid": uid}}
     else:

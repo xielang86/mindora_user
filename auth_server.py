@@ -50,10 +50,6 @@ def send_verify_code_handler(data: AuthData):
     verify_code = generate_verify_code(4)
     set_verify_code(email=data.email, device_id=data.device_id, code=verify_code, expire_seconds=VERIFY_CODE_EXPIRE_SECONDS)
     status_data = send_verify_code_via_163(MY_163_EMAIL, MY_163_AUTH_CODE, data.email, verify_code)
-    status_data = {
-        "code": 0,
-        "msg": "dummy code 1234"
-    }
     resp.code = status_data.get("code")
     resp.msg = status_data.get("msg")
     resp.data = None
