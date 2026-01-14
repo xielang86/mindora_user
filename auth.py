@@ -9,7 +9,7 @@ from pydantic import (
     ValidationError
 )
 from uuid import UUID
-from enum import Enum
+from enum import Enum,StrEnum
 from datetime import datetime
 
 class UserData(BaseModel):
@@ -31,11 +31,14 @@ class UserData(BaseModel):
   }
 
 # 定义请求类型枚举（区分不同操作）
-class AuthRequestType(str, Enum):
+class AuthRequestType(StrEnum):
   SEND_VERIFY_CODE = "send_verify_code"  # 发送验证码
   LOGIN_WITH_EMAIL_VERIFY_CODE = "login_with_email_verify_code"   # email+验证码登录
   LOGIN_WITH_JWT = "login_with_jwt"      # JWT令牌登录: cloud & mindora
   DELETE_USER = "delete_user"
+
+  def __str__(self):
+    return self.value
 
 class AuthData(BaseModel):
   """autho data model（merge send verify_code /login with email verify code/JWT login）- Pydantic v2"""
@@ -140,10 +143,10 @@ class AuthRequest(BaseModel):
           f"request_type={req_type}时，data.jwt_token必填"
         )
       # 该场景下，email/device_id/verify_code必须为None
-      if data.email is not None or data.device_id is not None or data.verify_code is not None:
-        raise ValueError(
-          f"request_type={req_type}时，data.email/data.device_id/data.verify_code必须为None"
-        )
+      # if data.email is not None or data.device_id is not None or data.verify_code is not None:
+      #   raise ValueError(
+      #     f"request_type={req_type}时，data.email/data.device_id/data.verify_code必须为None"
+      #   )
 
     return self
 
@@ -237,7 +240,8 @@ class JWTTokenData(BaseModel):
 class AuthResponse(BaseModel):
   """auth request model（merge send verify_code /email login/JWT login）- Pydantic v2"""
   # 核心：请求类型，用于区分不同操作
-  request_type: AuthRequestType = Field(..., description="认证请求类型：send_verify_code/login_with_email_verify_code/login_with_jwt")
+  # request_type: AuthRequestType = Field(..., description="认证请求类型：send_verify_code/login_with_email_verify_code/login_with_jwt")
+  request_type: str = Field(..., description="认证请求类型：send_verify_code/login_with_email_verify_code/login_with_jwt")
   code: int = Field(0, description="响应状态码：0=成功，1： 验证码错误/过期,2： jwt token 过期,3 : 请求发送过于频繁")
   # 响应提示信息（默认空字符串）
   msg: str = Field("", description="响应提示信息")
@@ -254,7 +258,7 @@ class AuthResponse(BaseModel):
   model_config = ConfigDict(
     strict=True,        # 严格类型检查（如int不能自动转str）
     extra="forbid",     # 禁止传入模型未定义的字段
-    use_enum_values=False # 保留枚举对象，而非字符串值（便于判断）
+    use_enum_values=True# 保留枚举对象，而非字符串值（便于判断）
   )
 
 def test_request(): 
