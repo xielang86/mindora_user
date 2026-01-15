@@ -15,6 +15,8 @@ from common.util import normalize_email
 from uid.uuid import generate_uid_and_salt
 import logger
 
+logger.init_log("auth_logs")
+
 app = FastAPI(title="Auth Server")
 
 

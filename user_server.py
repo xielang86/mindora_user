@@ -13,12 +13,15 @@ from config import Config
 from common import util
 from user_profile import (
   UserProfile, QueryProfileRequest, UpdateProfileRequest,
-  QueryProfileResponse, UpdateProfileResponse, BaseResponse, BaseResponse
+  QueryProfileResponse, UpdateProfileResponse, BaseResponse,
+  InvalidOrExpiredTokenResp, InvalidReqFormatResp
 )
 from auth import AuthRequest
 
 from uid.uuid import get_or_create_uuid
 import logger
+
+logger.init_log("user_server_logs")
 
 # all bloking sync api
 class UserProfileServ:
@@ -121,9 +124,31 @@ class UserServer:
     self.app.router.add_post('/update_profile', self.handle_update_profile_http)
     self.app.router.add_post('/login', self.handle_login_http)
 
+  def check_token(self, jwt_token: str)-> dict | None:
+    try:
+      payload = jwt.decode(jwt_token, JWT_SECRET_KEY, algorithms=Config.ALGORITHM)
+    except jwt.ExpiredSignatureError:
+      logging.error("login token expired")
+      return None
+    except jwt.InvalidTokenError:
+      logging.error("login token invalid")
+      return None
+    return payload
+    
   def handle_query_profile(self, request: QueryProfileRequest) -> BaseResponse:
     """查询用户画像（从LevelDB按需读取）"""
-    uid = request.uid
+    logging.info(f"req: {request}")
+    uid = None
+    if request.jwt_token is not None:
+      payload = self.check_token(request.jwt_token)
+      if payload is None:
+        return InvalidOrExpiredTokenResp()
+      uid = payload.get("uid")
+    elif request.uid is not None:
+      uid = request.uid
+    else:
+      return InvalidOrExpiredTokenResp()
+
     profile = self.user_serv.get_profile(uid)
     if profile:
       return QueryProfileResponse(code=0, profile=profile)
@@ -134,21 +159,31 @@ class UserServer:
     # incr update the behaviors by time, and update long term weight
   def handle_update_profile(self, request: UpdateProfileRequest) -> BaseResponse:
     """写入用户行为（仅更新单个用户数据）"""
+    uid = None
+    if request.jwt_token is not None:
+      payload = self.check_token(request.jwt_token)
+      if payload is None:
+        return InvalidOrExpiredTokenResp()
+      uid = payload.get("uid")
+    elif request.user_profile.uid is None:
+      return InvalidOrExpiredTokenResp()
+
+    if uid is not None:
+      request.user_profile.uid = uid
+
     succ = self.user_serv.update_profile(request.user_profile)
     if succ:
       return UpdateProfileResponse(code=0, message=f"Behavior data for req '{request}' updated")
     else:
-      return BaseResponse(code=401, message=f"invalid reqest")
+      return BaseResponse(code=500, message=f"update profile failed")
 
   def handle_login(self, request: AuthRequest) -> BaseResponse:
     if request.data is None or request.data.jwt_token is None:
-      return BaseResponse(code=401, message=f"login data is None, jwt token must be right")
-    try:
-      payload = jwt.decode(request.data.jwt_token, JWT_SECRET_KEY, algorithms=Config.ALGORITHM)
-    except jwt.ExpiredSignatureError:
-      return BaseResponse(code=401, message=f"login token expired")
-    except jwt.InvalidTokenError:
-      return BaseResponse(code=401, message=f"token invalid")
+      return InvalidReqFormatResp()
+
+    payload = self.check_token(request.data.jwt_token)
+    if payload is None:
+      return InvalidOrExpiredTokenResp()
 
     uid = payload.get("uid")
     self.active_uid = uid
@@ -181,10 +216,12 @@ class UserServer:
   async def handle_query_profile_http(self, request: web.Request) -> web.Response:
     try:
       data = await request.json()
+      logging.info(f"req {data}")
       req = QueryProfileRequest.model_validate(data)
       response_obj = self.handle_query_profile(req)
     except (json.JSONDecodeError, TypeError, KeyError) as e:
-      response_obj = BaseResponse(code=400, message=f"Invalid request format: {e}")
+      logging.error(f"excpetion:{e}")
+      response_obj = InvalidReqFormatResp()
     logging.info(f"query profile result: {response_obj}")
     return web.json_response(status = get_http_status(response_obj), data=response_obj.model_dump())
 
@@ -194,7 +231,7 @@ class UserServer:
       req = UpdateProfileRequest.model_validate(data)
       response_obj = self.handle_update_profile(req)
     except (json.JSONDecodeError, TypeError, KeyError) as e:
-      response_obj = BaseResponse(code=400, message=f"Invalid request format: {e}")
+      response_obj = InvalidReqFormatResp()
    
     return web.json_response(status = get_http_status(response_obj), data=response_obj.model_dump())
 
@@ -203,10 +240,11 @@ class UserServer:
       data = await request.json()
       response_obj = self.handle_login(data)
     except (json.JSONDecodeError, TypeError, KeyError) as e:
-      response_obj = BaseResponse(code=400, message=f"Invalid request format: {e}")
+      response_obj = InvalidReqFormatResp()
     
     return web.json_response(status=get_http_status(response_obj), data=response_obj.model_dump())
   
+
 
   async def start_http(self):
     """启动HTTP服务器"""
@@ -222,6 +260,7 @@ class UserServer:
     async with websockets.serve(self.handle_request, self.host, self.port):
       logging.info(f"UserServer started on ws://{self.host}:{self.port}")
       await asyncio.Future()  # 持续运行
+
 
 if __name__ == "__main__":
   server = UserServer()

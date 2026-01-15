@@ -9,7 +9,7 @@ async def query_profile(uid: str, server_uri: str):
   async with ClientSession() as session:
     try:
       # 构造请求数据
-      payload = {"uid": uid}
+      payload = {"uid": uid, "action": "query_profile"}
       
       # 发送POST请求
       async with session.post(
