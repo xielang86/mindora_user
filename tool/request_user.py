@@ -22,7 +22,7 @@ async def query_profile(uid: str, server_uri: str):
             
     except ClientResponseError as e:
       # 处理HTTP错误响应
-      error_msg = f"查询失败 [HTTP {e.status}]: {await e.response.text()}"
+      error_msg = f"查询失败 [HTTP {e.status}]: {e.message}"
       raise Exception(error_msg) from e
     except Exception as e:
       raise Exception(f"查询用户画像失败: {str(e)}") from e

@@ -19,7 +19,7 @@ T = TypeVar('T')
 
 class BaseResponse(BaseModel):
   """响应的基类"""
-  status: str
+  code: int = 0
   message: str = ""
 
 
@@ -55,8 +55,3 @@ class QueryProfileResponse(BaseResponse):
 class UpdateProfileResponse(BaseResponse):
   """结构和 BaseResponse 一样"""
   pass
-
-
-class ErrorResponse(BaseResponse):
-  status: str = "error"  # 默认状态为 error
-

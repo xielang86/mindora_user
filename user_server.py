@@ -1,7 +1,10 @@
 import asyncio
 import json
 import logging
+import os
 from typing import Optional
+from dotenv import load_dotenv
+import jwt
 import websockets
 from aiohttp import web
 import plyvel
@@ -9,11 +12,12 @@ from user_profile import UserProfile
 from config import Config
 from common import util
 from user_profile import (
-  UserProfile, QueryProfileRequest, LoginRequest, UpdateProfileRequest,
-  QueryProfileResponse, UpdateProfileResponse, LoginResponse, ErrorResponse, BaseResponse
+  UserProfile, QueryProfileRequest, UpdateProfileRequest,
+  QueryProfileResponse, UpdateProfileResponse, BaseResponse, BaseResponse
 )
+from auth import AuthRequest
 
-from uid.uuid import get_or_create_uuid, generate_user_uuid
+from uid.uuid import get_or_create_uuid
 import logger
 
 # all bloking sync api
@@ -31,13 +35,13 @@ class UserProfileServ:
 
     data = self.db.get(uid.encode('utf-8'))  # LevelDB键值为bytes类型
     if data:
-      return UserProfile.from_dict(json.loads(data.decode('utf-8')))
+      return UserProfile.model_validate(json.loads(data.decode('utf-8')))
     return None
 
   def save_profile(self, profile: UserProfile):
     """将单个用户的画像写入LevelDB"""
     uid = profile.uid
-    data = json.dumps(profile.to_dict()).encode('utf-8')
+    data = json.dumps(profile.model_dump()).encode('utf-8')
     self.db.put(uid.encode('utf-8'), data)
 
   def _merge_profile(self, old_profile, new_profile):
@@ -84,18 +88,17 @@ class UserProfileServ:
     logging.info(f"Behavior data for uid '{new_profile.uid}' updated")
     return True
   
-  def insert_new_user(self, uid: str) -> bool:
-    profile = self.get_profile(uid)
-    if profile is not None:
-      logging.warning(f"dedup uid: {uid}")
-      return False
-    
-    empty_profile = UserProfile(uid=uid)
-    self.update_profile(empty_profile)
-    return True
-  
   def close(self):
     self.db.close()
+
+load_dotenv()
+JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY")
+
+def get_http_status(resp: BaseResponse):
+  status = 200
+  if resp.code != 0:
+    status = resp.code
+  return status
 
 class UserServer:
   def __init__(self):
@@ -123,37 +126,33 @@ class UserServer:
     uid = request.uid
     profile = self.user_serv.get_profile(uid)
     if profile:
-      return QueryProfileResponse(status="success", profile=profile)
+      return QueryProfileResponse(code=0, profile=profile)
     else:
-      return ErrorResponse(status="not_found", message=f"User with uid '{request.uid}' not found")
+      logging.warning(f"{request} not found")
+      return BaseResponse(code=0, message=f"User with uid '{request.uid}' not found")
 
     # incr update the behaviors by time, and update long term weight
   def handle_update_profile(self, request: UpdateProfileRequest) -> BaseResponse:
     """写入用户行为（仅更新单个用户数据）"""
     succ = self.user_serv.update_profile(request.user_profile)
     if succ:
-      return UpdateProfileResponse(status="success", message=f"Behavior data for req '{request}' updated")
+      return UpdateProfileResponse(code=0, message=f"Behavior data for req '{request}' updated")
     else:
-      return ErrorResponse(status="error", message=f"invalid reqest")
+      return BaseResponse(code=401, message=f"invalid reqest")
 
+  def handle_login(self, request: AuthRequest) -> BaseResponse:
+    if request.data is None or request.data.jwt_token is None:
+      return BaseResponse(code=401, message=f"login data is None, jwt token must be right")
+    try:
+      payload = jwt.decode(request.data.jwt_token, JWT_SECRET_KEY, algorithms=Config.ALGORITHM)
+    except jwt.ExpiredSignatureError:
+      return BaseResponse(code=401, message=f"login token expired")
+    except jwt.InvalidTokenError:
+      return BaseResponse(code=401, message=f"token invalid")
 
-  def handle_login(self, request: LoginRequest) -> BaseResponse:
-    uuid = request.uuid
-    if uuid is None or len(uuid) < 2:
-      if request.email is None or len(request.email) < 7:
-        logging.error("empty login/register request")
-      else:  # register new email
-        uid = generate_user_uuid(self.system_uid, request.email)
-        if not self.user_serv.insert_new_user(uid):
-          # we must let it happend, for user may change they phone, then need to use email to login again
-          logging.warning(f"user:{request.email} has been registered already")
-
-        return LoginResponse(status="success", message=f"succ login for '{request.email}'", uuid = self.active_uid)
-    else:
-      self.active_uid = request.uuid
-      return LoginResponse(status="success", message=f"succ login", uuid = self.active_uid)
-
-    return ErrorResponse(status="error", message=f"invalid reqest")
+    uid = payload.get("uid")
+    self.active_uid = uid
+    return BaseResponse(code=0, message="user ativated successufully")
 
   async def handle_request(self, websocket, path=None):
     try:
@@ -164,51 +163,50 @@ class UserServer:
           action = data.get("action")
 
           if action == "query_profile":
-            req = QueryProfileRequest.from_dict(data)
+            req = QueryProfileRequest.model_validate(data)
             response_obj = self.handle_query_profile(req)
           elif action == "update_profile":
-            req = UpdateProfileRequest.from_dict(data)
+            req = UpdateProfileRequest.model_validate(data)
             response_obj = self.handle_update_profile(req)
           else:
-            response_obj = ErrorResponse(message="Invalid action")
+            response_obj = BaseResponse(code=400, message="Invalid action")
 
         except (json.JSONDecodeError, TypeError, KeyError) as e:
-          response_obj = ErrorResponse(message=f"Invalid request format: {e}")
+          response_obj = BaseResponse(code=400, message=f"Invalid request format: {e}")
         
-        await websocket.send(json.dumps(response_obj.to_dict()))
+        await websocket.send(json.dumps(response_obj.model_dump()))
     except websockets.exceptions.ConnectionClosed:
       logging.error("Connection closed.")
 
   async def handle_query_profile_http(self, request: web.Request) -> web.Response:
     try:
       data = await request.json()
-      req = QueryProfileRequest.from_dict(data)
+      req = QueryProfileRequest.model_validate(data)
       response_obj = self.handle_query_profile(req)
     except (json.JSONDecodeError, TypeError, KeyError) as e:
-      response_obj = ErrorResponse(message=f"Invalid request format: {e}")
-    
-    return web.json_response(response_obj.to_dict())
+      response_obj = BaseResponse(code=400, message=f"Invalid request format: {e}")
+    logging.info(f"query profile result: {response_obj}")
+    return web.json_response(status = get_http_status(response_obj), data=response_obj.model_dump())
 
   async def handle_update_profile_http(self, request: web.Request) -> web.Response:
     try:
       data = await request.json()
-      req = UpdateProfileRequest.from_dict(data)
+      req = UpdateProfileRequest.model_validate(data)
       response_obj = self.handle_update_profile(req)
     except (json.JSONDecodeError, TypeError, KeyError) as e:
-      response_obj = ErrorResponse(message=f"Invalid request format: {e}")
-    
+      response_obj = BaseResponse(code=400, message=f"Invalid request format: {e}")
    
-    return web.json_response(response_obj.to_dict())
+    return web.json_response(status = get_http_status(response_obj), data=response_obj.model_dump())
 
   async def handle_login_http(self, request: web.Request) -> web.Response:
     try:
       data = await request.json()
-      req = LoginRequest.from_dict(data)
-      response_obj = self.handle_login(req)
+      response_obj = self.handle_login(data)
     except (json.JSONDecodeError, TypeError, KeyError) as e:
-      response_obj = ErrorResponse(message=f"Invalid request format: {e}")
+      response_obj = BaseResponse(code=400, message=f"Invalid request format: {e}")
     
-    return web.json_response(response_obj.to_dict())
+    return web.json_response(status=get_http_status(response_obj), data=response_obj.model_dump())
+  
 
   async def start_http(self):
     """启动HTTP服务器"""
