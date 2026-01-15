@@ -44,6 +44,8 @@ class UserProfileUpdater:
           "action": "update_profile",
           "user_profile": profile
         }
+        if profile.get("uid") is None or len(profile.get("uid")) < 3:
+          payload["jwt_token"] = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1aWQiOiJkYTRiYzFiNmJhZjBjOGFiMGJlN2E3ZjE1NzE0NGY0Y2EyNzQzNTllNTgzNmM5OTQxYzFjZDQxMjJjMzliNjFhIiwiZW1haWwiOiJ4aWVsYW5ndGNAMTYzLmNvbSIsImV4cCI6MTc2ODUwNzk2Mn0.tGr84Y8tKlUGv8zoHdSX3ys2I64Nti7W5oyXzBN6Wns"
         
         # 发送POST请求
         async with session.post(

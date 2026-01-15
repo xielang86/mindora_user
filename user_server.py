@@ -133,18 +133,19 @@ class UserServer:
     except jwt.InvalidTokenError:
       logging.error("login token invalid")
       return None
+
+    logging.info(f"payload: {payload}")
     return payload
     
   def handle_query_profile(self, request: QueryProfileRequest) -> BaseResponse:
     """查询用户画像（从LevelDB按需读取）"""
-    logging.info(f"req: {request}")
     uid = None
     if request.jwt_token is not None:
       payload = self.check_token(request.jwt_token)
       if payload is None:
         return InvalidOrExpiredTokenResp()
       uid = payload.get("uid")
-    elif request.uid is not None:
+    elif request.uid is not None and len(request.uid) > 3:
       uid = request.uid
     else:
       return InvalidOrExpiredTokenResp()
@@ -153,7 +154,7 @@ class UserServer:
     if profile:
       return QueryProfileResponse(code=0, profile=profile)
     else:
-      logging.warning(f"{request} not found")
+      logging.warning(f"{uid}, {request} not found")
       return BaseResponse(code=0, message=f"User with uid '{request.uid}' not found")
 
     # incr update the behaviors by time, and update long term weight
@@ -163,12 +164,13 @@ class UserServer:
     if request.jwt_token is not None:
       payload = self.check_token(request.jwt_token)
       if payload is None:
+        logging.error("failed to parse token")
         return InvalidOrExpiredTokenResp()
       uid = payload.get("uid")
-    elif request.user_profile.uid is None:
+    elif request.user_profile.uid is None or len(request.user_profile.uid) < 4:
       return InvalidOrExpiredTokenResp()
 
-    if uid is not None:
+    if uid is not None and len(uid) > 3:
       request.user_profile.uid = uid
 
     succ = self.user_serv.update_profile(request.user_profile)

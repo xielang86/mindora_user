@@ -3,13 +3,16 @@ import json
 from aiohttp import ClientSession, ClientResponseError  
 import sys
 
-async def query_profile(uid: str, server_uri: str):
+async def query_profile(uid_or_token: str, server_uri: str):
   """查询指定用户的画像并打印"""
   query_endpoint = f"{server_uri}/query_profile"
   async with ClientSession() as session:
     try:
       # 构造请求数据
-      payload = {"uid": uid, "action": "query_profile"}
+      if len(uid_or_token) > 64:
+        payload = {"jwt_token": uid_or_token, "action": "query_profile"}
+      else:
+        payload = {"uid": uid_or_token, "action": "query_profile"}
       
       # 发送POST请求
       async with session.post(
