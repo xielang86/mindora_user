@@ -150,6 +150,9 @@ class UserServer:
     else:
       return InvalidOrExpiredTokenResp()
 
+    if uid == "active_uid":
+      uid = self.active_uid
+
     profile = self.user_serv.get_profile(uid)
     if profile:
       return QueryProfileResponse(code=0, profile=profile)
@@ -240,7 +243,8 @@ class UserServer:
   async def handle_login_http(self, request: web.Request) -> web.Response:
     try:
       data = await request.json()
-      response_obj = self.handle_login(data)
+      request = AuthRequest.model_validate(data)
+      response_obj = self.handle_login(request)
     except (json.JSONDecodeError, TypeError, KeyError) as e:
       response_obj = InvalidReqFormatResp()
     
