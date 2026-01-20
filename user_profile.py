@@ -41,7 +41,7 @@ class UserProfile(BaseModel):
 
 # --- 请求类 ---
 class QueryProfileRequest(BaseModel):
-  uid: str | None = Field(None, description="uid, just for debug")
+  uid: Optional[str] = Field(None, description="uid, just for debug")
   jwt_token: str | None = Field(None, description="JWT token，in wan should be fixed")
   action: str = "query_profile"
 

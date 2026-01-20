@@ -96,7 +96,7 @@ class UserServerHttpClient:
   async def login_mindora(self) -> dict:
     async with ClientSession() as session:
       try:
-        token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1aWQiOiJkYTRiYzFiNmJhZjBjOGFiMGJlN2E3ZjE1NzE0NGY0Y2EyNzQzNTllNTgzNmM5OTQxYzFjZDQxMjJjMzliNjFhIiwiZW1haWwiOiJ4aWVsYW5ndGNAMTYzLmNvbSIsImV4cCI6MTc2ODU2ODYyMX0.Fdd0Tv2IX-TMdUnTqzHCV2aFl0RemvXBOWl0nqogJ-U"
+        token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1aWQiOiJkYTRiYzFiNmJhZjBjOGFiMGJlN2E3ZjE1NzE0NGY0Y2EyNzQzNTllNTgzNmM5OTQxYzFjZDQxMjJjMzliNjFhIiwiZW1haWwiOiJ4aWVsYW5ndGNAMTYzLmNvbSIsImV4cCI6MTc2ODkxOTQ1NX0.t5Wj36cou3oZDj-jVXBXh-GD21dmsqvR0O5wGvdtaZo"
         request = AuthRequest(request_type=AuthRequestType.LOGIN_WITH_JWT, timestamp=int(time.time()), version="1.0", data=AuthData(jwt_token=token))
 
         request_dict = request.model_dump()
@@ -165,7 +165,7 @@ class UserServerHttpClient:
         raise Exception(f"更新用户画像失败: {str(e)}") from e
 
 async def http_demo():
-  client = UserServerHttpClient("http://localhost:9102")
+  client = UserServerHttpClient("http://localhost:9001")
   # client = UserServerHttpClient("http://192.168.0.221:9102")
   try:
     r = await client.login_mindora()
@@ -175,8 +175,8 @@ async def http_demo():
     # login for active user
      
       # 2. 查询用户画像
-    query_result = await client.query_user_profile(uid="active_uid")
-    print("查询结果:", json.dumps(query_result, indent=2, ensure_ascii=False))
+    # query_result = await client.query_user_profile(uid="active_uid")
+    # print("查询结果:", json.dumps(query_result, indent=2, ensure_ascii=False))
 
   except Exception as e:
     print(f"操作失败: {e}")

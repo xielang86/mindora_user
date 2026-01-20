@@ -1,12 +1,10 @@
-import asyncio
-import json
-import logging
-import os
+import asyncio,json,logging,os,time
 from typing import Optional
 from dotenv import load_dotenv
 import jwt
+from pydantic import ValidationError
 import websockets
-from aiohttp import web
+from aiohttp import ClientResponseError, ClientSession, web
 import plyvel
 from user_profile import UserProfile
 from config import Config
@@ -17,7 +15,6 @@ from user_profile import (
   InvalidOrExpiredTokenResp, InvalidReqFormatResp
 )
 from auth import AuthRequest
-
 from uid.uuid import get_or_create_uuid
 import logger
 
@@ -54,9 +51,10 @@ class UserProfileServ:
     # merge sort, consider the old ones is sorted already
     logging.info(f"merge {old_behaviors} and {new_behaviors}")
     for behavior_type, values in new_behaviors.items():
+      values.sort(key=lambda x:x[0])
       if behavior_type in old_behaviors and isinstance(values, list):
-        values.sort(key=lambda x:x[0])
-        old_behaviors[behavior_type]= util.merge_two_sorted(old_behaviors[behavior_type], values) 
+        old_behaviors[behavior_type].sort(key=lambda x:x[0])
+        old_behaviors[behavior_type]= util.merge_two_sorted_dedup(old_behaviors[behavior_type], values) 
       else:
         old_behaviors[behavior_type] = values
 
@@ -84,7 +82,7 @@ class UserProfileServ:
       profile.uid_emb = new_profile.uid_emb
 
     profile.long_term_profile = self._merge_profile(profile.long_term_profile, new_profile.long_term_profile)
-    
+     
     profile.behaviors = self._merge_behavior(profile.behaviors, new_profile.behaviors)
     # 仅保存当前用户的更新（而非全量数据）
     self.save_profile(profile)
@@ -103,12 +101,36 @@ def get_http_status(resp: BaseResponse):
     status = resp.code
   return status
 
+
+async def query_profile(jwt_token: str, server_uri: str) :
+  query_endpoint = f"{server_uri}/query_profile"
+  async with ClientSession() as session:
+    try:
+      req = QueryProfileRequest(jwt_token = jwt_token)
+      # 构造请求数据
+      async with session.post(
+        query_endpoint,
+        json=req.model_dump(),
+        timeout=2  # 10秒超时
+      ) as response:
+        response.raise_for_status()  # 触发HTTP错误（如4xx、5xx）
+        data = await response.json()
+        return QueryProfileResponse.model_validate(data)
+            
+    except ClientResponseError as e:
+      # 处理HTTP错误响应
+      error_msg = f"查询失败 [HTTP {e.status}]: {e.message}"
+      raise Exception(error_msg) from e
+    except Exception as e:
+      raise Exception(f"查询用户画像失败: {str(e)}") from e
+
 class UserServer:
   def __init__(self):
     server_semaphore = asyncio.Semaphore(Config.MaxServerConcurrent)
     self.host = Config.HOST
     self.port = Config.PORT
     self.user_serv = UserProfileServ()
+    self.update_task = None
     self.app = web.Application()
     self.active_uid = ""
     self.system_uid = get_or_create_uuid()
@@ -117,6 +139,8 @@ class UserServer:
 
   def close(self):
     self.user_serv.close()
+    if self.update_task:
+      self.update_task.cancel()
 
   def setup_routes(self):
     """设置HTTP路由"""
@@ -192,6 +216,7 @@ class UserServer:
 
     uid = payload.get("uid")
     self.active_uid = uid
+    self.jwt_token = request.data.jwt_token
     return BaseResponse(code=0, message="user ativated successufully")
 
   async def handle_request(self, websocket, path=None):
@@ -211,7 +236,7 @@ class UserServer:
           else:
             response_obj = BaseResponse(code=400, message="Invalid action")
 
-        except (json.JSONDecodeError, TypeError, KeyError) as e:
+        except (json.JSONDecodeError, TypeError, KeyError, ValidationError) as e:
           response_obj = BaseResponse(code=400, message=f"Invalid request format: {e}")
         
         await websocket.send(json.dumps(response_obj.model_dump()))
@@ -223,8 +248,13 @@ class UserServer:
       data = await request.json()
       logging.info(f"req {data}")
       req = QueryProfileRequest.model_validate(data)
+      logging.info(f"request {req}")
       response_obj = self.handle_query_profile(req)
-    except (json.JSONDecodeError, TypeError, KeyError) as e:
+    except Exception as e:
+      if isinstance(e, ValidationError):
+        # 打印Pydantic内部的错误列表（核心！会显示真正触发错误的字段/原因）
+        logging.error(f"Pydantic完整校验错误：{e.errors()}")
+
       logging.error(f"excpetion:{e}")
       response_obj = InvalidReqFormatResp()
     logging.info(f"query profile result: {response_obj}")
@@ -241,16 +271,43 @@ class UserServer:
     return web.json_response(status = get_http_status(response_obj), data=response_obj.model_dump())
 
   async def handle_login_http(self, request: web.Request) -> web.Response:
+    if self.update_task is not None and not self.update_task.done():
+      self.update_task.cancel()
+
     try:
       data = await request.json()
       request = AuthRequest.model_validate(data)
       response_obj = self.handle_login(request)
     except (json.JSONDecodeError, TypeError, KeyError) as e:
       response_obj = InvalidReqFormatResp()
-    
+
+    logging.info(f"login resp: {response_obj}")
+    if response_obj.code == 0 and len(Config.RemoteHost) > 10:
+      self.update_task = asyncio.create_task(self.fetch_profile_from_remote(f"{Config.RemoteHost}")) 
+
     return web.json_response(status=get_http_status(response_obj), data=response_obj.model_dump())
   
+  async def fetch_profile_from_remote(self, url):
+    # check jwt_token util expire and the time(maybe 10h is enough)
+    start_min = int(time.time()) / 60
+    logging.info(f"begin to loop update for activeuid : {self.active_uid}")
+    while True:
+      cur_min = int(time.time()) / 60
+      if cur_min - start_min > 60:
+        logging.info("break because of time")
+        break
 
+      await asyncio.sleep(2)
+
+      resp = await query_profile(self.jwt_token, Config.RemoteHost)
+      if resp is None:
+        logging.warning(f"none resp from remote server: {Config.RemoteHost}")
+
+      succ = self.user_serv.update_profile(resp.profile)
+      if not succ:
+        logging.warning(f"erro in update profile for {resp.profile}")
+      else:
+        logging.info(f"succ update profile for {self.active_uid}")
 
   async def start_http(self):
     """启动HTTP服务器"""

@@ -1,4 +1,5 @@
 -- init_auth_db.sql 示例：创建用户认证表+插入测试数据
+create database mindora_db;
 USE mindora_db;
 
 CREATE TABLE `user_auth` (
