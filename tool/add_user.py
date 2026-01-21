@@ -53,6 +53,7 @@ class UserProfileUpdater:
           timeout=15
         ) as response:
           response_data = await response.json()
+          print(response_data)
           # 将响应放入队列
           await self.response_queue.put({
             "success": True,

@@ -144,10 +144,6 @@ if __name__ == "__main__":
     print("\n❌ 测试（user profile）失败：", e.errors()[0]["msg"])
 
 
-  update_response = {
-
-  }
-  ProfileResponse()
   query = {
     "request_type": "query_profile",
     "timestamp": int(time.time()),

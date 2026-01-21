@@ -76,7 +76,7 @@ def auth_by_verify_code(data: AuthData) -> AuthResponse:
       uid="uid",
       email=data.email,
       token="jwt_token",
-      expire_days= max(1, JWT_EXPIRE_SECONDS / 3600 / 24)
+      expire_days= max(1, int(JWT_EXPIRE_SECONDS / 3600 / 24))
     )
   )
 
@@ -139,7 +139,7 @@ def auth_by_verify_code(data: AuthData) -> AuthResponse:
       uid=uid,
       email=data.email,
       token=jwt_token,
-      expire_days= max(1, JWT_EXPIRE_SECONDS / 3600 / 24)
+      expire_days= max(1, int(JWT_EXPIRE_SECONDS / 3600 / 24))
     )
   
   except Exception as e:

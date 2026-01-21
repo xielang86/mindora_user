@@ -13,7 +13,7 @@ async def query_profile(uid_or_token: str, server_uri: str):
       # 构造请求数据
       if len(uid_or_token) < 64:
         req.data = ProfileData(uid=uid_or_token)
-      
+       
       # 发送POST请求
       async with session.post(
         query_endpoint,

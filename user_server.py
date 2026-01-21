@@ -205,7 +205,7 @@ class UserServer:
 
     succ = self.user_serv.update_profile(uid, request.data.user_profile)
     if succ:
-      return ProfileResponse(code=0, msg=f"Behavior data for req '{request}' updated", request_type=request.request_type, data=None)
+      return ProfileResponse(code=0, msg=f"update profile for '{request.timestamp}' succ", request_type=request.request_type, data=None)
     else:
       return BaseResponse(code=500, msg=f"update profile failed")
 
