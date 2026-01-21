@@ -1,4 +1,6 @@
 from typing import Dict, List, Tuple, Any, Optional
+import time
+
 from pydantic import (
     BaseModel,
     Field,
@@ -11,12 +13,11 @@ from pydantic import (
 class BaseResponse(BaseModel):
   """响应的基类"""
   code: int = 0
-  message: str = ""
+  msg: str = ""
 
 
 class UserProfile(BaseModel):
   """用户画像信息"""
-  uid: str
   uid_emb: List[float] = Field(default_factory=list)
   long_term_profile: List[Tuple[str, float]] = Field(default_factory=list)
   behaviors: Dict[str, List[Tuple[int, Any]]] = Field(
@@ -39,16 +40,22 @@ class UserProfile(BaseModel):
   )
 
 
-# --- 请求类 ---
-class QueryProfileRequest(BaseModel):
+class ProfileData(BaseModel):
   uid: Optional[str] = Field(None, description="uid, just for debug")
   jwt_token: str | None = Field(None, description="JWT token，in wan should be fixed")
-  action: str = "query_profile"
+  user_profile: Optional[UserProfile] = Field(None, description="user profile")
+
+
+class ProfileRequest(BaseModel):
+  request_type: str = Field("query_profile", description="query| update")
+  timestamp : int = Field(..., description="请求发送时间戳（秒级），必填")
+  version : str = Field("1.0", description="version, needed, such as 1.0")
+  data: ProfileData
 
   @model_validator(mode='after')
   def validate_data_by_request_type(self):
     missing_fields = []
-    if self.jwt_token is None and self.uid is None:
+    if self.data.jwt_token is None and self.data.uid is None:
       missing_fields.append("uid")
       missing_fields.append("jwt_token")
     if missing_fields:
@@ -57,96 +64,103 @@ class QueryProfileRequest(BaseModel):
       )
     
     return self
-
-
-class UpdateProfileRequest(BaseModel):
-  action: str = "update_profile"
-  jwt_token: str | None = Field(None, description="JWT token，in wan should be fixed")
-  user_profile: UserProfile = Field(default_factory=UserProfile)
-
-  @model_validator(mode='after')
-  def validate_data_by_request_type(self):
-    missing_fields = []
-    if self.jwt_token is None and self.user_profile.uid is None:
-      missing_fields.append("user_profile.uid")
-      missing_fields.append("jwt_token")
-    if missing_fields:
-      raise ValueError(
-        f"request ：{missing_fields} must have one"
-      )
-    return self
+  
 
 # --- 响应类 ---
-class QueryProfileResponse(BaseResponse):
-  profile: Optional[UserProfile] = None
+class ProfileResponse(BaseResponse):
+  request_type: str = Field("query_profile", description="query| update")
+  data: Optional[ProfileData]
 
-
-class UpdateProfileResponse(BaseResponse):
-  """结构和 BaseResponse 一样"""
-  pass
 
 class InvalidOrExpiredTokenResp(BaseResponse):
   code : int = 401
-  message : str = "token invalid or expired"
+  msg : str = "token invalid or expired"
 
 class InvalidReqFormatResp(BaseResponse):
   code : int = 400
-  message : str = "invalid request format"
+  msg : str = "invalid request format"
 
 if __name__ == "__main__":
   update_req = {
-    "action": "update_profile",
-    "user_profile":
-    {
-    "uid": "client007",
-    "long_term_profile": [], 
-    "behaviors": {
-      "heart_rate": [
-        [
-              1000000000,
-              78
-        ],
-        [
-              100000001,
-              80
-        ]
-      ],  
-      "blood_oxygen": [], 
-      "sleep_status": [], 
-      "clicks": [
-         [
-              1000000000,
-              "product_page_1"
-         ],
-         [
-              1000000001,
-              "checkout_button"
-         ]
-      ],  
-      "plays": []
-    }   
-  }
+    "request_type": "update_profile",
+    "timestamp": int(time.time()),
+    "version" : "1.0",
+    "data": {
+      "uid": "client007",
+      "jwt_token": "jwt_token_dummy",
+      "user_profile":
+      {
+        "long_term_profile": [], 
+        "behaviors": {
+          "heart_rate": [
+           ( 
+                  1000000000,
+                  78
+           ),
+           ( 
+                  100000001,
+                  80
+           ) 
+          ],  
+          "blood_oxygen": [], 
+          "sleep_status": [], 
+          "clicks": [
+            ( 
+                  1000000000,
+                  "product_page_1"
+            ),
+            ( 
+                  1000000001,
+                  "checkout_button"
+            ) 
+          ],  
+          "plays": []
+        },
+        "mindora_record":
+        {
+          "sleep.scene.cocos_island_moonlight": [(100000, 600)], 
+          "sleep.scene.amalfi_breeze": [(1000001, 600)],
+          "sleep.scene.kyoto_forest": [],
+          "sleep.scene.andaman_rainforest_sanctuary": [],
+          "sleep.scene.bhutan_misty_forest": [],
+          "sleep.scene.sedona_red_rock_peace" : [],
+          "sleep.scene.fogo_island_cookie_box": [],
+          "sleep.scene.seychelles_moonlight_lullaby": []
+        }
+      }
+    }
   }
 
   try:
-    req = UpdateProfileRequest(** update_req)
+    req = ProfileRequest(** update_req)
+    print(f"succ for {req}")
   except ValidationError as e:
     print("\n❌ 测试（user profile）失败：", e.errors()[0]["msg"])
 
   try:
-    req2 = UpdateProfileRequest.model_validate(update_req)
+    req2 = ProfileRequest.model_validate(update_req)
+    print(f"succ for {req2}")
   except ValidationError as e:
     print("\n❌ 测试（user profile）失败：", e.errors()[0]["msg"])
 
-  print(f"succ for {req}")
 
+  update_response = {
 
-  query = {'uid': 'client007', 'action': 'query_profile'}
+  }
+  ProfileResponse()
+  query = {
+    "request_type": "query_profile",
+    "timestamp": int(time.time()),
+    "version" : "1.0",
+    "data": {
+      "uid": "client007",
+      "jwt_token": "jwt_token_dummy",
+    }
+  }
+
   try:
-    req = QueryProfileRequest(** query)
-    req2 = QueryProfileRequest.model_validate(query)
+    req = ProfileRequest(** query)
+    req2 = ProfileRequest.model_validate(query)
+    print(f"succ query for {req} and {req2}")
   except ValidationError as e:
     print("\n❌ 测试（query profile）失败：", e.errors()[0]["msg"])
-
-  print(f"succ query for {req}")
-

@@ -10,9 +10,8 @@ from user_profile import UserProfile
 from config import Config
 from common import util
 from user_profile import (
-  UserProfile, QueryProfileRequest, UpdateProfileRequest,
-  QueryProfileResponse, UpdateProfileResponse, BaseResponse,
-  InvalidOrExpiredTokenResp, InvalidReqFormatResp
+  UserProfile, ProfileRequest, ProfileResponse, ProfileData,
+  InvalidOrExpiredTokenResp, InvalidReqFormatResp,BaseResponse
 )
 from auth import AuthRequest
 from uid.uuid import get_or_create_uuid
@@ -38,9 +37,8 @@ class UserProfileServ:
       return UserProfile.model_validate(json.loads(data.decode('utf-8')))
     return None
 
-  def save_profile(self, profile: UserProfile):
+  def save_profile(self, uid: str, profile: UserProfile):
     """将单个用户的画像写入LevelDB"""
-    uid = profile.uid
     data = json.dumps(profile.model_dump()).encode('utf-8')
     self.db.put(uid.encode('utf-8'), data)
 
@@ -65,16 +63,16 @@ class UserProfileServ:
     return old_behaviors
 
     # incr update the behaviors by time, and update long term weight
-  def update_profile(self, new_profile: UserProfile) -> bool:
+  def update_profile(self, uid: str, new_profile: UserProfile) -> bool:
     """写入用户行为（仅更新单个用户数据）"""
-    if new_profile is None or new_profile.uid is None or not isinstance(new_profile.uid, str):
-      logging.error(f"invalid new profile {new_profile}")
+    if new_profile is None or uid is None or not isinstance(uid, str):
+      logging.error(f"invalid new profile {new_profile} or uid {uid}")
       return False
 
     # 读取或创建用户画像（仅操作单个用户，避免全量加载）
-    profile = self.get_profile(new_profile.uid)
+    profile = self.get_profile(uid)
     if profile is None:
-      self.save_profile(new_profile)
+      self.save_profile(uid, new_profile)
       return True
 
     # just replace, if need
@@ -85,8 +83,8 @@ class UserProfileServ:
      
     profile.behaviors = self._merge_behavior(profile.behaviors, new_profile.behaviors)
     # 仅保存当前用户的更新（而非全量数据）
-    self.save_profile(profile)
-    logging.info(f"Behavior data for uid '{new_profile.uid}' updated")
+    self.save_profile(uid, profile)
+    logging.info(f"Behavior data for uid '{uid}' updated")
     return True
   
   def close(self):
@@ -106,7 +104,7 @@ async def query_profile(jwt_token: str, server_uri: str) :
   query_endpoint = f"{server_uri}/query_profile"
   async with ClientSession() as session:
     try:
-      req = QueryProfileRequest(jwt_token = jwt_token)
+      req = ProfileRequest(request_type="query_profile", timestamp=int(time.time()), version="1.0", data=ProfileData(jwt_token = jwt_token))
       # 构造请求数据
       async with session.post(
         query_endpoint,
@@ -115,11 +113,11 @@ async def query_profile(jwt_token: str, server_uri: str) :
       ) as response:
         response.raise_for_status()  # 触发HTTP错误（如4xx、5xx）
         data = await response.json()
-        return QueryProfileResponse.model_validate(data)
+        return ProfileResponse.model_validate(data)
             
     except ClientResponseError as e:
       # 处理HTTP错误响应
-      error_msg = f"查询失败 [HTTP {e.status}]: {e.message}"
+      error_msg = f"查询失败 [HTTP {e.status}]: {e.msg}"
       raise Exception(error_msg) from e
     except Exception as e:
       raise Exception(f"查询用户画像失败: {str(e)}") from e
@@ -144,11 +142,10 @@ class UserServer:
 
   def setup_routes(self):
     """设置HTTP路由"""
-    self.app.router.add_post('/query_profile', self.handle_query_profile_http)
-    self.app.router.add_post('/update_profile', self.handle_update_profile_http)
+    self.app.router.add_post('/user_profile', self.handle_profile_request_http)
     self.app.router.add_post('/login', self.handle_login_http)
 
-  def check_token(self, jwt_token: str)-> dict | None:
+  def _check_token(self, jwt_token: str)-> dict | None:
     try:
       payload = jwt.decode(jwt_token, JWT_SECRET_KEY, algorithms=Config.ALGORITHM)
     except jwt.ExpiredSignatureError:
@@ -160,18 +157,28 @@ class UserServer:
 
     logging.info(f"payload: {payload}")
     return payload
-    
-  def handle_query_profile(self, request: QueryProfileRequest) -> BaseResponse:
-    """查询用户画像（从LevelDB按需读取）"""
+
+  def _parse_for_uid(self, data: ProfileData):
     uid = None
-    if request.jwt_token is not None:
-      payload = self.check_token(request.jwt_token)
+    if data.jwt_token is not None:
+      payload = self._check_token(data.jwt_token)
       if payload is None:
         return InvalidOrExpiredTokenResp()
       uid = payload.get("uid")
-    elif request.uid is not None and len(request.uid) > 3:
-      uid = request.uid
-    else:
+    elif data.uid is not None and len(data.uid) > 3:
+      uid = data.uid
+
+    return uid
+
+  def handle_query_profile(self, request: ProfileRequest) -> BaseResponse:
+    """查询用户画像（从LevelDB按需读取）"""
+    if request.data is None:
+      logging.error("query request without any data")
+      return InvalidOrExpiredTokenResp()
+
+    uid = self._parse_for_uid(request.data)
+
+    if uid is None:
       return InvalidOrExpiredTokenResp()
 
     if uid == "active_uid":
@@ -179,101 +186,85 @@ class UserServer:
 
     profile = self.user_serv.get_profile(uid)
     if profile:
-      return QueryProfileResponse(code=0, profile=profile)
+      return ProfileResponse(code=0, msg="succ", request_type=request.request_type, data=ProfileData(user_profile=profile))
     else:
       logging.warning(f"{uid}, {request} not found")
-      return BaseResponse(code=0, message=f"User with uid '{request.uid}' not found")
+      return BaseResponse(code=0, msg=f"User with uid '{request.uid}' not found")
 
     # incr update the behaviors by time, and update long term weight
-  def handle_update_profile(self, request: UpdateProfileRequest) -> BaseResponse:
+  def handle_update_profile(self, request: ProfileRequest) -> BaseResponse:
     """写入用户行为（仅更新单个用户数据）"""
-    uid = None
-    if request.jwt_token is not None:
-      payload = self.check_token(request.jwt_token)
-      if payload is None:
-        logging.error("failed to parse token")
-        return InvalidOrExpiredTokenResp()
-      uid = payload.get("uid")
-    elif request.user_profile.uid is None or len(request.user_profile.uid) < 4:
+    if request.data is None:
+      logging.error("update request without any data")
       return InvalidOrExpiredTokenResp()
 
-    if uid is not None and len(uid) > 3:
-      request.user_profile.uid = uid
+    uid = self._parse_for_uid(request.data)
 
-    succ = self.user_serv.update_profile(request.user_profile)
+    if uid is None:
+      return InvalidOrExpiredTokenResp()
+
+    succ = self.user_serv.update_profile(uid, request.data.user_profile)
     if succ:
-      return UpdateProfileResponse(code=0, message=f"Behavior data for req '{request}' updated")
+      return ProfileResponse(code=0, msg=f"Behavior data for req '{request}' updated", request_type=request.request_type, data=None)
     else:
-      return BaseResponse(code=500, message=f"update profile failed")
+      return BaseResponse(code=500, msg=f"update profile failed")
 
   def handle_login(self, request: AuthRequest) -> BaseResponse:
     if request.data is None or request.data.jwt_token is None:
       return InvalidReqFormatResp()
 
-    payload = self.check_token(request.data.jwt_token)
+    payload = self._check_token(request.data.jwt_token)
     if payload is None:
       return InvalidOrExpiredTokenResp()
 
     uid = payload.get("uid")
     self.active_uid = uid
     self.jwt_token = request.data.jwt_token
-    return BaseResponse(code=0, message="user ativated successufully")
+    return BaseResponse(code=0, msg="user ativated successufully")
 
-  async def handle_request(self, websocket, path=None):
+  async def handle_profile_request(self, websocket, path=None):
     try:
-      async for message in websocket:
+      async for msg in websocket:
         response_obj: BaseResponse
         try:
-          data = json.loads(message)
-          action = data.get("action")
-
-          if action == "query_profile":
-            req = QueryProfileRequest.model_validate(data)
+          data = json.loads(msg)
+          req = ProfileRequest.model_validate(data)
+          if req.request_type == "query_profile":
             response_obj = self.handle_query_profile(req)
-          elif action == "update_profile":
-            req = UpdateProfileRequest.model_validate(data)
+          elif req.request_type == "update_profile":
             response_obj = self.handle_update_profile(req)
           else:
-            response_obj = BaseResponse(code=400, message="Invalid action")
+            response_obj = BaseResponse(code=400, msg="Invalid request type")
 
         except (json.JSONDecodeError, TypeError, KeyError, ValidationError) as e:
-          response_obj = BaseResponse(code=400, message=f"Invalid request format: {e}")
+          response_obj = BaseResponse(code=400, msg=f"Invalid request format: {e}")
         
         await websocket.send(json.dumps(response_obj.model_dump()))
     except websockets.exceptions.ConnectionClosed:
       logging.error("Connection closed.")
 
-  async def handle_query_profile_http(self, request: web.Request) -> web.Response:
+
+  async def handle_profile_request_http(self, request: web.Request) -> web.Response:
     try:
       data = await request.json()
       logging.info(f"req {data}")
-      req = QueryProfileRequest.model_validate(data)
+      req = ProfileRequest.model_validate(data)
       logging.info(f"request {req}")
-      response_obj = self.handle_query_profile(req)
-    except Exception as e:
-      if isinstance(e, ValidationError):
-        # 打印Pydantic内部的错误列表（核心！会显示真正触发错误的字段/原因）
-        logging.error(f"Pydantic完整校验错误：{e.errors()}")
+      if req.request_type == "query_profile":
+        response_obj = self.handle_query_profile(req)
+      elif req.request_type == "update_profile":
+        response_obj = self.handle_update_profile(req)
+      else:
+        response_obj = BaseResponse(code=400, msg="Invalid request type")
 
-      logging.error(f"excpetion:{e}")
-      response_obj = InvalidReqFormatResp()
-    logging.info(f"query profile result: {response_obj}")
-    return web.json_response(status = get_http_status(response_obj), data=response_obj.model_dump())
+    except (json.JSONDecodeError, TypeError, KeyError, ValidationError) as e:
+      response_obj = BaseResponse(code=400, msg=f"Invalid request format: {e}")
 
-  async def handle_update_profile_http(self, request: web.Request) -> web.Response:
-    try:
-      data = await request.json()
-      req = UpdateProfileRequest.model_validate(data)
-      response_obj = self.handle_update_profile(req)
-    except (json.JSONDecodeError, TypeError, KeyError) as e:
-      response_obj = InvalidReqFormatResp()
-   
+    logging.info(f"profile response: {response_obj}")
     return web.json_response(status = get_http_status(response_obj), data=response_obj.model_dump())
+      
 
   async def handle_login_http(self, request: web.Request) -> web.Response:
-    if self.update_task is not None and not self.update_task.done():
-      self.update_task.cancel()
-
     try:
       data = await request.json()
       request = AuthRequest.model_validate(data)
@@ -282,8 +273,10 @@ class UserServer:
       response_obj = InvalidReqFormatResp()
 
     logging.info(f"login resp: {response_obj}")
-    if response_obj.code == 0 and len(Config.RemoteHost) > 10:
+    if response_obj.code == 0 and len(Config.RemoteHost) > 10 and self.update_task is None or self.update_task.done():
       self.update_task = asyncio.create_task(self.fetch_profile_from_remote(f"{Config.RemoteHost}")) 
+    else:
+      logging.info("update task has started already")
 
     return web.json_response(status=get_http_status(response_obj), data=response_obj.model_dump())
   
@@ -297,7 +290,7 @@ class UserServer:
         logging.info("break because of time")
         break
 
-      await asyncio.sleep(2)
+      await asyncio.sleep(60)
 
       resp = await query_profile(self.jwt_token, Config.RemoteHost)
       if resp is None:
@@ -320,7 +313,7 @@ class UserServer:
     await asyncio.Event().wait()
 
   async def start(self):
-    async with websockets.serve(self.handle_request, self.host, self.port):
+    async with websockets.serve(self.handle_profile_request, self.host, self.port):
       logging.info(f"UserServer started on ws://{self.host}:{self.port}")
       await asyncio.Future()  # 持续运行
 

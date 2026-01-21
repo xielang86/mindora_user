@@ -1,11 +1,11 @@
 import asyncio
-import json
+import json, time
 from typing import Dict, Any
 import asyncio
 import aiohttp
 import json
 from typing import List, Dict, Any
-
+from user_profile import ProfileRequest, ProfileData, UserProfile
 class UserProfileUpdater:
   def __init__(self, uri: str, filename: str):
     """
@@ -27,7 +27,7 @@ class UserProfileUpdater:
       with open(self.filename, 'r', encoding='utf-8') as f:
         data = json.load(f)
         # 验证数据格式是否为列表
-        if not isinstance(data, list):
+        if not isinstance(data, dict):
           raise ValueError("JSON文件内容必须是包含用户画像的列表")
         return data
     except FileNotFoundError:
@@ -35,17 +35,16 @@ class UserProfileUpdater:
     except json.JSONDecodeError:
       raise Exception(f"文件 {self.filename} 不是有效的JSON格式")
 
-  async def _send_single_update(self, session: aiohttp.ClientSession, profile: Dict[str, Any]):
+  async def _send_single_update(self, session: aiohttp.ClientSession, uid: str, profile: Dict[str, Any]):
     """发送单个用户画像更新请求"""
+    jwt_token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1aWQiOiJkYTRiYzFiNmJhZjBjOGFiMGJlN2E3ZjE1NzE0NGY0Y2EyNzQzNTllNTgzNmM5OTQxYzFjZDQxMjJjMzliNjFhIiwiZW1haWwiOiJ4aWVsYW5ndGNAMTYzLmNvbSIsImV4cCI6MTc2OTAwNTUzNn0.4Rn4RjKfXfsr_oT_gFfhZMjKDGaaB0sSGxDfyProYF8"
     async with self.semaphore:  # 限制并发数量
+      req = ProfileRequest(request_type="update_profile", timestamp=int(time.time()), version="1.0", data=ProfileData(uid=uid, user_profile=UserProfile.model_validate(profile)))
+      if uid is None or len(uid) < 3:
+        req.data = ProfileData(jwt_token = jwt_token, user_profile=UserProfile.model_validate(profile))
       try:
         # 构造更新请求数据
-        payload = {
-          "action": "update_profile",
-          "user_profile": profile
-        }
-        if profile.get("uid") is None or len(profile.get("uid")) < 3:
-          payload["jwt_token"] = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1aWQiOiJkYTRiYzFiNmJhZjBjOGFiMGJlN2E3ZjE1NzE0NGY0Y2EyNzQzNTllNTgzNmM5OTQxYzFjZDQxMjJjMzliNjFhIiwiZW1haWwiOiJ4aWVsYW5ndGNAMTYzLmNvbSIsImV4cCI6MTc2ODUwNzk2Mn0.tGr84Y8tKlUGv8zoHdSX3ys2I64Nti7W5oyXzBN6Wns"
+        payload = req.model_dump()
         
         # 发送POST请求
         async with session.post(
@@ -57,7 +56,7 @@ class UserProfileUpdater:
           # 将响应放入队列
           await self.response_queue.put({
             "success": True,
-            "profile_uid": profile.get("uid", "unknown"),
+            "profile_uid": uid,
             "data": response_data
           })
             
@@ -65,7 +64,7 @@ class UserProfileUpdater:
         # 错误信息也放入队列
         await self.response_queue.put({
           "success": False,
-          "profile_uid": profile.get("uid", "unknown"),
+          "profile_uid": uid,
           "error": str(e)
         })
 
@@ -81,7 +80,7 @@ class UserProfileUpdater:
           
       # 打印响应内容
       if response["success"]:
-        print(f"✅ 用户 {response['profile_uid']} 更新成功: {response['data']['message']}")
+        print(f"✅ 用户 {response['profile_uid']} 更新成功: {response['data']['msg']}")
       else:
         print(f"❌ 用户 {response['profile_uid']} 更新失败: {response['error']}")
           
@@ -101,8 +100,8 @@ class UserProfileUpdater:
       
       # 创建所有发送任务
       tasks = [
-        self._send_single_update(session, profile)
-        for profile in profiles
+        self._send_single_update(session, uid, profile)
+        for uid,profile in profiles.items()
       ]
       
       # 等待所有发送任务完成
@@ -124,7 +123,7 @@ class UserProfileUpdater:
 # 使用示例
 if __name__ == "__main__":
   # 服务器更新接口地址
-  server_uri = "http://localhost:9102/update_profile"
+  server_uri = "http://localhost:9001/user_profile"
   # 包含用户画像的JSON文件
   profiles_file = "data/user_profile.json"
   
