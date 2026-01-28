@@ -17,7 +17,7 @@ from auth import AuthRequest
 from uid.uuid import get_or_create_uuid
 import logger
 
-logger.init_log("user_server_logs")
+logger.init_log("/opt/mindora_user/user_server_logs")
 
 # all bloking sync api
 class UserProfileServ:
@@ -101,7 +101,7 @@ def get_http_status(resp: BaseResponse):
 
 
 async def query_profile(jwt_token: str, server_uri: str) :
-  query_endpoint = f"{server_uri}/query_profile"
+  query_endpoint = f"{server_uri}/user_profile"
   async with ClientSession() as session:
     try:
       req = ProfileRequest(request_type="query_profile", timestamp=int(time.time()), version="1.0", data=ProfileData(jwt_token = jwt_token))

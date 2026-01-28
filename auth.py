@@ -11,6 +11,7 @@ from pydantic import (
 from uuid import UUID
 from enum import Enum,StrEnum
 from datetime import datetime
+import json
 
 class UserData(BaseModel):
   # 核心字段：与MySQL字段名一致，指定类型
@@ -83,6 +84,15 @@ class AuthData(BaseModel):
       }
     }
   )
+
+# 自定义JSON编码器：处理UUID类型
+class UUIDEncoder(json.JSONEncoder):
+  def default(self, obj):
+    if isinstance(obj, uuid.UUID):
+      # 将UUID对象转为字符串
+      return str(obj)
+    # 其他类型按默认逻辑处理
+    return super().default(obj)
 
 
 class AuthRequest(BaseModel):

@@ -85,8 +85,7 @@ class UUIDEncoder(json.JSONEncoder):
 class UserServerHttpClient:
   def __init__(self, server_url: str):
     self.server_url = server_url.rstrip("/")
-    self.query_endpoint = f"{self.server_url}/query_profile"
-    self.update_endpoint = f"{self.server_url}/update_profile"
+    self.profile_endpoint = f"{self.server_url}/user_profile"
     self.login_endpoint = f"{self.server_url}/login"
 
   async def login_mindora(self) -> dict:
@@ -124,7 +123,7 @@ class UserServerHttpClient:
         
         # 发送POST请求
         async with session.post(
-            self.query_endpoint,
+            self.profile_endpoint,
             json=payload,
             timeout=10  # 10秒超时
         ) as response:
@@ -149,7 +148,7 @@ class UserServerHttpClient:
         payload = req.model_dump()
         # 发送POST请求
         async with session.post(
-          self.update_endpoint,
+          self.profile_endpoint,
           json=payload,
           timeout=10
         ) as response:
