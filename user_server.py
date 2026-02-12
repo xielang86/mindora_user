@@ -33,6 +33,7 @@ class UserProfileServ:
       return None
 
     data = self.db.get(uid.encode('utf-8'))  # LevelDB键值为bytes类型
+    logging.info(f"get from leveldb data {data}")
     if data:
       return UserProfile.model_validate(json.loads(data.decode('utf-8')))
     return None
@@ -117,7 +118,7 @@ async def query_profile(jwt_token: str, server_uri: str) :
             
     except ClientResponseError as e:
       # 处理HTTP错误响应
-      error_msg = f"查询失败 [HTTP {e.status}]: {e.msg}"
+      error_msg = f"查询失败 [HTTP {e.status}]: {e}"
       raise Exception(error_msg) from e
     except Exception as e:
       raise Exception(f"查询用户画像失败: {str(e)}") from e
@@ -155,6 +156,8 @@ class UserServer:
       logging.error("login token invalid")
       return None
 
+    logging.info(f"in login: {jwt_token}")
+
     logging.info(f"payload: {payload}")
     return payload
 
@@ -171,12 +174,14 @@ class UserServer:
     return uid
 
   def handle_query_profile(self, request: ProfileRequest) -> BaseResponse:
+    logging.info(f"handle: {request}")
     """查询用户画像（从LevelDB按需读取）"""
     if request.data is None:
       logging.error("query request without any data")
       return InvalidOrExpiredTokenResp()
 
     uid = self._parse_for_uid(request.data)
+    logging.info(f"get uid: {uid}")
 
     if uid is None:
       return InvalidOrExpiredTokenResp()
@@ -185,11 +190,12 @@ class UserServer:
       uid = self.active_uid
 
     profile = self.user_serv.get_profile(uid)
+    logging.info(f"profile found: {profile}")
     if profile:
       return ProfileResponse(code=0, msg="succ", request_type=request.request_type, data=ProfileData(user_profile=profile))
     else:
       logging.warning(f"{uid}, {request} not found")
-      return BaseResponse(code=0, msg=f"User with uid '{request.uid}' not found")
+      return ProfileResponse(code=0, msg=f"User with uid '{request.data}' not found", request_type=request.request_type, data=None)
 
     # incr update the behaviors by time, and update long term weight
   def handle_update_profile(self, request: ProfileRequest) -> BaseResponse:
@@ -207,7 +213,7 @@ class UserServer:
     if succ:
       return ProfileResponse(code=0, msg=f"update profile for '{request.timestamp}' succ", request_type=request.request_type, data=None)
     else:
-      return BaseResponse(code=500, msg=f"update profile failed")
+      return ProfileResponse(code=500, msg=f"update profile failed", request_type=request.request_type, data=None)
 
   def handle_login(self, request: AuthRequest) -> BaseResponse:
     if request.data is None or request.data.jwt_token is None:
@@ -270,10 +276,11 @@ class UserServer:
       request = AuthRequest.model_validate(data)
       response_obj = self.handle_login(request)
     except (json.JSONDecodeError, TypeError, KeyError) as e:
+      logging.error(f"login error: {e}, request={request}")
       response_obj = InvalidReqFormatResp()
 
     logging.info(f"login resp: {response_obj}")
-    if response_obj.code == 0 and len(Config.RemoteHost) > 10 and self.update_task is None or self.update_task.done():
+    if response_obj.code == 0 and len(Config.RemoteHost) > 10 and (self.update_task is None or self.update_task.done()):
       self.update_task = asyncio.create_task(self.fetch_profile_from_remote(f"{Config.RemoteHost}")) 
     else:
       logging.info("update task has started already")

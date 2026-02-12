@@ -19,7 +19,7 @@ class BaseResponse(BaseModel):
 class UserProfile(BaseModel):
   """用户画像信息"""
   uid_emb: List[float] = Field(default_factory=list)
-  basic_info: Dict[str, str]
+  basic_info: Optional[Dict[str, str]] = Field(default_factory=dict)
   long_term_profile: List[Tuple[str, float]] = Field(default_factory=list)
   behaviors: Dict[str, List[Tuple[int, Any]]] = Field(
     default_factory=lambda: {
