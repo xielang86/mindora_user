@@ -17,7 +17,11 @@ from auth import AuthRequest
 from uid.uuid import get_or_create_uuid
 import logger
 
-logger.init_log("/opt/mindora_user/user_server_logs")
+load_dotenv()
+run_dir = os.getenv("RUN_DIR")
+logger.init_log(f"{run_dir}/user_server_logs")
+JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY")
+
 
 # all bloking sync api
 class UserProfileServ:
@@ -90,9 +94,6 @@ class UserProfileServ:
   
   def close(self):
     self.db.close()
-
-load_dotenv()
-JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY")
 
 def get_http_status(resp: BaseResponse):
   status = 200
@@ -168,7 +169,7 @@ class UserServer:
       if payload is None:
         return InvalidOrExpiredTokenResp()
       uid = payload.get("uid")
-    elif data.uid is not None and len(data.uid) > 3:
+    elif Config.IS_DEBUG and data.uid is not None and len(data.uid) > 3:
       uid = data.uid
 
     return uid
@@ -205,6 +206,7 @@ class UserServer:
       return InvalidOrExpiredTokenResp()
 
     uid = self._parse_for_uid(request.data)
+    logging.info(f"uid for update: {uid}")
 
     if uid is None:
       return InvalidOrExpiredTokenResp()
