@@ -15,7 +15,9 @@ from common.util import normalize_email
 from uid.uuid import generate_uid_and_salt
 import logger
 
-logger.init_log("auth_logs")
+load_dotenv()
+run_dir = os.getenv("RUN_DIR")
+logger.init_log(f"{run_dir}/auth_logs")
 
 app = FastAPI(title="Auth Server")
 
@@ -28,7 +30,6 @@ mock_db = {
 }
 
 # 加载配置
-load_dotenv()
 JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY")
 JWT_EXPIRE_SECONDS = int(os.getenv("JWT_EXPIRE_SECONDS"))
 VERIFY_CODE_EXPIRE_SECONDS = int(os.getenv("VERIFY_CODE_EXPIRE_SECONDS"))
