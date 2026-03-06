@@ -28,7 +28,7 @@ class UserProfileServ:
   MAX_BEHAVIOR_LEN = 1024
   def __init__(self):
     # 初始化LevelDB（若路径不存在则自动创建）
-    self.db = plyvel.DB(Config.DB_PATH, create_if_missing=True)
+    self.db = plyvel.DB(f"{run_dir}/{Config.DB_PATH}", create_if_missing=True)
 
   def get_profile(self, uid: str) -> Optional[UserProfile]:
     """从LevelDB读取单个用户的画像"""
