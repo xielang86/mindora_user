@@ -16,17 +16,80 @@ class BaseResponse(BaseModel):
   msg: str = ""
 
 
+#  一级指标：
+# 睡眠得分(sleep_score)： 入睡效率， 睡眠结构, 夜间波动
+# 场景偏好(scene_preference)：场景排序
+# 睡眠建议(sleep_advice)：建议，文章列表
+# 
+# 
+# 二级指标：
+# 入睡效率:  首次入睡时间，入睡前心率，入睡前呼吸频率
+# 睡眠结构： 快速动眼睛睡眠，核心睡眠，深度睡眠
+# 夜间波动：夜间觉醒，觉醒时长，觉醒类型，心率波动，呼吸波动
+# 
+# 三级（苹果健康直接有，后继我们会选择部分自己算）：
+# 首次入睡时间，入睡前心率，入睡前呼吸频率，快速动眼睛睡眠，核心睡眠，深度睡眠，夜间觉醒，觉醒时长，觉醒类型，心率波动，呼吸波动, 体温
+# 
+# 时间维度统计：
+# 睡眠得分（week， month）： avg, 序列
+# 睡眠时长(week， month)： 序列(by day), sum
+# 睡眠趋势（week， month）：模型分析
+# Onset efficiency（week， month）： 场景次数(sum)
+# Time in bed： avg
+# Heart rate: avg
+
+class SleepResult(BaseModel):
+  timestamp: int = Field(..., description="数据记录的时间戳（秒级）")
+  sleep_score: Optional[float] = Field(None, description="睡眠得分，范围0-100") 
+  fall_sleep_efficiency: Optional[float] = Field(None, description="入睡效率，范围0-100")
+  sleep_struct: Optional[float] = Field(None, description="睡眠结构，包含快速动眼、核心、深度睡眠占比，单位%")
+  sleep_var: Optional[float] = Field(None, description="夜间波动，包含觉醒次数、觉醒时长、心率波动等，单位%")
+
+  first_sleep_time: Optional[int] = Field(None, description="首次入睡时间，单位分钟")
+  heart_rate_before_sleep: Optional[float] = Field(None, description="入睡前心率，单位bpm")
+  bpm_before_sleep: Optional[float] = Field(None, description="入睡前呼吸频率，单位次/分钟")
+
+  rem_sleep_duration: Optional[float] = Field(None, description="fast eye movement sleep 单位分钟")
+  core_sleep_duration_core: Optional[float] = Field(None, description="core sleep 单位分钟")
+  deep_sleep_duration: Optional[float] = Field(None, description="deep sleep sleep 单位分钟")
+
+  night_awake_times: Optional[int] = Field(None, description="夜间觉醒次数")
+  night_awake_duration: Optional[int] = Field(None, description="夜间觉醒时长，单位分钟")
+  night_awake_type: Optional[str] = Field(None, description="夜间觉醒类型，如自然觉醒、环境干扰、身体不适等")
+  heart_rate_var: Optional[float] = Field(None, description="心率波动，单位bpm")
+  respiratory_var: Optional[float] = Field(None, description="呼吸频率波动，单位次/分钟")
+  
+  time_in_bed: Optional[int] = Field(None, description="躺床时间，单位分钟")
+  avg_heart_rate: Optional[float] = Field(None, description="平均心率，单位bpm")
+  avg_respiratory: Optional[float] = Field(None, description="平均呼吸频率，单位次/分钟")
+  avg_temperature: Optional[float] = Field(None, description="体温，单位摄氏度")
+
+  scene_preference: List[Tuple[str, float]] = Field(None, description="场景偏好，如喜欢的睡眠场景名称")
+
 class UserProfile(BaseModel):
   """用户画像信息"""
   uid_emb: List[float] = Field(default_factory=list)
   basic_info: Optional[Dict[str, str]] = Field(default_factory=dict)
   long_term_profile: List[Tuple[str, float]] = Field(default_factory=list)
+
   behaviors: Dict[str, List[Tuple[int, Any]]] = Field(
     default_factory=lambda: {
       "heart_rate": [], "blood_oxygen": [], "sleep_status": [],
       "clicks": [], "plays": []
     }
   )
+
+  sleep_data:  List[Tuple[int, SleepResult]] = Field(default_factory=list)
+
+  sleep_analysis: Dict[str, Any] = Field(
+    default_factory=lambda: {
+      "sleep_trend_week": "", 
+      "sleep_trend_month": "",
+      "scene": {"title":"", "music":"", "text":"", "image_url": ""},
+      "sleep_advice": "",
+    }
+  )
+
   mindora_record: Dict[str, List[Tuple[Any, Any]]] = Field(
     default_factory=lambda: {
       "sleep.scene.cocos_island_moonlight": [], 

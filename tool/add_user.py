@@ -124,7 +124,8 @@ class UserProfileUpdater:
 # 使用示例
 if __name__ == "__main__":
   # 服务器更新接口地址
-  server_uri = "http://localhost:9001/user_profile"
+  # server_uri = "http://localhost:9001/user_profile"
+  server_uri = "https://api.mindora316.com/user_server/user_profile"
   # 包含用户画像的JSON文件
   profiles_file = "data/user_profile.json"
   
