@@ -64,7 +64,7 @@ class UserProfileServ:
         old_behaviors[behavior_type] = values
 
       if len(old_behaviors[behavior_type]) > UserProfileServ.MAX_BEHAVIOR_LEN:
-        old_behaviors[behavior_type] = old_behaviors[behavior_type][len(old_behaviors) - UserServer.MAX_BEHAVIOR_LEN:]
+        old_behaviors[behavior_type] = old_behaviors[behavior_type][len(old_behaviors[behavior_type]) - UserProfileServ.MAX_BEHAVIOR_LEN:]
 
     logging.info(f"after update {old_behaviors}")
     return old_behaviors
