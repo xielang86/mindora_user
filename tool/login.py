@@ -4,8 +4,8 @@ import uuid, json
 from auth import AuthRequest,AuthResponse, AuthRequestType, AuthData
 
 # 配置
-# BASE_URL = "http://127.0.0.1:9103/auth"
-BASE_URL = "https://api.mindora316.com/auth"
+BASE_URL = "http://127.0.0.1:9103/auth"
+# BASE_URL = "https://api.mindora316.com/auth"
 TEST_EMAIL = sys.argv[1]
 DEVICE_ID = uuid.uuid4()
 

@@ -3,6 +3,7 @@ import time
 
 from pydantic import (
     BaseModel,
+    EmailStr,
     Field,
     model_validator,
     field_validator,
@@ -15,56 +16,92 @@ class BaseResponse(BaseModel):
   code: int = 0
   msg: str = ""
 
+# -------------------------- 子模型定义（对应data下一级字段的嵌套结构） --------------------------
+class UserAddress(BaseModel):
+  """用户地址信息模型"""
+  province: str = Field(..., description="省份")
+  city: str = Field(..., description="城市")
+  detail: str = Field(..., description="详细地址")
+  zip_code: Optional[str] = Field(None, description="邮政编码")
 
-#  一级指标：
-# 睡眠得分(sleep_score)： 入睡效率， 睡眠结构, 夜间波动
-# 场景偏好(scene_preference)：场景排序
-# 睡眠建议(sleep_advice)：建议，文章列表
-# 
-# 
-# 二级指标：
-# 入睡效率:  首次入睡时间，入睡前心率，入睡前呼吸频率
-# 睡眠结构： 快速动眼睛睡眠，核心睡眠，深度睡眠
-# 夜间波动：夜间觉醒，觉醒时长，觉醒类型，心率波动，呼吸波动
-# 
-# 三级（苹果健康直接有，后继我们会选择部分自己算）：
-# 首次入睡时间，入睡前心率，入睡前呼吸频率，快速动眼睛睡眠，核心睡眠，深度睡眠，夜间觉醒，觉醒时长，觉醒类型，心率波动，呼吸波动, 体温
-# 
-# 时间维度统计：
-# 睡眠得分（week， month）： avg, 序列
-# 睡眠时长(week， month)： 序列(by day), sum
-# 睡眠趋势（week， month）：模型分析
-# Onset efficiency（week， month）： 场景次数(sum)
-# Time in bed： avg
-# Heart rate: avg
+class UserSocial(BaseModel):
+  """用户社交账号信息模型"""
+  wechat: Optional[str] = Field(None, description="微信号")
+  phone: str = Field(..., description="手机号")
+  email: Optional[EmailStr] = Field(None, description="邮箱")
+
+class UserPreference(BaseModel):
+  """用户偏好设置模型"""
+  theme: str = Field(default="light", description="界面主题")
+  language: str = Field(default="zh-CN", description="语言")
+  notify: bool = Field(default=True, description="是否开启通知")
+
+class Address(BaseModel):
+  id: str = Field(..., description="地址唯一 ID")
+  is_default: bool = Field(..., description="是否默认地址")
+  region: str = Field(..., description="省市区或区域信息")
+  detail: str = Field(..., description="详细地址")
+  name: str = Field(..., description="收件人姓名")
+  phone: str = Field(..., description="收件人电话")
+
+class Profile(BaseModel):
+  nickname: Optional[str] = Field("", description="昵称")
+  gender: Optional[str] = Field("", description="性别展示值")
+  age: Optional[str] = Field("", description="年龄展示值")
+  birthday: Optional[str] = Field("", description="生日展示值，格式为 yyyy.MM.dd")
+  email: Optional[str] = Field("", description="联系邮箱")
+  phone: Optional[str] = Field("", description="联系电话")
+  address_list: List[Address] = Field(default_factory=list, description="地址列表")
+  avatar_base64: Optional[str] = Field("", description="头像的 Base64 内容")
+  avatar_mime_type: Optional[str] = Field("image/jpeg", description="头像 MIME 类型")
+
+
+class SleepElement(BaseModel):
+  start_time: int = Field(..., description="睡眠阶段开始时间戳（秒级）")
+  duration: float = Field(..., description="睡眠阶段持续时长，单位分钟")
+  sleep_type: str = Field(..., description="睡眠阶段类型，如REM、core,deep,rem,awake")
 
 class SleepResult(BaseModel):
-  timestamp: int = Field(..., description="数据记录的时间戳（秒级）")
-  sleep_score: Optional[float] = Field(None, description="睡眠得分，范围0-100") 
-  fall_sleep_efficiency: Optional[float] = Field(None, description="入睡效率，范围0-100")
-  sleep_struct: Optional[float] = Field(None, description="睡眠结构，包含快速动眼、核心、深度睡眠占比，单位%")
-  sleep_var: Optional[float] = Field(None, description="夜间波动，包含觉醒次数、觉醒时长、心率波动等，单位%")
+  timestamp: int = Field(..., description="数据 update 时间戳（秒级）")
+  sleep_quality: Optional[float] = Field(None, description="睡眠得分，范围0-100") 
+  soe: Optional[float] = Field(None, description="入睡效率，范围0-100")
+  sleep_arch_index: Optional[float] = Field(None, description="睡眠结构，包含快速动眼、核心、深度睡眠占比，单位%")
+  night_var_index: Optional[float] = Field(None, description="夜间波动，包含觉醒次数、觉醒时长、心率波动等，单位%")
 
-  first_sleep_time: Optional[int] = Field(None, description="首次入睡时间，单位分钟")
-  heart_rate_before_sleep: Optional[float] = Field(None, description="入睡前心率，单位bpm")
-  bpm_before_sleep: Optional[float] = Field(None, description="入睡前呼吸频率，单位次/分钟")
+  first_sleep_time: Optional[str] = Field(None, description="首次入睡时间, 00:00")
+  hr_before_sleep: Optional[float] = Field(None, description="入睡前心率，单位bpm")
+  rr_before_sleep: Optional[float] = Field(None, description="入睡前呼吸频率，单位次/分钟")
 
-  rem_sleep_duration: Optional[float] = Field(None, description="fast eye movement sleep 单位分钟")
-  core_sleep_duration_core: Optional[float] = Field(None, description="core sleep 单位分钟")
-  deep_sleep_duration: Optional[float] = Field(None, description="deep sleep sleep 单位分钟")
-
-  night_awake_times: Optional[int] = Field(None, description="夜间觉醒次数")
-  night_awake_duration: Optional[int] = Field(None, description="夜间觉醒时长，单位分钟")
-  night_awake_type: Optional[str] = Field(None, description="夜间觉醒类型，如自然觉醒、环境干扰、身体不适等")
-  heart_rate_var: Optional[float] = Field(None, description="心率波动，单位bpm")
+  hrv: Optional[float] = Field(None, description="心率波动，单位bpm")
   respiratory_var: Optional[float] = Field(None, description="呼吸频率波动，单位次/分钟")
-  
-  time_in_bed: Optional[int] = Field(None, description="躺床时间，单位分钟")
+
   avg_heart_rate: Optional[float] = Field(None, description="平均心率，单位bpm")
   avg_respiratory: Optional[float] = Field(None, description="平均呼吸频率，单位次/分钟")
   avg_temperature: Optional[float] = Field(None, description="体温，单位摄氏度")
 
   scene_preference: List[Tuple[str, float]] = Field(None, description="场景偏好，如喜欢的睡眠场景名称")
+  # the recent sleep status sequence, with start_time, duration and sleep_type, used for sleep analysis and advice generation
+  sleep_status: List[SleepElement] = Field(default_factory=list, description="the seq for the sleep status, with start_time, duration and sleep_type")
+
+  @property
+  def sequence_summaries(self):
+    awake_types = {}
+    for seq in self.sleep_status:
+      if seq.sleep_type == "awake":
+        awake_types[seq.sleep_type] = awake_types.get(seq.sleep_type, 0) + 1
+
+    max_awake_type = max(awake_types, key=awake_types.get) if awake_types else None
+
+    return {
+      "rem_sleep_duration": sum(seq.duration for seq in self.sleep_status if seq.sleep_type == "rem"),
+      "core_sleep_duration": sum(seq.duration for seq in self.sleep_status if seq.sleep_type == "core"),
+      "deep_sleep_duration": sum(seq.duration for seq in self.sleep_status if seq.sleep_type == "deep"),
+      "night_awake_duration": sum(seq.duration for seq in self.sleep_status if seq.sleep_type == "awake"),
+      "night_awake_count": sum(1 for seq in self.sleep_status if seq.sleep_type == "awake"),
+      "night_awake_type": max_awake_type,
+      "time_in_bed": sum(seq.duration for seq in self.sleep_status) 
+    }
+  
 
 class UserProfile(BaseModel):
   """用户画像信息"""
@@ -74,12 +111,20 @@ class UserProfile(BaseModel):
 
   behaviors: Dict[str, List[Tuple[int, Any]]] = Field(
     default_factory=lambda: {
-      "heart_rate": [], "blood_oxygen": [], "sleep_status": [],
-      "clicks": [], "plays": []
+      # 生命体征
+      "heart_rate": [], "blood_oxygen": [], "resting_heart_rate": [],
+      "heart_rate_variability_sdnn": [], "respiratory_rate": [],
+      "sleeping_wrist_temperature": [], "body_temperature": [],
+      # 睡眠状态
+      "sleep_status": [],
+      "sleep_stage_deep": [], "sleep_stage_rem": [], "sleep_stage_light": [],
+      # 交互行为
+      "clicks": [], "plays": [],
     }
   )
 
-  sleep_data:  List[Tuple[int, SleepResult]] = Field(default_factory=list)
+  # only the recent 7 days sleep data will be returned to app, and used for sleep analysis and advice generation, such as the data of yestoday night
+  sleep_data:  List[SleepResult] = Field(default_factory=list)
 
   sleep_analysis: Dict[str, Any] = Field(
     default_factory=lambda: {
@@ -103,6 +148,8 @@ class UserProfile(BaseModel):
     }
   )
 
+  profile: Optional[Profile]
+
 
 class ProfileData(BaseModel):
   uid: Optional[str] = Field(None, description="uid, just for debug")
@@ -111,10 +158,11 @@ class ProfileData(BaseModel):
 
 
 class ProfileRequest(BaseModel):
-  request_type: str = Field("query_profile", description="query| update")
-  timestamp : int = Field(..., description="请求发送时间戳（秒级），必填")
-  version : str = Field("1.0", description="version, needed, such as 1.0")
+  request_type: str = Field("query_profile", description="query| update| analysis_overview| insight| daily_report| weekly_report| month_report")
+  timestamp: int = Field(..., description="请求发送时间戳（秒级），必填")
+  version: str = Field("1.0", description="version, needed, such as 1.0")
   data: ProfileData
+  modules: Optional[List[str]] = Field(default_factory=list, description="Modules to include in the response")
 
   @model_validator(mode='after')
   def validate_data_by_request_type(self):
@@ -126,14 +174,13 @@ class ProfileRequest(BaseModel):
       raise ValueError(
         f"request ：{missing_fields} must have one"
       )
-    
+
     return self
-  
 
 # --- 响应类 ---
 class ProfileResponse(BaseResponse):
-  request_type: str = Field("query_profile", description="query| update")
-  data: Optional[ProfileData]
+  request_type: str = Field("query_profile", description="query| update| analysis_overview| insight| daily_report| weekly_report| month_report")
+  data: Optional[Dict[str, Any]] = Field(None, description="Response data based on modules")
 
 
 class InvalidOrExpiredTokenResp(BaseResponse):
@@ -143,6 +190,33 @@ class InvalidOrExpiredTokenResp(BaseResponse):
 class InvalidReqFormatResp(BaseResponse):
   code : int = 400
   msg : str = "invalid request format"
+
+# -------------------------- 分析接口模型 --------------------------
+class AnalysisData(BaseModel):
+  uid: Optional[str] = Field(None, description="用户ID")
+  jwt_token: Optional[str] = Field(None, description="JWT token")
+  language: str = Field("en", description="语言代码，如 zh-Hans / en / ja")
+  date: Optional[str] = Field(None, description="当前自然日 yyyy-MM-dd")
+  timezone: str = Field("UTC", description="时区 ID，如 Asia/Shanghai")
+  start_date: Optional[str] = Field(None, description="统计起始日期 yyyy-MM-dd")
+  end_date: Optional[str] = Field(None, description="统计结束日期 yyyy-MM-dd")
+  modules: List[str] = Field(default_factory=list, description="需要返回的模块列表")
+
+class AnalysisRequest(BaseModel):
+  request_type: str = Field(..., description="analysis_overview|analysis_sleep_day|analysis_sleep_week|analysis_sleep_month|analysis_explore")
+  version: str = Field("1.0")
+  timestamp: int = Field(..., description="请求时间戳（秒级）")
+  data: AnalysisData
+
+  @model_validator(mode='after')
+  def validate_auth(self):
+    if self.data.jwt_token is None and self.data.uid is None:
+      raise ValueError("uid or jwt_token must be provided")
+    return self
+
+class AnalysisResponse(BaseResponse):
+  request_type: str
+  data: Optional[Dict[str, Any]] = None
 
 if __name__ == "__main__":
   update_req = {
