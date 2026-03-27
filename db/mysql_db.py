@@ -219,6 +219,111 @@ def soft_delete_user(uid: str) -> dict:
   except Exception as e:
     return {"code": 500, "msg": f"软删除用户异常：{str(e)}", "data": None}
   
+# ── Web registration: email+password, phone, WeChat ──────────────────────────
+
+def init_web_columns():
+  """
+  Add extra columns to user_auth if they don't already exist.
+  Called once at startup. Safe to run multiple times.
+  """
+  columns = {
+    "password_hash": "VARCHAR(128) DEFAULT NULL COMMENT '密码哈希(PBKDF2-SHA256)'",
+    "phone":         "VARCHAR(20)  DEFAULT NULL COMMENT '手机号'",
+    "wechat_openid": "VARCHAR(64)  DEFAULT NULL COMMENT '微信openid'",
+    "wechat_unionid":"VARCHAR(64)  DEFAULT NULL COMMENT '微信unionid'",
+    "nickname":      "VARCHAR(64)  DEFAULT NULL COMMENT '昵称'",
+    "avatar_url":    "VARCHAR(512) DEFAULT NULL COMMENT '头像URL'",
+  }
+  db_name = os.getenv("MYSQL_DB", "")
+  for col, definition in columns.items():
+    check_sql = (
+      "SELECT COUNT(*) as cnt FROM information_schema.COLUMNS "
+      "WHERE TABLE_SCHEMA=%s AND TABLE_NAME='user_auth' AND COLUMN_NAME=%s"
+    )
+    row = mysql_db.query_one(check_sql, (db_name, col))
+    if row and row["cnt"] == 0:
+      try:
+        mysql_db.execute(f"ALTER TABLE user_auth ADD COLUMN {col} {definition}", ())
+        logging.info("Added column %s to user_auth", col)
+      except Exception as e:
+        logging.warning("Could not add column %s: %s", col, e)
+  # Unique index on phone (ignore error if already exists)
+  for col in ("phone", "wechat_openid"):
+    try:
+      mysql_db.execute(
+        f"CREATE UNIQUE INDEX idx_user_auth_{col} ON user_auth ({col})", ()
+      )
+    except Exception:
+      pass
+
+
+def register_user_with_password(email: str, uid: str, salt: str,
+                                 password_hash: str, device_list: str) -> int:
+  """Insert a new user who registered with email+password (web flow)."""
+  sql = """
+  INSERT INTO user_auth (uid, email, salt, password_hash, device_list)
+  VALUES (%s, %s, %s, %s, %s)
+  """
+  return mysql_db.execute(sql, (uid, email, salt, password_hash, device_list))
+
+
+def get_user_password_hash(email: str) -> str | None:
+  """Return stored password_hash for the given email, or None."""
+  sql = "SELECT password_hash FROM user_auth WHERE email=%s AND status=1"
+  row = mysql_db.query_one(sql, (email,))
+  return row["password_hash"] if row else None
+
+
+def get_user_by_phone(phone: str) -> "UserData | None":
+  """Query user by phone number."""
+  sql = ("SELECT uid, email, salt, status, device_list, register_time, update_time "
+         "FROM user_auth WHERE phone=%s")
+  row = mysql_db.query_one(sql, (phone,))
+  return UserData.model_validate(row) if row else None
+
+
+def register_phone_user(phone: str, uid: str, salt: str, device_list: str) -> int:
+  """Insert a new user who registered via phone+SMS code."""
+  sql = """
+  INSERT INTO user_auth (uid, phone, salt, device_list)
+  VALUES (%s, %s, %s, %s)
+  """
+  return mysql_db.execute(sql, (uid, phone, salt, device_list))
+
+
+def get_or_create_wechat_user(openid: str, unionid: str | None,
+                               nickname: str, avatar_url: str) -> "UserData":
+  """
+  Find user by wechat_openid (or wechat_unionid).
+  If not found, create a new record.
+  Returns the UserData of the (possibly new) user.
+  """
+  # Try openid first, then unionid
+  for col, val in [("wechat_openid", openid), ("wechat_unionid", unionid)]:
+    if not val:
+      continue
+    sql = ("SELECT uid, email, salt, status, device_list, register_time, update_time "
+           f"FROM user_auth WHERE {col}=%s AND status=1")
+    row = mysql_db.query_one(sql, (val,))
+    if row:
+      return UserData.model_validate(row)
+
+  # New WeChat user — generate uid + salt
+  import os as _os, hashlib as _hl
+  salt = _os.urandom(16).hex()
+  raw_uid = _hl.sha256((salt + openid).encode()).hexdigest()
+  sql = """
+  INSERT INTO user_auth (uid, salt, wechat_openid, wechat_unionid, nickname, avatar_url, device_list)
+  VALUES (%s, %s, %s, %s, %s, %s, %s)
+  """
+  mysql_db.execute(sql, (raw_uid, salt, openid, unionid or None, nickname, avatar_url, "wechat"))
+  row = mysql_db.query_one(
+    "SELECT uid, email, salt, status, device_list, register_time, update_time "
+    "FROM user_auth WHERE uid=%s", (raw_uid,)
+  )
+  return UserData.model_validate(row)
+
+
 def update_user_device_list(uid: str, new_device_list: str) -> int:
   """
   修改用户设备列表，数据库自动更新 update_time 为当前时间

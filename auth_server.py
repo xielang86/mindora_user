@@ -1,15 +1,27 @@
 import datetime
+import hashlib
+import secrets
 import jwt
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 from auth import AuthRequest, AuthResponse, AuthRequestType, JWTTokenData, AuthData
 import logging
 from common.email import send_verify_code_via_163, generate_verify_code
+from common.sms import send_verify_code_via_sms
+from common import wechat as wechat_svc
 from config import Config
 import os
 import jwt
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
-from db.mysql_db import insert_user, get_user_by_email_or_uid, insert_or_restore_user, get_active_user_by_email_or_uid, soft_delete_user
+from db.mysql_db import (
+  insert_user, get_user_by_email_or_uid, insert_or_restore_user,
+  get_active_user_by_email_or_uid, soft_delete_user,
+  # web registration additions
+  init_web_columns, register_user_with_password, get_user_password_hash,
+  get_user_by_phone, register_phone_user, get_or_create_wechat_user,
+)
 from db.redis_db import get_verify_code, set_jwt_token, set_verify_code
 from common.util import normalize_email
 from uid.uuid import generate_uid_and_salt
@@ -20,6 +32,22 @@ run_dir = os.getenv("RUN_DIR")
 logger.init_log(f"{run_dir}/auth_logs")
 
 app = FastAPI(title="Auth Server")
+
+app.add_middleware(
+  CORSMiddleware,
+  allow_origins=["http://localhost:8080", "http://127.0.0.1:8080",
+                 "http://192.168.1.0/24"],  # adjust for LAN access
+  allow_origin_regex=r"http://192\.168\.\d+\.\d+:\d+",
+  allow_credentials=True,
+  allow_methods=["*"],
+  allow_headers=["*"],
+)
+
+# Ensure web columns (password_hash, phone, wechat_openid …) exist in DB
+try:
+  init_web_columns()
+except Exception as _e:
+  logging.warning("init_web_columns failed (OK on first run): %s", _e)
 
 
 # Mock database for demonstration
@@ -33,6 +61,38 @@ mock_db = {
 JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY")
 JWT_EXPIRE_SECONDS = int(os.getenv("JWT_EXPIRE_SECONDS"))
 VERIFY_CODE_EXPIRE_SECONDS = int(os.getenv("VERIFY_CODE_EXPIRE_SECONDS"))
+
+# ── Password helpers (PBKDF2-SHA256, no extra deps) ──────────────────────────
+
+def _hash_password(password: str, salt: str) -> str:
+  key = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 200_000)
+  return key.hex()
+
+def _verify_password(password: str, stored_hash: str, salt: str) -> bool:
+  return secrets.compare_digest(_hash_password(password, salt), stored_hash)
+
+# ── JWT builder ───────────────────────────────────────────────────────────────
+
+def _make_jwt(uid: str, email: str | None) -> tuple[str, int]:
+  """Return (jwt_token, expire_days)."""
+  expire_time = datetime.now() + timedelta(seconds=JWT_EXPIRE_SECONDS)
+  token = jwt.encode(
+    {"uid": uid, "email": email or "", "exp": expire_time},
+    JWT_SECRET_KEY,
+    algorithm=Config.ALGORITHM,
+  )
+  return token, max(1, int(JWT_EXPIRE_SECONDS / 86400))
+
+# ── SMS verification code key ─────────────────────────────────────────────────
+
+def _sms_code_key(phone: str, device_id: str) -> tuple[str, str]:
+  """Return (redis_email_arg, redis_device_arg) reusing the existing redis helpers."""
+  return f"sms:{phone}", str(device_id) if device_id else "web"
+
+
+# =============================================================================
+# Existing handlers
+# =============================================================================
 
 def send_verify_code_handler(data: AuthData):
   MY_163_EMAIL = "mindora2026@163.com"
@@ -209,6 +269,198 @@ def del_user(data: AuthData) -> AuthResponse:
 
   return resp
 
+# =============================================================================
+# Web site handlers
+# =============================================================================
+
+def register_with_email_password_handler(data: AuthData) -> AuthResponse:
+  """邮箱+验证码+密码注册"""
+  resp = AuthResponse(
+    request_type=AuthRequestType.REGISTER_WITH_EMAIL_PASSWORD,
+    code=0, msg="注册成功", data=None,
+  )
+  normalized_email = normalize_email(data.email)
+
+  # 1. Check duplicate
+  if get_user_by_email_or_uid(email=normalized_email):
+    raise HTTPException(status_code=400, detail="该邮箱已注册")
+
+  # 2. Verify email code (reuses existing email code flow)
+  stored_code = None
+  if Config.Mode != 1:
+    stored_code = get_verify_code(normalized_email, str(data.device_id) if data.device_id else "web")
+  else:
+    stored_code = "1234"
+
+  if not stored_code:
+    raise HTTPException(status_code=401, detail="验证码已过期或不存在")
+  if stored_code != data.verify_code:
+    raise HTTPException(status_code=401, detail="验证码错误")
+
+  # 3. Hash password
+  uid, salt = generate_uid_and_salt(normalized_email)
+  pw_hash = _hash_password(data.password, salt)
+
+  # 4. Insert user
+  result = register_user_with_password(
+    normalized_email, uid, salt, pw_hash,
+    str(data.device_id) if data.device_id else "web",
+  )
+  if result < 1:
+    logging.error("register_user_with_password failed for %s", normalized_email)
+    raise HTTPException(status_code=500, detail="注册失败，请稍后重试")
+
+  # 5. Return JWT
+  token, expire_days = _make_jwt(uid, normalized_email)
+  if Config.Mode != 1:
+    set_jwt_token(uid, str(data.device_id) if data.device_id else "web", token, JWT_EXPIRE_SECONDS)
+
+  resp.data = JWTTokenData(uid=uid, email=normalized_email, token=token, expire_days=expire_days)
+  logging.info("Registered (email+password): %s uid=%s", normalized_email, uid)
+  return resp
+
+
+def login_with_email_password_handler(data: AuthData) -> AuthResponse:
+  """邮箱+密码登录"""
+  resp = AuthResponse(
+    request_type=AuthRequestType.LOGIN_WITH_EMAIL_PASSWORD,
+    code=0, msg="登录成功", data=None,
+  )
+  normalized_email = normalize_email(data.email)
+
+  # 1. Fetch user
+  user = get_active_user_by_email_or_uid(email=normalized_email)
+  if not user:
+    raise HTTPException(status_code=401, detail="邮箱或密码错误")
+
+  # 2. Verify password
+  stored_hash = get_user_password_hash(normalized_email)
+  if not stored_hash:
+    raise HTTPException(status_code=401, detail="该账号未设置密码，请使用验证码登录")
+  if not _verify_password(data.password, stored_hash, user.salt):
+    raise HTTPException(status_code=401, detail="邮箱或密码错误")
+
+  # 3. Return JWT
+  token, expire_days = _make_jwt(user.uid, normalized_email)
+  if Config.Mode != 1:
+    set_jwt_token(user.uid, str(data.device_id) if data.device_id else "web", token, JWT_EXPIRE_SECONDS)
+
+  resp.data = JWTTokenData(uid=user.uid, email=normalized_email, token=token, expire_days=expire_days)
+  logging.info("Login (email+password): %s uid=%s", normalized_email, user.uid)
+  return resp
+
+
+def send_sms_code_handler(data: AuthData) -> AuthResponse:
+  """发送手机短信验证码"""
+  phone = data.phone
+  resp = AuthResponse(
+    request_type=AuthRequestType.SEND_SMS_CODE,
+    code=0, msg="验证码已发送", data=None,
+  )
+  code = "1234" if Config.Mode == 1 else generate_verify_code(6)
+
+  if Config.Mode != 1:
+    sms_email, sms_device = _sms_code_key(phone, data.device_id)
+    set_verify_code(sms_email, sms_device, code, VERIFY_CODE_EXPIRE_SECONDS)
+    result = send_verify_code_via_sms(phone, code)
+    resp.code = result.get("code")
+    resp.msg  = result.get("msg")
+  else:
+    logging.info("[DEV SMS mock] phone=%s code=%s", phone, code)
+
+  logging.info("SMS code sent: phone=%s code=%s", phone, code)
+  return resp
+
+
+def register_or_login_with_phone_handler(data: AuthData, is_register: bool) -> AuthResponse:
+  """手机号+SMS验证码 注册 or 登录（登录时若无账号自动注册）"""
+  req_type = (AuthRequestType.REGISTER_WITH_PHONE if is_register
+              else AuthRequestType.LOGIN_WITH_PHONE_SMS)
+  resp = AuthResponse(request_type=req_type, code=0, msg="成功", data=None)
+  phone = data.phone
+
+  # 1. Verify SMS code
+  if Config.Mode != 1:
+    sms_email, sms_device = _sms_code_key(phone, data.device_id)
+    stored_code = get_verify_code(sms_email, sms_device)
+    if not stored_code:
+      raise HTTPException(status_code=401, detail="验证码已过期或不存在")
+    if stored_code != data.verify_code:
+      raise HTTPException(status_code=401, detail="验证码错误")
+
+  # 2. Check if user exists
+  user = get_user_by_phone(phone)
+
+  if is_register and user and user.status == 1:
+    raise HTTPException(status_code=400, detail="该手机号已注册")
+
+  if user is None or user.status == 0:
+    # Auto-register
+    uid, salt = generate_uid_and_salt(phone)
+    result = register_phone_user(phone, uid, salt, str(data.device_id) if data.device_id else "web")
+    if result < 1:
+      logging.error("register_phone_user failed for %s", phone)
+      raise HTTPException(status_code=500, detail="注册失败，请稍后重试")
+    user = get_user_by_phone(phone)
+    resp.msg = "注册并登录成功"
+  else:
+    resp.msg = "登录成功"
+
+  # 3. Return JWT
+  token, expire_days = _make_jwt(user.uid, user.email)
+  if Config.Mode != 1:
+    set_jwt_token(user.uid, str(data.device_id) if data.device_id else "web", token, JWT_EXPIRE_SECONDS)
+
+  resp.data = JWTTokenData(
+    uid=user.uid,
+    email=user.email or f"{phone}@phone.local",
+    token=token,
+    expire_days=expire_days,
+  )
+  logging.info("Phone auth: phone=%s uid=%s", phone, user.uid)
+  return resp
+
+
+def wechat_callback_handler(data: AuthData) -> AuthResponse:
+  """微信OAuth code换token，自动注册/登录"""
+  resp = AuthResponse(
+    request_type=AuthRequestType.WECHAT_CALLBACK,
+    code=0, msg="微信登录成功", data=None,
+  )
+
+  if not wechat_svc.is_wechat_enabled():
+    raise HTTPException(status_code=503, detail="微信登录未配置，请联系管理员")
+
+  try:
+    token_data = wechat_svc.exchange_code(data.wechat_code)
+    openid   = token_data["access_token"]   # note: field is access_token
+    openid   = token_data["openid"]
+    wx_token = token_data["access_token"]
+    unionid  = token_data.get("unionid")
+    info     = wechat_svc.get_user_info(wx_token, openid)
+  except Exception as e:
+    logging.error("WeChat OAuth error: %s", e)
+    raise HTTPException(status_code=400, detail=f"微信授权失败：{e}")
+
+  nickname   = info.get("nickname", "微信用户")
+  avatar_url = info.get("headimgurl", "")
+
+  user = get_or_create_wechat_user(openid, unionid, nickname, avatar_url)
+
+  token, expire_days = _make_jwt(user.uid, user.email)
+  if Config.Mode != 1:
+    set_jwt_token(user.uid, "wechat", token, JWT_EXPIRE_SECONDS)
+
+  resp.data = JWTTokenData(
+    uid=user.uid,
+    email=user.email or f"{openid[:8]}@wechat.local",
+    token=token,
+    expire_days=expire_days,
+  )
+  logging.info("WeChat login: openid=%s uid=%s", openid, user.uid)
+  return resp
+
+
 # --- Handlers ---
 @app.post("/auth", response_model=AuthResponse)
 async def handle_auth(request: AuthRequest):
@@ -216,22 +468,63 @@ async def handle_auth(request: AuthRequest):
   req_type = request.request_type
   data = request.data
 
-  # 1. SEND VERIFY CODE
+  # 1. SEND EMAIL VERIFY CODE
   if req_type == AuthRequestType.SEND_VERIFY_CODE:
     return send_verify_code_handler(data)
 
-  # 2. LOGIN WITH EMAIL & VERIFY CODE
+  # 2. LOGIN/REGISTER WITH EMAIL VERIFY CODE (original device flow)
   elif req_type == AuthRequestType.LOGIN_WITH_EMAIL_VERIFY_CODE:
     return auth_by_verify_code(data)
+
   # 3. LOGIN WITH JWT
   elif req_type == AuthRequestType.LOGIN_WITH_JWT:
     logging.info(f"login by jwt: {data}")
     return auth_by_jwt(data)
+
   # 4. DELETE USER
   elif req_type == AuthRequestType.DELETE_USER:
     return del_user(data)
 
+  # ── Web site flows ────────────────────────────────────────────────────────
+  # 5. REGISTER: email + verify code + password
+  elif req_type == AuthRequestType.REGISTER_WITH_EMAIL_PASSWORD:
+    return register_with_email_password_handler(data)
+
+  # 6. LOGIN: email + password
+  elif req_type == AuthRequestType.LOGIN_WITH_EMAIL_PASSWORD:
+    return login_with_email_password_handler(data)
+
+  # 7. SEND SMS CODE
+  elif req_type == AuthRequestType.SEND_SMS_CODE:
+    return send_sms_code_handler(data)
+
+  # 8. REGISTER: phone + SMS code
+  elif req_type == AuthRequestType.REGISTER_WITH_PHONE:
+    return register_or_login_with_phone_handler(data, is_register=True)
+
+  # 9. LOGIN: phone + SMS code (auto-register if new)
+  elif req_type == AuthRequestType.LOGIN_WITH_PHONE_SMS:
+    return register_or_login_with_phone_handler(data, is_register=False)
+
+  # 10. WECHAT: exchange code for token
+  elif req_type == AuthRequestType.WECHAT_CALLBACK:
+    return wechat_callback_handler(data)
+
   raise HTTPException(status_code=400, detail="Unsupported request type")
+
+@app.get("/auth/wechat/qrcode")
+async def wechat_qrcode():
+  """Return WeChat QR-code page URL for PC scan-to-login."""
+  if not wechat_svc.is_wechat_enabled():
+    raise HTTPException(status_code=503, detail="微信登录未配置")
+  url, state = wechat_svc.get_qrcode_url()
+  return {"qrcode_url": url, "state": state}
+
+
+@app.get("/health")
+async def health():
+  return {"status": "ok", "service": "auth_server"}
+
 
 if __name__ == "__main__":
     import uvicorn

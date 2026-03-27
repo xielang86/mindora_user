@@ -33,10 +33,17 @@ class UserData(BaseModel):
 
 # 定义请求类型枚举（区分不同操作）
 class AuthRequestType(StrEnum):
-  SEND_VERIFY_CODE = "send_verify_code"  # 发送验证码
-  LOGIN_WITH_EMAIL_VERIFY_CODE = "login_with_email_verify_code"   # email+验证码登录
-  LOGIN_WITH_JWT = "login_with_jwt"      # JWT令牌登录: cloud & mindora
+  SEND_VERIFY_CODE = "send_verify_code"                          # 发送邮箱验证码
+  LOGIN_WITH_EMAIL_VERIFY_CODE = "login_with_email_verify_code"  # email+验证码登录/注册
+  LOGIN_WITH_JWT = "login_with_jwt"                              # JWT令牌登录
   DELETE_USER = "delete_user"
+  # ── Web site registration & login ─────────────────────────────────────────
+  REGISTER_WITH_EMAIL_PASSWORD = "register_with_email_password"  # email+验证码+密码 注册
+  LOGIN_WITH_EMAIL_PASSWORD = "login_with_email_password"        # email+密码 登录
+  SEND_SMS_CODE = "send_sms_code"                                # 发送手机短信验证码
+  REGISTER_WITH_PHONE = "register_with_phone"                    # 手机号+SMS验证码 注册
+  LOGIN_WITH_PHONE_SMS = "login_with_phone_sms"                  # 手机号+SMS验证码 登录/自动注册
+  WECHAT_CALLBACK = "wechat_callback"                            # 微信OAuth code换token
 
   def __str__(self):
     return self.value
@@ -46,13 +53,35 @@ class AuthData(BaseModel):
   # 可选字段（根据请求类型动态校验必填）
   email: EmailStr | None = Field(None, description="用户邮箱，send_verify code/login_with_email_verify_code 必填")
   device_id: UUID | None = Field(None, description="设备唯一标识（UUID格式），send_verify_code/login_with_email_verify_code 必填")
-  verify_code: str | None = Field(None, description="4 位数字验证码，login_with_email_verify_code 必填")
+  verify_code: str | None = Field(None, description="4-6位数字验证码")
   jwt_token: str | None = Field(None, description="JWT登录令牌，login_with_jwt 必填")
+  # ── Web site fields ─────────────────────────────────────────────────────
+  phone: str | None = Field(None, description="手机号（11位中国大陆），register_with_phone/login_with_phone_sms 必填")
+  password: str | None = Field(None, description="登录密码（>=8位），register_with_email_password/login_with_email_password 必填")
+  wechat_code: str | None = Field(None, description="微信OAuth code，wechat_callback 必填")
+  state: str | None = Field(None, description="微信OAuth state")
 
   @field_validator("verify_code")
   def check_verify_code_format(cls, v):
-    if v is not None and not (v.isdigit() and len(v) == 4):
-      raise ValueError("verify code must be 4 numbers")
+    if v is not None and not (v.isdigit() and 4 <= len(v) <= 6):
+      raise ValueError("verify code must be 4-6 digits")
+    return v
+
+  @field_validator("phone")
+  def check_phone_format(cls, v):
+    import re
+    if v is not None and not re.fullmatch(r"1[3-9]\d{9}", v.strip()):
+      raise ValueError("phone must be 11-digit mainland China mobile number")
+    return v.strip() if v else v
+
+  @field_validator("password")
+  def check_password(cls, v):
+    import re
+    if v is not None:
+      if len(v) < 8:
+        raise ValueError("password must be at least 8 characters")
+      if not re.search(r"[A-Za-z]", v) or not re.search(r"\d", v):
+        raise ValueError("password must contain letters and digits")
     return v
 
   @field_validator("jwt_token")
@@ -152,11 +181,30 @@ class AuthRequest(BaseModel):
         raise ValueError(
           f"request_type={req_type}时，data.jwt_token必填"
         )
-      # 该场景下，email/device_id/verify_code必须为None
-      # if data.email is not None or data.device_id is not None or data.verify_code is not None:
-      #   raise ValueError(
-      #     f"request_type={req_type}时，data.email/data.device_id/data.verify_code必须为None"
-      #   )
+
+    # ── Web site scenarios ────────────────────────────────────────────────
+    elif req_type == AuthRequestType.REGISTER_WITH_EMAIL_PASSWORD:
+      missing = [f for f in ["email", "verify_code", "password"] if getattr(data, f) is None]
+      if missing:
+        raise ValueError(f"request_type={req_type}时，data中以下字段必填：{missing}")
+
+    elif req_type == AuthRequestType.LOGIN_WITH_EMAIL_PASSWORD:
+      missing = [f for f in ["email", "password"] if getattr(data, f) is None]
+      if missing:
+        raise ValueError(f"request_type={req_type}时，data中以下字段必填：{missing}")
+
+    elif req_type == AuthRequestType.SEND_SMS_CODE:
+      if data.phone is None:
+        raise ValueError(f"request_type={req_type}时，phone必填")
+
+    elif req_type in (AuthRequestType.REGISTER_WITH_PHONE, AuthRequestType.LOGIN_WITH_PHONE_SMS):
+      missing = [f for f in ["phone", "verify_code"] if getattr(data, f) is None]
+      if missing:
+        raise ValueError(f"request_type={req_type}时，data中以下字段必填：{missing}")
+
+    elif req_type == AuthRequestType.WECHAT_CALLBACK:
+      if data.wechat_code is None:
+        raise ValueError(f"request_type={req_type}时，wechat_code必填")
 
     return self
 
