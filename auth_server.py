@@ -143,9 +143,10 @@ def auth_by_verify_code(data: AuthData) -> AuthResponse:
 
   try:
     normalized_email = normalize_email(data.email)
+    device_id = str(data.device_id)
     verify_code = "1234"
     if Config.Mode != 1:
-      verify_code = get_verify_code(normalized_email, data.device_id)
+      verify_code = get_verify_code(normalized_email, device_id)
 
     if not verify_code:
       resp.code = 401
@@ -164,7 +165,7 @@ def auth_by_verify_code(data: AuthData) -> AuthResponse:
     if not user:
       # new user：gen UID and insert to db
       uid, salt = generate_uid_and_salt(normalized_email)
-      insert_result = insert_user(normalized_email, uid, salt, device_list=data.device_id)
+      insert_result = insert_user(normalized_email, uid, salt, device_list=device_id)
       if insert_result < 1:
         resp.code = 500
         resp.msg = f"insert new user error for {data}, result={insert_result}"
@@ -195,7 +196,7 @@ def auth_by_verify_code(data: AuthData) -> AuthResponse:
     )
     
     # 步骤5：存储JWT Token到Redis（和JWT过期时间一致）
-    set_jwt_token(uid, data.device_id, jwt_token, JWT_EXPIRE_SECONDS)
+    set_jwt_token(uid, device_id, jwt_token, JWT_EXPIRE_SECONDS)
     resp.data = JWTTokenData(
       uid=uid,
       email=data.email,
@@ -203,6 +204,8 @@ def auth_by_verify_code(data: AuthData) -> AuthResponse:
       expire_days= max(1, int(JWT_EXPIRE_SECONDS / 3600 / 24))
     )
   
+  except HTTPException:
+    raise
   except Exception as e:
     # 捕获所有异常，返回服务器错误
     resp.code = 500
@@ -216,7 +219,7 @@ def auth_by_verify_code(data: AuthData) -> AuthResponse:
 def decode_access_token(token: str):
   """Decodes and validates the JWT token."""
   try:
-    payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=Config.ALGORITHM)
+    payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=[Config.ALGORITHM])
     return payload
   except jwt.ExpiredSignatureError:
     raise HTTPException(status_code=401, detail="Token expired")
@@ -225,29 +228,34 @@ def decode_access_token(token: str):
  
 
 def auth_by_jwt(data: AuthData) -> AuthResponse:
-  resp = AuthResponse(
-    request_type = AuthRequestType(AuthRequestType.LOGIN_WITH_JWT),
-    code=0,
-    msg="Token is valid",
-    data= None
-  )
-
   """Decodes and validates the JWT token."""
   payload = decode_access_token(data.jwt_token)
 
-  if Config.Mode == 1:
-    return resp
-
-  email = payload.get("email")
   uid = payload.get("uid")
+  email = payload.get("email")
+
+  if Config.Mode == 1:
+    token, expire_days = _make_jwt(uid, email)
+    return AuthResponse(
+      request_type=AuthRequestType(AuthRequestType.LOGIN_WITH_JWT),
+      code=0,
+      msg="Token is valid",
+      data=JWTTokenData(uid=uid, email=email or "", token=token, expire_days=expire_days),
+    )
 
   user = get_active_user_by_email_or_uid(email=None, uid=uid)
   if user is None:
-    resp.code = 500
-    resp.msg = "cannot find user by jwt_token"
-    raise HTTPException(status_code=401, detail="jwt expire")
+    raise HTTPException(status_code=401, detail="cannot find user by jwt_token")
 
-  return resp
+  token, expire_days = _make_jwt(uid, email)
+  set_jwt_token(uid, "jwt_refresh", token, JWT_EXPIRE_SECONDS)
+
+  return AuthResponse(
+    request_type=AuthRequestType(AuthRequestType.LOGIN_WITH_JWT),
+    code=0,
+    msg="Token is valid",
+    data=JWTTokenData(uid=uid, email=email or "", token=token, expire_days=expire_days),
+  )
 
 def del_user(data: AuthData) -> AuthResponse:
   resp = AuthResponse(request_type=AuthRequestType.DELETE_USER, code=0, msg="User deleted")

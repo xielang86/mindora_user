@@ -35,7 +35,7 @@ if __name__ == "__main__":
     print("用法：python query_profile.py <用户UID>")
     print("示例：python query_profile.py user_123")
     sys.exit(1)
-  # uri = "http://121.43.54.25:9001"
+  # uri = "https://api.midnora316.com/user_server"
   uri = "http://localhost:9001"
   token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1aWQiOiJkYTRiYzFiNmJhZjBjOGFiMGJlN2E3ZjE1NzE0NGY0Y2EyNzQzNTllNTgzNmM5OTQxYzFjZDQxMjJjMzliNjFhIiwiZW1haWwiOiJ4aWVsYW5ndGNAMTYzLmNvbSIsImV4cCI6MTc2OTAwNTUzNn0.4Rn4RjKfXfsr_oT_gFfhZMjKDGaaB0sSGxDfyProYF8"
   asyncio.run(query_profile(token, uri))

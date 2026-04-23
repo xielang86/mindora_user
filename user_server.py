@@ -13,6 +13,7 @@ from user_profile import (
   UserProfile, ProfileRequest, ProfileResponse, ProfileData,
   InvalidOrExpiredTokenResp, InvalidReqFormatResp, BaseResponse,
   AnalysisRequest, AnalysisResponse,
+  SleepAdviceRequest, SleepAdviceResponse, SleepAdviceResult,
 )
 from auth import AuthRequest
 from uid.uuid import get_or_create_uuid
@@ -150,10 +151,12 @@ class UserServer:
     self.app.router.add_post('/user_profile', self.handle_profile_request_http)
     self.app.router.add_post('/login', self.handle_login_http)
     self.app.router.add_post('/analysis', self.handle_analysis_http)
+    self.app.router.add_post('/sleep_advice', self.handle_sleep_advice_http)
 
   def _check_token(self, jwt_token: str)-> dict | None:
+    logging.info(f"in login: {jwt_token}")
     try:
-      payload = jwt.decode(jwt_token, JWT_SECRET_KEY, algorithms=Config.ALGORITHM)
+      payload = jwt.decode(jwt_token, JWT_SECRET_KEY, algorithms=[Config.ALGORITHM])
     except jwt.ExpiredSignatureError:
       logging.error("login token expired")
       return None
@@ -161,7 +164,6 @@ class UserServer:
       logging.error("login token invalid")
       return None
 
-    logging.info(f"in login: {jwt_token}")
 
     logging.info(f"payload: {payload}")
     return payload
@@ -351,6 +353,87 @@ class UserServer:
     except Exception as e:
       logging.error(f"analysis error: {e}")
       return web.json_response(BaseResponse(code=500, msg="Internal server error").model_dump(), status=500)
+
+  # -------------------- /sleep_advice endpoint --------------------
+
+  _DEFAULT_ADVICE_ANALYSIS = (
+    "Your sleep data shows a balanced pattern overall. "
+    "Deep sleep and REM stages are within a healthy range, "
+    "supporting physical recovery and cognitive function."
+  )
+  _DEFAULT_ADVICE_BULLETS = [
+    "Try to maintain a consistent bedtime to reinforce your circadian rhythm.",
+    "Limit screen exposure at least 30 minutes before bed.",
+    "Consider a light breathing exercise or Mindora scene before sleeping.",
+  ]
+  _DEFAULT_ADVICE_HIGHLIGHTS = {
+    "onset": "Sleep onset appears normal.",
+    "deep": "Deep sleep ratio is within the healthy range.",
+    "rem": "REM activity supports memory consolidation.",
+    "rhythm": "Sleep continuity is stable.",
+  }
+
+  async def handle_sleep_advice_http(self, request: web.Request) -> web.Response:
+    """POST /sleep_advice — LLM-powered sleep analysis + actionable advice."""
+    try:
+      body = await request.json()
+      req = SleepAdviceRequest.model_validate(body)
+
+      uid = self._parse_for_uid(req.data)
+      if uid is None:
+        return web.json_response(InvalidOrExpiredTokenResp().model_dump(), status=401)
+      if isinstance(uid, BaseResponse):
+        return web.json_response(uid.model_dump(), status=uid.code)
+
+      profile = self.user_serv.get_profile(uid)
+      date = req.data.date or datetime.date.today().isoformat()
+      language = req.data.language or "en"
+
+      # --- try LLM generation -------------------------------------------------
+      llm_result = None
+      if self.llm.enabled and profile:
+        ctx = extract_sleep_context(profile, req.data)
+        ctx["focus"] = req.data.focus
+        llm_result = await self.llm.generate(
+          "sleep_analysis_advice", ctx, language, [],
+        )
+
+      # --- assemble response ---------------------------------------------------
+      if llm_result:
+        result = SleepAdviceResult(
+          analysis=llm_result.get("analysis", self._DEFAULT_ADVICE_ANALYSIS),
+          advice=llm_result.get("advice", self._DEFAULT_ADVICE_BULLETS),
+          highlights=llm_result.get("highlights", self._DEFAULT_ADVICE_HIGHLIGHTS),
+          date=date,
+          language=language,
+          llm_used=True,
+        )
+      else:
+        # Fallback: static defaults when LLM is disabled or fails
+        result = SleepAdviceResult(
+          analysis=self._DEFAULT_ADVICE_ANALYSIS,
+          advice=list(self._DEFAULT_ADVICE_BULLETS),
+          highlights=dict(self._DEFAULT_ADVICE_HIGHLIGHTS),
+          date=date,
+          language=language,
+          llm_used=False,
+        )
+
+      resp = SleepAdviceResponse(
+        code=0, msg="success",
+        request_type="sleep_analysis_advice",
+        data=result,
+      )
+      return web.json_response(resp.model_dump())
+
+    except ValidationError as e:
+      logging.error(f"sleep_advice validation error: {e}")
+      return web.json_response(InvalidReqFormatResp().model_dump(), status=400)
+    except Exception as e:
+      logging.error(f"sleep_advice error: {e}")
+      return web.json_response(
+        BaseResponse(code=500, msg="Internal server error").model_dump(), status=500
+      )
 
   def _build_analysis_data(self, req: AnalysisRequest, profile: Optional[UserProfile]) -> dict:
     d = req.data

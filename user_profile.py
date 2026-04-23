@@ -218,6 +218,63 @@ class AnalysisResponse(BaseResponse):
   request_type: str
   data: Optional[Dict[str, Any]] = None
 
+
+# -------------------------- 睡眠分析与建议接口 --------------------------
+class SleepAdviceData(BaseModel):
+  """Payload for /sleep_advice requests."""
+  uid: Optional[str] = Field(None, description="用户ID（debug/内网使用）")
+  jwt_token: Optional[str] = Field(None, description="JWT token")
+  language: str = Field("en", description="返回语言, e.g. zh-Hans / en / ja")
+  date: Optional[str] = Field(None, description="目标日期 yyyy-MM-dd，默认最近一晚")
+  timezone: str = Field("UTC", description="时区 ID, 如 Asia/Shanghai")
+  # Optional thematic focus, e.g. ["deep_sleep", "onset"]; empty = full
+  focus: List[str] = Field(default_factory=list, description="希望重点关注的维度")
+
+
+class SleepAdviceRequest(BaseModel):
+  """Request wrapper for the sleep-analysis-and-advice endpoint.
+
+  The server uses the user's recent sleep_data + mindora_record to produce:
+    * a free-form analysis paragraph (2-4 sentences)
+    * a short list of personalised, actionable advice bullets
+    * optional structured highlights (one-liner per pillar)
+  """
+  request_type: str = Field("sleep_analysis_advice",
+                            description="必须为 sleep_analysis_advice")
+  version: str = Field("1.0")
+  timestamp: int = Field(..., description="请求时间戳（秒级）")
+  data: SleepAdviceData
+
+  @model_validator(mode='after')
+  def validate_auth(self):
+    if self.data.jwt_token is None and self.data.uid is None:
+      raise ValueError("uid or jwt_token must be provided")
+    if self.request_type != "sleep_analysis_advice":
+      raise ValueError(
+        f"request_type must be 'sleep_analysis_advice', got '{self.request_type}'"
+      )
+    return self
+
+
+class SleepAdviceResult(BaseModel):
+  """Structured LLM output for sleep analysis + advice."""
+  analysis: str = Field("", description="LLM 生成的整体睡眠分析段落")
+  advice: List[str] = Field(default_factory=list,
+                            description="个性化、可执行的建议要点")
+  highlights: Dict[str, str] = Field(
+    default_factory=dict,
+    description="按维度给出的一句话亮点, e.g. {'onset': '...', 'deep': '...'}"
+  )
+  date: Optional[str] = Field(None, description="分析对应的日期 yyyy-MM-dd")
+  language: str = Field("en", description="回显请求的语言代码")
+  llm_used: bool = Field(True, description="False 代表回退到默认文案")
+
+
+class SleepAdviceResponse(BaseResponse):
+  request_type: str = Field("sleep_analysis_advice")
+  data: Optional[SleepAdviceResult] = None
+
+
 if __name__ == "__main__":
   update_req = {
     "request_type": "update_profile",

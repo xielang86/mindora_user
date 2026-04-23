@@ -1,85 +1,186 @@
+import argparse
+import json
+import os
+import sys
+import time
+import uuid
+from enum import StrEnum
+
 import requests
-import time,sys
-import uuid, json
-from auth import AuthRequest,AuthResponse, AuthRequestType, AuthData
 
-# 配置
-BASE_URL = "http://127.0.0.1:9103/auth"
-# BASE_URL = "https://api.mindora316.com/auth"
-TEST_EMAIL = sys.argv[1]
-DEVICE_ID = uuid.uuid4()
+# DEFAULT_BASE_URL = os.getenv("AUTH_SERVER_URL", "http://127.0.0.1:9103/auth")
+DEFAULT_BASE_URL = os.getenv("AUTH_SERVER_URL", "https://api.mindora316.com/auth")
 
-def print_step(msg):
-  print(f"\n{'='*20} {msg} {'='*20}")
 
-# 自定义JSON编码器：处理UUID类型
-class UUIDEncoder(json.JSONEncoder):
-  def default(self, obj):
-    if isinstance(obj, uuid.UUID):
-      # 将UUID对象转为字符串
-      return str(obj)
-    # 其他类型按默认逻辑处理
-    return super().default(obj)
+class AuthRequestType(StrEnum):
+  SEND_VERIFY_CODE = "send_verify_code"
+  LOGIN_WITH_EMAIL_VERIFY_CODE = "login_with_email_verify_code"
+  LOGIN_WITH_JWT = "login_with_jwt"
+  DELETE_USER = "delete_user"
+  LOGIN_WITH_EMAIL_PASSWORD = "login_with_email_password"
 
-def test_auth_flow():
-  session_jwt = None
 
-  # --- 1. 测试发送验证码 ---
-  print_step("步骤 1: 发送验证码")
-  ts = int(time.time())
-  request = AuthRequest(request_type=AuthRequestType.SEND_VERIFY_CODE, timestamp=ts, version="1.0", data=AuthData(email=TEST_EMAIL, device_id=DEVICE_ID))
-  request_dict = request.model_dump()
-  request_json = json.dumps(request_dict, cls=UUIDEncoder)
-  resp_send = requests.post(BASE_URL, data=request_json)
-  print(f"状态码: {resp_send.status_code}")
-  print(f"响应: {resp_send.json()}")
-  
-  # 提示：因为是模拟，验证码会在服务端控制台打印
-  # 如果你在服务端用的是 secrets 随机生成，请去服务端后台查看打印的值
-  # 这里我们假设你从后台拿到了验证码，或者服务端逻辑为了方便测试打印了它
+def print_step(message: str):
+  print(f"\n{'=' * 20} {message} {'=' * 20}")
 
-  # --- 2. 测试验证码登录 (及注册) ---
-  print_step("步骤 2: 验证码登录")
-  verify_code = input("\n请输入服务端控制台显示的 4 位验证码: ")
-  request.request_type = AuthRequestType.LOGIN_WITH_EMAIL_VERIFY_CODE
-  request.data = AuthData(email=TEST_EMAIL, device_id=DEVICE_ID, verify_code=verify_code)
-  request_dict = request.model_dump()
-  request_json = json.dumps(request_dict, cls=UUIDEncoder)
-  resp_login = requests.post(BASE_URL, data=request_json)
-  print(f"响应: {resp_login}")
-  resp = AuthResponse.model_validate(resp_login.json())
-  print(f"响应body data: {resp}")
 
-  jwt_token = resp.data.token
+class AuthClient:
+  def __init__(self, base_url: str, email: str, device_id: str | None = None, timeout: int = 15):
+    self.base_url = base_url
+    self.email = email
+    self.device_id = uuid.UUID(device_id) if device_id else uuid.uuid4()
+    self.timeout = timeout
+    self.session = requests.Session()
+    self.session.trust_env = False
 
-  # --- 3. 测试 JWT 令牌登录 ---
-  print_step("步骤 3: JWT 登录验证")
-  request.request_type = AuthRequestType.LOGIN_WITH_JWT
-  request.data = AuthData(emai=TEST_EMAIL, device_id=DEVICE_ID, jwt_token = jwt_token)
-  request.timestamp = int(time.time())
+  def send_verify_code(self) -> requests.Response:
+    request = self._build_request(
+      AuthRequestType.SEND_VERIFY_CODE,
+      {"email": self.email, "device_id": str(self.device_id)},
+    )
+    return self._post(request)
 
-  request_dict = request.model_dump()
-  request_json = json.dumps(request_dict, cls=UUIDEncoder)
-  print(request_json)
-  resp_jwt = requests.post(BASE_URL, data=request_json)
-  print(f"http resp: {resp_jwt}")
-  print(f"http resp data: {resp_jwt.json()}")
-  # if resp_jwt.json().get("code") == 0:
-  #   print("✅ JWT 验证通过")
+  def login_with_verify_code(self, verify_code: str) -> tuple[requests.Response, dict]:
+    request = self._build_request(
+      AuthRequestType.LOGIN_WITH_EMAIL_VERIFY_CODE,
+      {
+        "email": self.email,
+        "device_id": str(self.device_id),
+        "verify_code": verify_code,
+      },
+    )
+    response = self._post(request)
+    return response, self._parse_auth_response(response)
 
-  # resp = AuthResponse.model_validate_json(resp_jwt.json())
+  def login_with_email_password(self, password: str) -> tuple[requests.Response, dict]:
+    request = self._build_request(
+      AuthRequestType.LOGIN_WITH_EMAIL_PASSWORD,
+      {
+        "email": self.email,
+        "password": password,
+        "device_id": str(self.device_id),
+      },
+    )
+    response = self._post(request)
+    return response, self._parse_auth_response(response)
 
-  # --- 4. 测试删除用户 ---
-  print_step("步骤 4: 删除用户")
-  request.request_type = AuthRequestType.DELETE_USER
-  request.data.jwt_token = jwt_token
-  request_dict = request.model_dump()
-  request_json = json.dumps(request_dict, cls=UUIDEncoder)
-  resp_delete = requests.post(BASE_URL, data=request_json)
-  print(f"响应: {resp_delete.json()}")
+  def login_with_jwt(self, jwt_token: str) -> requests.Response:
+    request = self._build_request(AuthRequestType.LOGIN_WITH_JWT, {"jwt_token": jwt_token})
+    return self._post(request)
+
+  def delete_user(self, jwt_token: str) -> requests.Response:
+    request = self._build_request(AuthRequestType.DELETE_USER, {"jwt_token": jwt_token})
+    return self._post(request)
+
+  def _post(self, request: dict) -> requests.Response:
+    return self.session.post(self.base_url, json=request, timeout=self.timeout)
+
+  @staticmethod
+  def _parse_auth_response(response: requests.Response) -> dict:
+    return response.json()
+
+  @staticmethod
+  def _build_request(request_type: AuthRequestType, data: dict) -> dict:
+    return {
+      "request_type": request_type.value,
+      "timestamp": int(time.time()),
+      "version": "1.0",
+      "data": data,
+    }
+
+
+def print_response(label: str, response: requests.Response):
+  print_step(label)
+  print(f"status_code: {response.status_code}")
+  try:
+    print(json.dumps(response.json(), ensure_ascii=False, indent=2))
+  except ValueError:
+    print(response.text)
+
+
+def run_verify_code_flow(client: AuthClient, verify_code: str | None, delete_after: bool):
+  send_response = client.send_verify_code()
+  print_response("步骤 1: 发送验证码", send_response)
+
+  if not verify_code:
+    verify_code = input("\n请输入服务端控制台显示的验证码: ").strip()
+
+  login_response, auth_response = client.login_with_verify_code(verify_code)
+  print_response("步骤 2: 邮箱验证码登录", login_response)
+
+  jwt_token = ((auth_response.get("data") or {}).get("token"))
+  if not jwt_token:
+    return
+
+  jwt_response = client.login_with_jwt(jwt_token)
+  print_response("步骤 3: JWT 登录验证", jwt_response)
+
+  if delete_after:
+    delete_response = client.delete_user(jwt_token)
+    print_response("步骤 4: 删除用户", delete_response)
+
+
+def run_password_login(client: AuthClient, password: str):
+  login_response, auth_response = client.login_with_email_password(password)
+  print_response("邮箱密码登录", login_response)
+
+  jwt_token = ((auth_response.get("data") or {}).get("token"))
+  if jwt_token:
+    jwt_response = client.login_with_jwt(jwt_token)
+    print_response("JWT 登录验证", jwt_response)
+
+
+def build_parser() -> argparse.ArgumentParser:
+  parser = argparse.ArgumentParser(description="Client for auth_server email login flows")
+  parser.add_argument("email", nargs="?", help="email for auth flow")
+  parser.add_argument("--base-url", default=DEFAULT_BASE_URL)
+  parser.add_argument("--device-id", default=None, help="reuse a fixed UUID for repeated verification tests")
+  parser.add_argument("--timeout", type=int, default=15)
+  parser.add_argument(
+    "--mode",
+    choices=["verify_code", "password"],
+    default="verify_code",
+    help="email login flow to test",
+  )
+  parser.add_argument("--verify-code", default=None, help="skip prompt and use this verification code directly")
+  parser.add_argument("--password", default=None, help="password for email+password login")
+  parser.add_argument("--delete-after", action="store_true", help="delete the user after a successful verify-code flow")
+  return parser
+
+
+def main():
+  args = build_parser().parse_args()
+  email = args.email or os.getenv("TEST_EMAIL")
+  if not email:
+    print("Usage: python3 tool/login.py <email> [--mode verify_code|password]")
+    sys.exit(1)
+
+  client = AuthClient(
+    base_url=args.base_url,
+    email=email,
+    device_id=args.device_id,
+    timeout=args.timeout,
+  )
+  print(f"base_url: {args.base_url}")
+  print(f"email: {email}")
+  print(f"device_id: {client.device_id}")
+
+  if args.mode == "password":
+    if not args.password:
+      print("--password is required when --mode password")
+      sys.exit(1)
+    run_password_login(client, args.password)
+    return
+
+  run_verify_code_flow(client, args.verify_code, args.delete_after)
+
 
 if __name__ == "__main__":
   try:
-    test_auth_flow()
-  except Exception as e:
-    print(f"连接失败: {e}")
+    main()
+  except requests.exceptions.RequestException as exc:
+    print(f"连接失败: {exc}")
+    sys.exit(1)
+  except KeyboardInterrupt:
+    print("\n已取消")
+    sys.exit(130)
