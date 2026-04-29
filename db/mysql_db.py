@@ -1,10 +1,20 @@
 import logging
+import hashlib
+import json
+import secrets
 import pymysql
 from pymysql.err import OperationalError, ProgrammingError
 from dbutils.pooled_db import PooledDB  # 核心：引入DBUtils连接池
 from dotenv import load_dotenv
 import os
+from datetime import datetime
 from auth import UserData
+from common.user_rights import (
+  DEFAULT_USER_LEVEL,
+  build_user_rights_payload,
+  normalize_user_level,
+  resolve_level_upgrade,
+)
 
 # 加载配置文件
 load_dotenv()
@@ -255,6 +265,259 @@ def init_web_columns():
       )
     except Exception:
       pass
+
+
+def init_user_rights_columns():
+  """Add membership columns to user_auth if they do not exist."""
+  columns = {
+    "user_level": "VARCHAR(32) NOT NULL DEFAULT 'free' COMMENT '用户等级：free/pro/premium'",
+    "level_end_at": "DATETIME DEFAULT NULL COMMENT '会员等级结束时间'",
+  }
+  db_name = os.getenv("MYSQL_DB", "")
+  for col, definition in columns.items():
+    check_sql = (
+      "SELECT COUNT(*) as cnt FROM information_schema.COLUMNS "
+      "WHERE TABLE_SCHEMA=%s AND TABLE_NAME='user_auth' AND COLUMN_NAME=%s"
+    )
+    row = mysql_db.query_one(check_sql, (db_name, col))
+    if row and row["cnt"] == 0:
+      try:
+        mysql_db.execute(f"ALTER TABLE user_auth ADD COLUMN {col} {definition}", ())
+        logging.info("Added membership column %s to user_auth", col)
+      except Exception as e:
+        logging.warning("Could not add membership column %s: %s", col, e)
+
+
+def init_redemption_tables():
+  """Create redemption_codes table if the DB user has DDL permission."""
+  sql = """
+  CREATE TABLE IF NOT EXISTS redemption_codes (
+    code_hash VARCHAR(64) NOT NULL COMMENT '兑换码SHA256哈希',
+    code_prefix VARCHAR(24) NOT NULL COMMENT '兑换码前缀，便于排查',
+    batch_id VARCHAR(64) NOT NULL COMMENT '批次号',
+    target_level VARCHAR(32) NOT NULL DEFAULT 'pro' COMMENT '目标等级',
+    duration_days INT NOT NULL COMMENT '兑换后有效天数',
+    status TINYINT(1) NOT NULL DEFAULT 0 COMMENT '0-未使用，1-已兑换，2-已过期，3-已禁用',
+    expire_at DATETIME DEFAULT NULL COMMENT '兑换码本身的过期时间',
+    activated_uid VARCHAR(64) DEFAULT NULL COMMENT '兑换用户UID',
+    activated_at DATETIME DEFAULT NULL COMMENT '兑换时间',
+    rights_json JSON DEFAULT NULL COMMENT '预留扩展权益配置',
+    created_by VARCHAR(64) DEFAULT NULL COMMENT '创建人',
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (code_hash),
+    KEY idx_redemption_batch (batch_id),
+    KEY idx_redemption_uid (activated_uid),
+    KEY idx_redemption_status (status)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='兑换码表';
+  """
+  try:
+    mysql_db.execute(sql, ())
+  except Exception as e:
+    logging.warning("Could not create redemption_codes table: %s", e)
+
+
+def init_membership_schema():
+  """Best-effort runtime initialization for rights-related schema."""
+  init_web_columns()
+  init_user_rights_columns()
+  init_redemption_tables()
+
+
+def _hash_redemption_code(code: str) -> str:
+  return hashlib.sha256(code.strip().upper().encode("utf-8")).hexdigest()
+
+
+def _generate_redemption_code_text() -> str:
+  alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+  groups = ["".join(secrets.choice(alphabet) for _ in range(4)) for _ in range(4)]
+  return f"MDR-{groups[0]}-{groups[1]}-{groups[2]}-{groups[3]}"
+
+
+def get_user_rights_info(uid: str) -> dict:
+  sql = "SELECT user_level, level_end_at, status FROM user_auth WHERE uid=%s"
+  try:
+    row = mysql_db.query_one(sql, (uid,))
+  except Exception as e:
+    logging.warning("membership columns unavailable, fallback to free rights: %s", e)
+    return build_user_rights_payload(DEFAULT_USER_LEVEL, None)
+
+  if not row or row.get("status") != 1:
+    return build_user_rights_payload(DEFAULT_USER_LEVEL, None)
+  return build_user_rights_payload(row.get("user_level"), row.get("level_end_at"))
+
+
+def create_redemption_codes(
+  batch_id: str,
+  target_level: str,
+  duration_days: int,
+  quantity: int,
+  expire_at: datetime | None = None,
+  created_by: str | None = None,
+) -> list[dict]:
+  normalized_level = normalize_user_level(target_level)
+  if quantity <= 0:
+    raise ValueError("quantity must be greater than 0")
+  if duration_days <= 0:
+    raise ValueError("duration_days must be greater than 0")
+
+  created_codes: list[dict] = []
+  conn = None
+  try:
+    conn = mysql_db.get_connection()
+    conn.autocommit(False)
+    with conn.cursor() as cursor:
+      for _ in range(quantity):
+        plain_code = _generate_redemption_code_text()
+        cursor.execute(
+          """
+          INSERT INTO redemption_codes
+            (code_hash, code_prefix, batch_id, target_level, duration_days, status, expire_at, created_by)
+          VALUES (%s, %s, %s, %s, %s, 0, %s, %s)
+          """,
+          (
+            _hash_redemption_code(plain_code),
+            plain_code[:8],
+            batch_id,
+            normalized_level,
+            duration_days,
+            expire_at,
+            created_by,
+          ),
+        )
+        created_codes.append(
+          {
+            "code": plain_code,
+            "batch_id": batch_id,
+            "target_level": normalized_level,
+            "duration_days": duration_days,
+            "expire_at": expire_at.isoformat() if expire_at else None,
+          }
+        )
+    conn.commit()
+    return created_codes
+  except Exception:
+    if conn:
+      conn.rollback()
+    raise
+  finally:
+    if conn:
+      try:
+        conn.autocommit(True)
+      except Exception:
+        pass
+      conn.close()
+
+
+def redeem_redemption_code(uid: str, redemption_code: str) -> dict:
+  if not uid or not redemption_code:
+    return {"code": 400, "msg": "uid and redemption_code are required", "data": None}
+
+  conn = None
+  try:
+    conn = mysql_db.get_connection()
+    conn.autocommit(False)
+    now = datetime.now()
+    code_hash = _hash_redemption_code(redemption_code)
+
+    with conn.cursor(pymysql.cursors.DictCursor) as cursor:
+      cursor.execute(
+        """
+        SELECT uid, status, user_level, level_end_at
+        FROM user_auth
+        WHERE uid=%s
+        FOR UPDATE
+        """,
+        (uid,),
+      )
+      user_row = cursor.fetchone()
+      if not user_row:
+        conn.rollback()
+        return {"code": 404, "msg": "user not found", "data": None}
+      if user_row["status"] != 1:
+        conn.rollback()
+        return {"code": 403, "msg": "user is not active", "data": None}
+
+      cursor.execute(
+        """
+        SELECT code_hash, batch_id, target_level, duration_days, status, expire_at, activated_uid, activated_at, rights_json
+        FROM redemption_codes
+        WHERE code_hash=%s
+        FOR UPDATE
+        """,
+        (code_hash,),
+      )
+      code_row = cursor.fetchone()
+      if not code_row:
+        conn.rollback()
+        return {"code": 404, "msg": "redemption code not found", "data": None}
+
+      if code_row["status"] == 1:
+        conn.rollback()
+        return {"code": 409, "msg": "redemption code already used", "data": None}
+      if code_row["status"] == 3:
+        conn.rollback()
+        return {"code": 403, "msg": "redemption code disabled", "data": None}
+      if code_row["expire_at"] and code_row["expire_at"] <= now:
+        cursor.execute(
+          "UPDATE redemption_codes SET status=2 WHERE code_hash=%s AND status=0",
+          (code_hash,),
+        )
+        conn.commit()
+        return {"code": 410, "msg": "redemption code expired", "data": None}
+
+      try:
+        upgrade = resolve_level_upgrade(
+          user_row.get("user_level"),
+          user_row.get("level_end_at"),
+          code_row.get("target_level"),
+          int(code_row.get("duration_days") or 0),
+          now=now,
+        )
+      except ValueError as e:
+        conn.rollback()
+        return {"code": 400, "msg": str(e), "data": None}
+
+      cursor.execute(
+        """
+        UPDATE redemption_codes
+        SET status=1, activated_uid=%s, activated_at=%s
+        WHERE code_hash=%s
+        """,
+        (uid, now, code_hash),
+      )
+      cursor.execute(
+        """
+        UPDATE user_auth
+        SET user_level=%s, level_end_at=%s, update_time=NOW()
+        WHERE uid=%s
+        """,
+        (upgrade["new_user_level"], upgrade["new_level_end_at"], uid),
+      )
+
+    conn.commit()
+    rights_payload = build_user_rights_payload(upgrade["new_user_level"], upgrade["new_level_end_at"], now=now)
+    rights_payload["redeemed_code"] = {
+      "batch_id": code_row["batch_id"],
+      "target_level": normalize_user_level(code_row["target_level"]),
+      "duration_days": int(code_row["duration_days"]),
+      "activated_at": now.isoformat(),
+      "action": upgrade["action"],
+    }
+    if code_row.get("rights_json"):
+      rights_payload["code_rights"] = code_row["rights_json"] if isinstance(code_row["rights_json"], dict) else json.loads(code_row["rights_json"])
+
+    return {"code": 0, "msg": "redemption success", "data": rights_payload}
+  except Exception as e:
+    if conn:
+      conn.rollback()
+    return {"code": 500, "msg": f"redeem redemption code failed: {e}", "data": None}
+  finally:
+    if conn:
+      try:
+        conn.autocommit(True)
+      except Exception:
+        pass
+      conn.close()
 
 
 def register_user_with_password(email: str, uid: str, salt: str,

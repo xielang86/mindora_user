@@ -377,7 +377,7 @@ class SleepAnalysisLLM:
             loop = asyncio.get_running_loop()
             return await asyncio.wait_for(
                 loop.run_in_executor(None, _invoke),
-                timeout=15,
+                timeout=120,
             )
         except asyncio.TimeoutError:
             logging.warning("LLM call timed out")

@@ -148,7 +148,7 @@ class UserProfile(BaseModel):
     }
   )
 
-  profile: Optional[Profile]
+  profile: Optional[Profile] = None
 
 
 class ProfileData(BaseModel):

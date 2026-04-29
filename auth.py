@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Any, Optional
 from pydantic import (
     BaseModel,
     Field,
@@ -12,6 +12,7 @@ from uuid import UUID
 from enum import Enum,StrEnum
 from datetime import datetime
 import json
+from common.user_rights import normalize_user_level
 
 class UserData(BaseModel):
   # 核心字段：与MySQL字段名一致，指定类型
@@ -44,6 +45,9 @@ class AuthRequestType(StrEnum):
   REGISTER_WITH_PHONE = "register_with_phone"                    # 手机号+SMS验证码 注册
   LOGIN_WITH_PHONE_SMS = "login_with_phone_sms"                  # 手机号+SMS验证码 登录/自动注册
   WECHAT_CALLBACK = "wechat_callback"                            # 微信OAuth code换token
+  REDEEM_REDEMPTION_CODE = "redeem_redemption_code"              # 兑换权益码
+  GENERATE_REDEMPTION_CODES = "generate_redemption_codes"        # 生成权益码（后台）
+  QUERY_USER_RIGHTS = "query_user_rights"                        # 查询用户权益
 
   def __str__(self):
     return self.value
@@ -60,6 +64,13 @@ class AuthData(BaseModel):
   password: str | None = Field(None, description="登录密码（>=8位），register_with_email_password/login_with_email_password 必填")
   wechat_code: str | None = Field(None, description="微信OAuth code，wechat_callback 必填")
   state: str | None = Field(None, description="微信OAuth state")
+  redemption_code: str | None = Field(None, description="兑换码，redeem_redemption_code 必填")
+  batch_id: str | None = Field(None, description="兑换码批次号，generate_redemption_codes 必填")
+  target_level: str | None = Field(None, description="目标用户等级，例如 free/pro/premium")
+  duration_days: int | None = Field(None, description="兑换后持续天数")
+  quantity: int | None = Field(None, description="生成兑换码数量")
+  code_expire_at: datetime | None = Field(None, description="兑换码自身过期时间")
+  admin_secret: str | None = Field(None, description="后台生成兑换码口令")
 
   @field_validator("verify_code")
   def check_verify_code_format(cls, v):
@@ -88,6 +99,30 @@ class AuthData(BaseModel):
   def check_jwt_token_not_blank(cls, v):
     if v is not None and v.strip() == "":
       raise ValueError("JWT token empty")
+    return v
+
+  @field_validator("redemption_code", "batch_id", "admin_secret")
+  def check_optional_non_empty_text(cls, v):
+    if v is not None:
+      value = v.strip()
+      if not value:
+        raise ValueError("field cannot be blank")
+      return value
+    return v
+
+  @field_validator("target_level")
+  def check_target_level(cls, v):
+    if v is None:
+      return v
+    normalized = normalize_user_level(v)
+    if normalized != v.strip().lower():
+      raise ValueError("target_level must be one of: free, pro, premium")
+    return normalized
+
+  @field_validator("duration_days", "quantity")
+  def check_positive_int(cls, v):
+    if v is not None and v <= 0:
+      raise ValueError("must be greater than 0")
     return v
 
   model_config = ConfigDict(
@@ -206,6 +241,20 @@ class AuthRequest(BaseModel):
       if data.wechat_code is None:
         raise ValueError(f"request_type={req_type}时，wechat_code必填")
 
+    elif req_type == AuthRequestType.REDEEM_REDEMPTION_CODE:
+      missing = [f for f in ["jwt_token", "redemption_code"] if getattr(data, f) is None]
+      if missing:
+        raise ValueError(f"request_type={req_type}时，data中以下字段必填：{missing}")
+
+    elif req_type == AuthRequestType.GENERATE_REDEMPTION_CODES:
+      missing = [f for f in ["admin_secret", "batch_id", "target_level", "duration_days", "quantity"] if getattr(data, f) is None]
+      if missing:
+        raise ValueError(f"request_type={req_type}时，data中以下字段必填：{missing}")
+
+    elif req_type == AuthRequestType.QUERY_USER_RIGHTS:
+      if data.jwt_token is None:
+        raise ValueError(f"request_type={req_type}时，data.jwt_token必填")
+
     return self
 
   # mode='after'：所有字段基础校验完成后，再执行该校验（对应原 skip_on_failure=True）
@@ -267,6 +316,10 @@ class JWTTokenData(BaseModel):
   email: EmailStr = Field(..., description="用户邮箱，必填，符合邮箱格式，非空")
   token: str = Field(..., description="JWT Token，必填，非空字符串")
   expire_days: int = Field(..., description="Token过期天数，必填，必须大于0")
+  user_level: str = Field("free", description="数据库中记录的当前用户等级")
+  effective_user_level: str = Field("free", description="当前生效的用户等级，过期后回退到free")
+  level_end_at: datetime | None = Field(None, description="等级结束时间")
+  rights: dict[str, Any] | None = Field(None, description="返回给App的权益内容")
 
   @field_validator("uid", "token")
   def validate_non_empty_string(cls, v):
@@ -303,14 +356,10 @@ class AuthResponse(BaseModel):
   code: int = Field(0, description="响应状态码：0=成功，1： 验证码错误/过期,2： jwt token 过期,3 : 请求发送过于频繁")
   # 响应提示信息（默认空字符串）
   msg: str = Field("", description="响应提示信息")
-  data: Optional[JWTTokenData] = Field(None, description="响应数据：login_with_email_verify_code 时必须非空")
+  data: Optional[Any] = Field(None, description="响应数据")
 
   @model_validator(mode='after')
   def validate_data_when_email_login(self):
-    if self.request_type == AuthRequestType.LOGIN_WITH_EMAIL_VERIFY_CODE and self.data is None:
-      raise ValueError(
-        f"request_type={self.request_type.value}时，data字段必须不为None"
-      )
     return self
 
   model_config = ConfigDict(

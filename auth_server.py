@@ -15,12 +15,15 @@ import os
 import jwt
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
+from pydantic import ValidationError
 from db.mysql_db import (
   insert_user, get_user_by_email_or_uid, insert_or_restore_user,
   get_active_user_by_email_or_uid, soft_delete_user,
   # web registration additions
   init_web_columns, register_user_with_password, get_user_password_hash,
   get_user_by_phone, register_phone_user, get_or_create_wechat_user,
+  init_membership_schema, get_user_rights_info, redeem_redemption_code,
+  create_redemption_codes,
 )
 from db.redis_db import get_verify_code, set_jwt_token, set_verify_code
 from common.util import normalize_email
@@ -43,11 +46,11 @@ app.add_middleware(
   allow_headers=["*"],
 )
 
-# Ensure web columns (password_hash, phone, wechat_openid …) exist in DB
+# Ensure auth-related schema exists when DB permissions allow it
 try:
-  init_web_columns()
+  init_membership_schema()
 except Exception as _e:
-  logging.warning("init_web_columns failed (OK on first run): %s", _e)
+  logging.warning("init_membership_schema failed (OK on first run): %s", _e)
 
 
 # Mock database for demonstration
@@ -61,6 +64,7 @@ mock_db = {
 JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY")
 JWT_EXPIRE_SECONDS = int(os.getenv("JWT_EXPIRE_SECONDS"))
 VERIFY_CODE_EXPIRE_SECONDS = int(os.getenv("VERIFY_CODE_EXPIRE_SECONDS"))
+REDEMPTION_ADMIN_SECRET = os.getenv("REDEMPTION_ADMIN_SECRET", "")
 
 # ── Password helpers (PBKDF2-SHA256, no extra deps) ──────────────────────────
 
@@ -82,6 +86,33 @@ def _make_jwt(uid: str, email: str | None) -> tuple[str, int]:
     algorithm=Config.ALGORITHM,
   )
   return token, max(1, int(JWT_EXPIRE_SECONDS / 86400))
+
+
+def _safe_email(email: str | None, uid: str) -> str:
+  if email and "@" in email:
+    return email
+  return f"{uid[:12]}@mindora.local"
+
+
+def _build_token_data(uid: str, email: str | None, token: str, expire_days: int) -> JWTTokenData:
+  rights_info = get_user_rights_info(uid)
+  level_end_at = rights_info.get("level_end_at")
+  if isinstance(level_end_at, str):
+    try:
+      level_end_at = datetime.fromisoformat(level_end_at)
+    except ValueError:
+      logging.warning("invalid level_end_at format for uid=%s: %s", uid, level_end_at)
+      level_end_at = None
+  return JWTTokenData(
+    uid=uid,
+    email=_safe_email(email, uid),
+    token=token,
+    expire_days=expire_days,
+    user_level=rights_info.get("stored_user_level", "free"),
+    effective_user_level=rights_info.get("effective_user_level", "free"),
+    level_end_at=level_end_at,
+    rights=rights_info.get("rights"),
+  )
 
 # ── SMS verification code key ─────────────────────────────────────────────────
 
@@ -133,12 +164,7 @@ def auth_by_verify_code(data: AuthData) -> AuthResponse:
     request_type = AuthRequestType(AuthRequestType.LOGIN_WITH_EMAIL_VERIFY_CODE),
     code=0,
     msg="Login successful",
-    data = JWTTokenData(
-      uid="uid",
-      email=data.email,
-      token="jwt_token",
-      expire_days= max(1, int(JWT_EXPIRE_SECONDS / 3600 / 24))
-    )
+    data=None,
   )
 
   try:
@@ -197,11 +223,11 @@ def auth_by_verify_code(data: AuthData) -> AuthResponse:
     
     # 步骤5：存储JWT Token到Redis（和JWT过期时间一致）
     set_jwt_token(uid, device_id, jwt_token, JWT_EXPIRE_SECONDS)
-    resp.data = JWTTokenData(
+    resp.data = _build_token_data(
       uid=uid,
-      email=data.email,
+      email=normalized_email,
       token=jwt_token,
-      expire_days= max(1, int(JWT_EXPIRE_SECONDS / 3600 / 24))
+      expire_days=max(1, int(JWT_EXPIRE_SECONDS / 3600 / 24)),
     )
   
   except HTTPException:
@@ -210,7 +236,7 @@ def auth_by_verify_code(data: AuthData) -> AuthResponse:
     # 捕获所有异常，返回服务器错误
     resp.code = 500
     resp.msg = "internal server error"
-    logging.error(f"error: {e}")
+    logging.exception("auth_by_verify_code failed")
     raise HTTPException(status_code=500, detail="internal server error")
 
   logging.info(f"resp: {resp}")
@@ -240,7 +266,7 @@ def auth_by_jwt(data: AuthData) -> AuthResponse:
       request_type=AuthRequestType(AuthRequestType.LOGIN_WITH_JWT),
       code=0,
       msg="Token is valid",
-      data=JWTTokenData(uid=uid, email=email or "", token=token, expire_days=expire_days),
+      data=_build_token_data(uid=uid, email=email, token=token, expire_days=expire_days),
     )
 
   user = get_active_user_by_email_or_uid(email=None, uid=uid)
@@ -254,7 +280,7 @@ def auth_by_jwt(data: AuthData) -> AuthResponse:
     request_type=AuthRequestType(AuthRequestType.LOGIN_WITH_JWT),
     code=0,
     msg="Token is valid",
-    data=JWTTokenData(uid=uid, email=email or "", token=token, expire_days=expire_days),
+    data=_build_token_data(uid=uid, email=user.email or email, token=token, expire_days=expire_days),
   )
 
 def del_user(data: AuthData) -> AuthResponse:
@@ -323,7 +349,7 @@ def register_with_email_password_handler(data: AuthData) -> AuthResponse:
   if Config.Mode != 1:
     set_jwt_token(uid, str(data.device_id) if data.device_id else "web", token, JWT_EXPIRE_SECONDS)
 
-  resp.data = JWTTokenData(uid=uid, email=normalized_email, token=token, expire_days=expire_days)
+  resp.data = _build_token_data(uid=uid, email=normalized_email, token=token, expire_days=expire_days)
   logging.info("Registered (email+password): %s uid=%s", normalized_email, uid)
   return resp
 
@@ -353,7 +379,7 @@ def login_with_email_password_handler(data: AuthData) -> AuthResponse:
   if Config.Mode != 1:
     set_jwt_token(user.uid, str(data.device_id) if data.device_id else "web", token, JWT_EXPIRE_SECONDS)
 
-  resp.data = JWTTokenData(uid=user.uid, email=normalized_email, token=token, expire_days=expire_days)
+  resp.data = _build_token_data(uid=user.uid, email=normalized_email, token=token, expire_days=expire_days)
   logging.info("Login (email+password): %s uid=%s", normalized_email, user.uid)
   return resp
 
@@ -419,7 +445,7 @@ def register_or_login_with_phone_handler(data: AuthData, is_register: bool) -> A
   if Config.Mode != 1:
     set_jwt_token(user.uid, str(data.device_id) if data.device_id else "web", token, JWT_EXPIRE_SECONDS)
 
-  resp.data = JWTTokenData(
+  resp.data = _build_token_data(
     uid=user.uid,
     email=user.email or f"{phone}@phone.local",
     token=token,
@@ -459,7 +485,7 @@ def wechat_callback_handler(data: AuthData) -> AuthResponse:
   if Config.Mode != 1:
     set_jwt_token(user.uid, "wechat", token, JWT_EXPIRE_SECONDS)
 
-  resp.data = JWTTokenData(
+  resp.data = _build_token_data(
     uid=user.uid,
     email=user.email or f"{openid[:8]}@wechat.local",
     token=token,
@@ -467,6 +493,61 @@ def wechat_callback_handler(data: AuthData) -> AuthResponse:
   )
   logging.info("WeChat login: openid=%s uid=%s", openid, user.uid)
   return resp
+
+
+def query_user_rights_handler(data: AuthData) -> AuthResponse:
+  payload = decode_access_token(data.jwt_token)
+  uid = payload.get("uid")
+  rights_info = get_user_rights_info(uid)
+  return AuthResponse(
+    request_type=AuthRequestType.QUERY_USER_RIGHTS,
+    code=0,
+    msg="success",
+    data=rights_info,
+  )
+
+
+def redeem_redemption_code_handler(data: AuthData) -> AuthResponse:
+  payload = decode_access_token(data.jwt_token)
+  uid = payload.get("uid")
+  result = redeem_redemption_code(uid, data.redemption_code)
+  if result["code"] != 0:
+    raise HTTPException(status_code=result["code"], detail=result["msg"])
+  return AuthResponse(
+    request_type=AuthRequestType.REDEEM_REDEMPTION_CODE,
+    code=0,
+    msg=result["msg"],
+    data=result["data"],
+  )
+
+
+def generate_redemption_codes_handler(data: AuthData) -> AuthResponse:
+  if not REDEMPTION_ADMIN_SECRET:
+    raise HTTPException(status_code=503, detail="REDEMPTION_ADMIN_SECRET is not configured")
+  if data.admin_secret != REDEMPTION_ADMIN_SECRET:
+    raise HTTPException(status_code=403, detail="invalid admin secret")
+
+  generated = create_redemption_codes(
+    batch_id=data.batch_id,
+    target_level=data.target_level,
+    duration_days=data.duration_days,
+    quantity=data.quantity,
+    expire_at=data.code_expire_at,
+    created_by="auth_server",
+  )
+  return AuthResponse(
+    request_type=AuthRequestType.GENERATE_REDEMPTION_CODES,
+    code=0,
+    msg="redemption codes generated",
+    data={
+      "batch_id": data.batch_id,
+      "target_level": data.target_level,
+      "duration_days": data.duration_days,
+      "quantity": len(generated),
+      "expire_at": data.code_expire_at.isoformat() if data.code_expire_at else None,
+      "codes": generated,
+    },
+  )
 
 
 # --- Handlers ---
@@ -518,7 +599,33 @@ async def handle_auth(request: AuthRequest):
   elif req_type == AuthRequestType.WECHAT_CALLBACK:
     return wechat_callback_handler(data)
 
+  elif req_type == AuthRequestType.REDEEM_REDEMPTION_CODE:
+    return redeem_redemption_code_handler(data)
+
+  elif req_type == AuthRequestType.GENERATE_REDEMPTION_CODES:
+    return generate_redemption_codes_handler(data)
+
+  elif req_type == AuthRequestType.QUERY_USER_RIGHTS:
+    return query_user_rights_handler(data)
+
   raise HTTPException(status_code=400, detail="Unsupported request type")
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request, exc):
+  if isinstance(exc, HTTPException):
+    raise exc
+  if isinstance(exc, ValidationError):
+    logging.exception("response/request validation failed")
+    return JSONResponse(
+      status_code=500,
+      content={"code": 500, "msg": "validation failed", "detail": str(exc)},
+    )
+  logging.exception("Unhandled auth server exception")
+  return JSONResponse(
+    status_code=500,
+    content={"code": 500, "msg": "internal server error", "detail": str(exc)},
+  )
 
 @app.get("/auth/wechat/qrcode")
 async def wechat_qrcode():
