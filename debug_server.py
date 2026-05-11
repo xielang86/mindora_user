@@ -93,7 +93,7 @@ HTML_TEMPLATE = """
             };
 
             try {
-                const resp = await fetch('/api/proxy', {
+                const resp = await fetch('/debug/api/proxy', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify(payload)
@@ -113,7 +113,7 @@ HTML_TEMPLATE = """
                 "data": { "uid": "{{ uid }}" }
             };
             
-            const resp = await fetch('/api/proxy', {
+            const resp = await fetch('/debug/api/proxy', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify(payload)
@@ -147,11 +147,11 @@ HTML_TEMPLATE = """
 </html>
 """
 
-@app.route('/')
+@app.route('/debug')
 def index():
     return render_template_string(HTML_TEMPLATE, uid=TEST_UID)
 
-@app.route('/api/proxy', methods=['POST'])
+@app.route('/debug/api/proxy', methods=['POST'])
 def proxy():
     # 直接获取前端发来的原始字节流，不解析，直接转发
     raw_data = request.get_data() 
