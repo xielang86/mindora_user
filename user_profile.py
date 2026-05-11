@@ -102,12 +102,30 @@ class SleepResult(BaseModel):
       "time_in_bed": sum(seq.duration for seq in self.sleep_status) 
     }
   
+# -------------------------- 助眠场景推荐模型 --------------------------
+class SleepStage(BaseModel):
+  """助眠阶段模型"""
+  cmd_name: str = Field(..., description="背景图/SOP流程名")
+  stage_name: str = Field(..., description="阶段名字，如Relax, Induce, Deep, Waken")
+  audio_file: str = Field(..., description="背景音文件名")
+  guide_file: str = Field(..., description="引导语文件名")
+  light_scene: str = Field(..., description="灯光场景名")
+  aroma_mode: str = Field(..., description="香氛模式名")
+
+class SleepScenario(BaseModel):
+  """完整的助眠流程方案"""
+  scenario_id: str = Field(..., description="方案唯一ID")
+  scenario_name: str = Field(..., description="方案展示名称")
+  stages: List[SleepStage] = Field(default_factory=list, description="包含四个睡眠阶段")
 
 class UserProfile(BaseModel):
   """用户画像信息"""
   uid_emb: List[float] = Field(default_factory=list)
   basic_info: Optional[Dict[str, str]] = Field(default_factory=dict)
   long_term_profile: List[Tuple[str, float]] = Field(default_factory=list)
+
+  # 新增：存储推荐的助眠候选方案
+  sleep_scenarios_reco: List[SleepScenario] = Field(default_factory=list, description="推荐的候选助眠流程列表")
 
   behaviors: Dict[str, List[Tuple[int, Any]]] = Field(
     default_factory=lambda: {

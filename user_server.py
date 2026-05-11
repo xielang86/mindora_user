@@ -1,12 +1,13 @@
 import asyncio,datetime,json,logging,os,time
-from typing import Any, Optional
+from typing import Any, Optional, List
 from dotenv import load_dotenv
 import jwt
 from pydantic import ValidationError
 import websockets
 from aiohttp import ClientResponseError, ClientSession, web
+from sleep_reco import RecommendationEngine
 import plyvel
-from user_profile import UserProfile
+from user_profile import UserProfile, SleepScenario
 from config import Config
 from common import util
 from user_profile import (
@@ -19,6 +20,7 @@ from auth import AuthRequest
 from uid.uuid import get_or_create_uuid
 from llm_service import SleepAnalysisLLM, extract_sleep_context, deep_merge
 import logger
+import copy
 
 load_dotenv()
 run_dir = os.getenv("RUN_DIR")
@@ -69,8 +71,16 @@ class UserProfileServ:
 
     logging.info(f"after update {old_behaviors}")
     return old_behaviors
+  
+  def calc_sleep_reco(self, uid: str, new_profile: UserProfile, old_profile: UserProfile) -> List[SleepScenario]:
+    # 1. 触发推荐引擎逻辑
+    sleep_scenarios = old_profile.sleep_scenarios
+    if RecommendationEngine.should_rerun_recommendation(old_profile, new_profile):
+      logging.info(f"Rerunning sleep scenario recommendation for {uid}")
+      sleep_scenarios = RecommendationEngine.generate(new_profile)
 
-    # incr update the behaviors by time, and update long term weight
+    return sleep_scenarios
+
   def update_profile(self, uid: str, new_profile: UserProfile) -> bool:
     """写入用户行为（仅更新单个用户数据）"""
     if new_profile is None or uid is None or not isinstance(uid, str):
@@ -79,6 +89,7 @@ class UserProfileServ:
 
     # 读取或创建用户画像（仅操作单个用户，避免全量加载）
     profile = self.get_profile(uid)
+    old_profile = profile
     if profile is None:
       self.save_profile(uid, new_profile)
       return True
