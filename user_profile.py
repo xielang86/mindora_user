@@ -125,7 +125,7 @@ class UserProfile(BaseModel):
   long_term_profile: List[Tuple[str, float]] = Field(default_factory=list)
 
   # 新增：存储推荐的助眠候选方案
-  sleep_scenarios_reco: List[SleepScenario] = Field(default_factory=list, description="推荐的候选助眠流程列表")
+  sleep_scenarios_reco: Optional[List[SleepScenario]] = Field(default_factory=list, description="推荐的候选助眠流程列表")
 
   behaviors: Dict[str, List[Tuple[int, Any]]] = Field(
     default_factory=lambda: {
