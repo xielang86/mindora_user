@@ -101,6 +101,8 @@ class UserProfileServ:
     profile.long_term_profile = self._merge_profile(profile.long_term_profile, new_profile.long_term_profile)
      
     profile.behaviors = self._merge_behavior(profile.behaviors, new_profile.behaviors)
+
+    profile.sleep_scenarios_reco = self.calc_sleep_reco(uid, profile, old_profile)
     # 仅保存当前用户的更新（而非全量数据）
     self.save_profile(uid, profile)
     logging.info(f"Behavior data for uid '{uid}' updated")
