@@ -8,8 +8,8 @@ from enum import StrEnum
 
 import requests
 
-DEFAULT_BASE_URL = os.getenv("AUTH_SERVER_URL", "http://127.0.0.1:9103/auth")
-# DEFAULT_BASE_URL = os.getenv("AUTH_SERVER_URL", "https://api.mindora316.com/auth")
+# DEFAULT_BASE_URL = os.getenv("AUTH_SERVER_URL", "http://127.0.0.1:9103/auth")
+DEFAULT_BASE_URL = os.getenv("AUTH_SERVER_URL", "https://api.mindora316.com/auth")
 
 
 class AuthRequestType(StrEnum):
