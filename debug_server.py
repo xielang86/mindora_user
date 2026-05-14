@@ -9,7 +9,8 @@ for var in proxy_vars:
         del os.environ[var]
 
 # 配置信息
-USER_SERVER_URL = "https://api.mindora316.com/user_server/user_profile"
+# USER_SERVER_URL = "https://api.mindora316.com/user_server/user_profile"
+USER_SERVER_URL = "http://127.0.0.1:9001/user_profile"
 TEST_UID = "test_debug_user_001"
 
 HTML_TEMPLATE = """
@@ -79,7 +80,7 @@ HTML_TEMPLATE = """
         #result { 
             white-space: pre-wrap; background: #1e293b; color: #e2e8f0; 
             padding: 20px; margin-top: 20px; border-radius: 12px; font-family: monospace; 
-            font-size: 0.85rem; max-height: 300px; overflow: auto; 
+            font-size: 0.85rem; max-height: 400px; overflow: auto; 
         }
         .scenario-card { border: 1px solid var(--line); border-radius: 12px; padding: 20px; margin-top: 16px; background: white; }
         .stage-item { background: #f1f5f9; margin: 10px 0; padding: 12px; border-radius: 8px; border-left: 4px solid var(--blue); }
@@ -119,7 +120,6 @@ HTML_TEMPLATE = """
     </div>
 
     <script>
-      // 统一使用 Python 传过来的变量，注意要加引号
       const TEST_UID = "{{ uid }}";
       const profileFieldDefs = [
             {
@@ -165,7 +165,7 @@ HTML_TEMPLATE = """
                 label: '敏感度',
                 profileKey: 'sensitivity',
                 options: [
-                    { value: 'light_sensitive', title: '怕光敏感', desc: '光线控制需极其精细，避免蓝绿光，偏向极暗红光。' },
+                    { value: 'light_sensitive', title: '怕光敏感', desc: '光线控制需极其精ines，避免蓝绿光，偏向极暗红光。' },
                     { value: 'sound_sensitive', title: '怕声敏感', desc: '音量衰减需更平滑，环境音需保持低频且持续。' },
                     { value: 'light_sound_sensitive', title: '声光双敏', desc: '全维度低刺激策略，环境变化幅度需控制在极小范围。' },
                     { value: 'not_sensitive', title: '不敏感', desc: '标准环境兼容度，可接受更丰富的音画变化。' }
@@ -194,16 +194,13 @@ HTML_TEMPLATE = """
             `).join('');
         }
 
-        // 核心修改：聚合所有维度的说明
         function updateAllDescs() {
             const container = document.getElementById('fullDescContainer');
             let html = '';
-
             profileFieldDefs.forEach(field => {
                 const selectElement = document.getElementById(field.name);
                 const selectedValue = selectElement.value;
                 const option = field.options.find(opt => opt.value === selectedValue);
-
                 if (option) {
                     html += `
                         <div class="desc-section">
@@ -214,7 +211,6 @@ HTML_TEMPLATE = """
                     `;
                 }
             });
-
             container.innerHTML = html;
         }
 
@@ -222,7 +218,6 @@ HTML_TEMPLATE = """
             const formData = new FormData(document.getElementById('updateForm'));
             const resultDiv = document.getElementById('result');
             resultDiv.innerText = '发送请求中...';
-
             const stressVal = parseFloat(formData.get('stress_index'));
             const payload = {
                 request_type: 'update_profile',
@@ -235,7 +230,6 @@ HTML_TEMPLATE = """
                     }
                 }
             };
-
             try {
                 const resp = await fetch('/api/proxy', {
                     method: 'POST',
@@ -271,6 +265,10 @@ HTML_TEMPLATE = """
                     body: JSON.stringify(payload)
                 });
                 const resJson = await resp.json();
+                
+                // 核心修改：在控制台展示完整的画像 JSON
+                document.getElementById('result').innerText = '查询成功，完整响应数据：\\n' + JSON.stringify(resJson, null, 2);
+
                 const scenarios = resJson.data?.user_profile?.sleep_scenarios || [];
                 let html = '';
                 scenarios.forEach(s => {
@@ -283,21 +281,19 @@ HTML_TEMPLATE = """
                         `).join('') + `</div>
                     </div>`;
                 });
-                document.getElementById('scenarioDisplay').innerHTML = html || '<p>暂无数据</p>';
-                document.getElementById('result').innerText = '查询成功';
+                document.getElementById('scenarioDisplay').innerHTML = html || '<p>暂无场景数据</p>';
             } catch (e) {
                 document.getElementById('result').innerText = '查询失败: ' + e;
             }
         }
 
         renderFieldGrid();
-        updateAllDescs(); // 初始加载
+        updateAllDescs();
     </script>
 </body>
 </html>
 """
 
-# 关闭那烦人的 InsecureRequestWarning 警告
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 @app.route('/')
@@ -307,27 +303,19 @@ def index():
 @app.route('/api/proxy', methods=['POST'])
 def proxy():
     raw_data = request.get_data()
-    
-    # 打印一下，确保收到的是有效的字节流
     print(f"--- Forwarding {len(raw_data)} bytes to {USER_SERVER_URL} ---")
-
     try:
-        # 使用 Session 对象可以更稳定地管理连接
         with requests.Session() as s:
-            # 再次确保 session 级别的代理为空
             s.trust_env = False 
-            
             resp = s.post(
                 USER_SERVER_URL,
                 data=raw_data,
                 headers={'Content-Type': 'application/json'},
                 timeout=15,
-                verify=False # 本地调试建议先保持 False
+                verify=False
             )
-        
         print(f"--- Backend Response [{resp.status_code}]: {resp.text[:100]} ---")
         return resp.content, resp.status_code, resp.headers.items()
-
     except Exception as e:
         print(f"--- Final Proxy Error: {str(e)} ---")
         return jsonify({"code": -1, "msg": f"Final Proxy Error: {str(e)}"}), 500

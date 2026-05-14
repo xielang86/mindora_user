@@ -24,11 +24,20 @@ import json
 import logging
 import os
 import re
+from functools import lru_cache
 from typing import Any, Optional
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from tool.doubao_langchain import VolcEngineArkChat
+
+
+_PROFILE_JSON_MAX_CHARS = 12000
+_KNOWLEDGE_BASE_PATH = os.path.join(
+    os.path.dirname(__file__),
+    "db",
+    "knowledge_base.md",
+)
 
 
 # ──────────────────────────────────────────────────────────────
@@ -83,7 +92,54 @@ def extract_sleep_context(profile, data) -> dict:
             ctx["scene_name"]  = ctx["scene_id"].replace("_", " ").title()
             ctx["used_times"]  = len(best[1])
 
+    ctx["user_profile_json"] = _serialize_profile_for_prompt(profile)
+    ctx["sleep_knowledge"] = _load_sleep_knowledge()
+
     return ctx
+
+
+def _truncate_text(text: str, max_chars: int) -> str:
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 32] + "\n... [truncated for prompt size]"
+
+
+def _summarize_behavior_series(behaviors: dict[str, Any]) -> dict[str, Any]:
+    summarized: dict[str, Any] = {}
+    for key, values in (behaviors or {}).items():
+        if not isinstance(values, list):
+            summarized[key] = values
+            continue
+        summarized[key] = {
+            "count": len(values),
+            "recent_samples": values[-5:],
+        }
+    return summarized
+
+
+def _serialize_profile_for_prompt(profile) -> str:
+    profile_dict = profile.model_dump(mode="json", exclude_none=True)
+
+    if isinstance(profile_dict.get("profile"), dict):
+        # Skip bulky image payloads while keeping the field name visible.
+        if profile_dict["profile"].get("avatar_base64"):
+            profile_dict["profile"]["avatar_base64"] = "[omitted base64 image data]"
+
+    profile_dict["behaviors"] = _summarize_behavior_series(profile_dict.get("behaviors", {}))
+
+    text = json.dumps(profile_dict, ensure_ascii=False, indent=2)
+    return _truncate_text(text, _PROFILE_JSON_MAX_CHARS)
+
+
+@lru_cache(maxsize=1)
+def _load_sleep_knowledge() -> str:
+    try:
+        with open(_KNOWLEDGE_BASE_PATH, "r", encoding="utf-8") as f:
+            text = f.read().strip()
+            return _truncate_text(text, 5000)
+    except Exception as e:
+        logging.warning("failed to load sleep knowledge base: %s", e)
+        return ""
 
 
 def deep_merge(base: dict, updates: dict) -> None:
@@ -230,6 +286,9 @@ def _prompt_sleep_advice(ctx: dict) -> str:
     hr = ctx.get('avg_heart_rate', '—')
     hr_lo = round(hr - 15) if isinstance(hr, (int, float)) else '—'
     hr_hi = round(hr + 15) if isinstance(hr, (int, float)) else '—'
+    profile_json = ctx.get("user_profile_json", "{}")
+    knowledge = ctx.get("sleep_knowledge", "")
+    knowledge_block = f"\nMindora sleep recommendation knowledge base:\n{knowledge}\n" if knowledge else ""
 
     return f"""{_lang_instruction(ctx.get('language', 'en'))}
 
@@ -243,11 +302,19 @@ Sleep data for {ctx.get('date', 'last night')}:
 - HR range: {hr_lo}–{hr_hi} bpm   HRV: {ctx.get('hrv', '—')}
 - Preferred scene (7 days): {ctx.get('scene_name', '—')} (used {ctx.get('used_times', 0)} times)
 {focus_hint}
+{knowledge_block}
+Full user profile JSON snapshot:
+```json
+{profile_json}
+```
 
 Your task:
-1. Write a brief sleep analysis (2–4 sentences), warm and encouraging.
-2. Provide 2–4 personalised, actionable advice bullets based on the data.
-3. For each relevant pillar, give a one-line highlight.
+1. Use both the structured sleep metrics and the user profile JSON to infer the user's likely sleep issues, context, and preferences.
+2. Ground your recommendations in the Mindora sleep recommendation knowledge base when it is relevant.
+3. Write a brief sleep analysis (2–4 sentences), warm, concrete, and personalized.
+4. Provide 2–4 personalised, actionable advice bullets based on the data.
+5. For each relevant pillar, give a one-line highlight.
+6. Do not mention missing fields, raw JSON, or that you used a knowledge base.
 
 Return ONLY a JSON object (no markdown, no explanation):
 {{

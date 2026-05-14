@@ -105,7 +105,7 @@ class SleepResult(BaseModel):
 # -------------------------- 助眠场景推荐模型 --------------------------
 class SleepStage(BaseModel):
   """助眠阶段模型"""
-  cmd_name: str = Field(..., description="背景图/SOP流程名")
+  cmd_name: Optional[str] = Field("", description="背景图/SOP流程名")
   stage_name: str = Field(..., description="阶段名字，如Relax, Induce, Deep, Waken")
   audio_file: str = Field(..., description="背景音文件名")
   guide_file: str = Field(..., description="引导语文件名")

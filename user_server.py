@@ -74,10 +74,10 @@ class UserProfileServ:
   
   def calc_sleep_reco(self, uid: str, new_profile: UserProfile, old_profile: UserProfile) -> List[SleepScenario]:
     # 1. 触发推荐引擎逻辑
-    sleep_scenarios = old_profile.sleep_scenarios
-    if RecommendationEngine.should_rerun_recommendation(old_profile, new_profile):
-      logging.info(f"Rerunning sleep scenario recommendation for {uid}")
-      sleep_scenarios = RecommendationEngine.generate(new_profile)
+    sleep_scenarios = old_profile.sleep_scenarios_reco
+    # if RecommendationEngine.should_rerun_recommendation(old_profile, new_profile):
+    logging.info(f"Rerunning sleep scenario recommendation for {uid}")
+    sleep_scenarios = RecommendationEngine.generate(new_profile)
 
     return sleep_scenarios
 
@@ -150,7 +150,7 @@ class UserServer:
     self.app = web.Application()
     self.active_uid = ""
     self.system_uid = get_or_create_uuid()
-
+    self.debug_uid_set = {"mindora_test_uid1", "mindora_test_uid2", "mindora_test_uid3", "test_debug_user_001"}
     self.llm = SleepAnalysisLLM()
     self.setup_routes()
 
@@ -188,7 +188,7 @@ class UserServer:
       if payload is None:
         return InvalidOrExpiredTokenResp()
       uid = payload.get("uid")
-    elif Config.IS_DEBUG and data.uid is not None and len(data.uid) > 3:
+    elif Config.IS_DEBUG and data.uid is not None and len(data.uid) > 3 and data.uid in self.debug_uid_set:
       uid = data.uid
 
     return uid
@@ -510,7 +510,7 @@ class UserServer:
 
     result = {
       "score_summary": {"score": score, "date": date},
-      "sleep_scenarios": {
+      "sleep_scenarios_reco": {
         "title": "Sedona Desert Calm",
         "description": "You fell asleep quickly and maintained a stable sleep rhythm after the scenario started.",
         "date": date,

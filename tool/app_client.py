@@ -24,7 +24,7 @@ import requests
 # ──────────────────────────────────────────
 BASE_URL  = sys.argv[1] if len(sys.argv) > 1 else os.getenv("APP_SERVER_URL", "http://127.0.0.1:9001")
 JWT_TOKEN = sys.argv[2] if len(sys.argv) > 2 else os.getenv("JWT_TOKEN", "")
-DEBUG_UID = "test_user"   # used when JWT_TOKEN is empty and server runs in debug mode
+DEBUG_UID = "mindora_test_uid1"   # used when JWT_TOKEN is empty and server runs in debug mode
 
 TODAY       = datetime.date.today().isoformat()
 WEEK_START  = (datetime.date.today() - datetime.timedelta(days=6)).isoformat()

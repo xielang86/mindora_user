@@ -1,4 +1,15 @@
 # Sleep Intervention Knowledge Base
+## all lights candidates
+### L1
+- desc: 日落光 + 熄灯过渡
+### L2
+- desc: 微红光
+
+## all spray candidates
+### S1
+- desc: 薰衣草 + 雪松, GABA增强,睡前30分钟
+### S2
+- desc: 薰衣草 + 洋甘菊,持续扩散 脉冲
 
 ## insomnia.onset
 ### mechanism
