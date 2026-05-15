@@ -56,6 +56,13 @@ class Profile(BaseModel):
   avatar_mime_type: Optional[str] = Field("image/jpeg", description="头像 MIME 类型")
 
 
+# 建议新增：环境与敏感度
+class EnvironmentalSensitivity(BaseModel):
+  light_sensitivity: str = Field("normal", description="光敏感度：normal, sensitive")
+  noise_sensitivity: str = Field("normal", description="声敏感度：normal, sensitive")
+  room_base_noise: Optional[float] = Field(None, description="卧室底噪分贝值")
+
+
 class SleepElement(BaseModel):
   start_time: int = Field(..., description="睡眠阶段开始时间戳（秒级）")
   duration: float = Field(..., description="睡眠阶段持续时长，单位分钟")

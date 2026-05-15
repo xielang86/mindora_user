@@ -24,7 +24,8 @@ class VolcEngineArkChat(BaseChatModel):
     def validate_ark_api_key(self) -> "VolcEngineArkChat":
         """Pydantic校验：确保ark_api_key存在（参数/环境变量二选一）"""
         # 优先取代码传入的参数，其次取环境变量VOLC_ARK_API_KEY
-        self.ark_api_key = self.ark_api_key or os.getenv("VOLC_ARK_API_KEY")
+        self.ark_api_key = self.ark_api_key or os.getenv("ARK_API_KEY")
+        self.endpoint_id = self.endpoint_id or os.getenv("ARK_ENDPOINT_ID")
         if not self.ark_api_key:
             raise ValueError(
                 "Did not find ark_api_key! "
@@ -137,17 +138,20 @@ class VolcEngineArkChat(BaseChatModel):
 # ------------------- 测试使用 -------------------
 if __name__ == "__main__":
     # 初始化自定义方舟类：传入ark_api_key（支持参数/环境变量两种方式）
+    api_key     = os.getenv("ARK_API_KEY")
+    endpoint_id = os.getenv("ARK_ENDPOINT_ID", "ep-20260325170723-znh7n")
+    model       = os.getenv("ARK_MODEL", "doubao-seed-2-0-lite-260215")
     chat_model = VolcEngineArkChat(
-        ark_api_key="你的火山方舟ark_api_key",  # 直接传参（推荐生产用环境变量）
-        endpoint_id="你的方舟endpoint_id",
-        model="你的方舟模型名称",
+        ark_api_key=api_key,  # 直接传参（推荐生产用环境变量）
+        endpoint_id=endpoint_id,
+        model=model,
         temperature=0.5
     )
 
     # 标准LangChain消息调用逻辑（与VolcEngineMaasChat完全一致）
     messages = [
         SystemMessage(content="你是一个专业的智能助手，回答准确简洁"),
-        HumanMessage(content="你好，介绍一下火山方舟大模型平台")
+        HumanMessage(content="你好，告诉我你是那个模型，我要确认我调用的模型名字")
     ]
 
     # 调用模型并输出结果

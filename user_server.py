@@ -26,6 +26,7 @@ load_dotenv()
 run_dir = os.getenv("RUN_DIR")
 logger.init_log(f"{run_dir}/user_server_logs")
 JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY")
+REMOTE_SYNC_HEADER = "X-Mindora-Remote-Sync"
 
 
 # all bloking sync api
@@ -186,7 +187,7 @@ class UserServer:
     if data.jwt_token is not None:
       payload = self._check_token(data.jwt_token)
       if payload is None:
-        return InvalidOrExpiredTokenResp()
+        return None
       uid = payload.get("uid")
     elif Config.IS_DEBUG and data.uid is not None and len(data.uid) > 3 and data.uid in self.debug_uid_set:
       uid = data.uid
@@ -235,6 +236,47 @@ class UserServer:
       return ProfileResponse(code=0, msg=f"update profile for '{request.timestamp}' succ", request_type=request.request_type, data=None)
     else:
       return ProfileResponse(code=500, msg=f"update profile failed", request_type=request.request_type, data=None)
+
+  async def sync_profile_to_remote(self, uid: str, request: ProfileRequest) -> bool:
+    if not Config.RemoteHost or len(Config.RemoteHost) < 10:
+      return False
+
+    profile = self.user_serv.get_profile(uid)
+    if profile is None:
+      logging.warning(f"skip remote sync because local profile missing for uid={uid}")
+      return False
+
+    remote_endpoint = f"{Config.RemoteHost.rstrip('/')}/user_profile"
+    sync_data = {"user_profile": profile.model_dump()}
+    if request.data.jwt_token is not None:
+      sync_data["jwt_token"] = request.data.jwt_token
+    else:
+      sync_data["uid"] = uid
+
+    payload = ProfileRequest(
+      request_type="update_profile",
+      timestamp=int(time.time()),
+      version=request.version,
+      data=ProfileData.model_validate(sync_data),
+    ).model_dump()
+
+    try:
+      async with ClientSession() as session:
+        async with session.post(
+          remote_endpoint,
+          json=payload,
+          headers={REMOTE_SYNC_HEADER: "1"},
+          timeout=10,
+        ) as response:
+          resp_data = await response.json()
+          if response.status >= 400:
+            logging.error(f"remote profile sync failed status={response.status}, body={resp_data}")
+            return False
+          logging.info(f"remote profile sync succ for uid={uid}, body={resp_data}")
+          return True
+    except Exception as e:
+      logging.error(f"remote profile sync error for uid={uid}: {e}")
+      return False
 
   def handle_login(self, request: AuthRequest) -> BaseResponse:
     if request.data is None or request.data.jwt_token is None:
@@ -292,6 +334,16 @@ class UserServer:
 
       elif req.request_type == "update_profile":
         response_obj = self.handle_update_profile(req)
+        if (
+          response_obj.code == 0
+          and Config.RemoteHost is not None and len(Config.RemoteHost) > 8
+          and req.data is not None
+        ):
+          uid = self._parse_for_uid(req.data)
+          if isinstance(uid, str) and uid:
+            remote_succ = await self.sync_profile_to_remote(uid, req)
+            if not remote_succ:
+              response_obj.msg = f"{response_obj.msg}, remote sync failed"
         return web.json_response(response_obj.model_dump(), status=get_http_status(response_obj))
 
       elif req.request_type in ["analysis_overview", "insight", "daily_report", "weekly_report", "month_report"]:
