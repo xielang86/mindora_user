@@ -112,17 +112,17 @@ class SleepResult(BaseModel):
 # -------------------------- 助眠场景推荐模型 --------------------------
 class SleepStage(BaseModel):
   """助眠阶段模型"""
-  cmd_name: Optional[str] = Field("", description="背景图/SOP流程名")
-  stage_name: str = Field(..., description="阶段名字，如Relax, Induce, Deep, Waken")
-  audio_file: str = Field(..., description="背景音文件名")
-  guide_file: str = Field(..., description="引导语文件名")
-  light_scene: str = Field(..., description="灯光场景名")
-  aroma_mode: str = Field(..., description="香氛模式名")
+  cmd_name: Optional[str] = Field(None, description="背景图/SOP流程名")
+  stage_name: Optional[str] = Field(None, description="阶段名字，如Relax, Induce, Deep, Waken")
+  audio_file: Optional[str] = Field(None, description="背景音文件名")
+  guide_file: Optional[str] = Field(None, description="引导语文件名")
+  light_scene: Optional[str] = Field(None, description="灯光场景名")
+  aroma_mode: Optional[str] = Field(None, description="香氛模式名")
 
 class SleepScenario(BaseModel):
   """完整的助眠流程方案"""
-  scenario_id: str = Field(..., description="方案唯一ID")
-  scenario_name: str = Field(..., description="方案展示名称")
+  scenario_id: Optional[str] = Field(None, description="方案唯一ID")
+  scenario_name: Optional[str] = Field(None, description="方案展示名称")
   stages: List[SleepStage] = Field(default_factory=list, description="包含四个睡眠阶段")
 
 class UserProfile(BaseModel):
@@ -133,6 +133,32 @@ class UserProfile(BaseModel):
 
   # 新增：存储推荐的助眠候选方案
   sleep_scenarios_reco: Optional[List[SleepScenario]] = Field(default_factory=list, description="推荐的候选助眠流程列表")
+  standard_sop_reco: List[SleepScenario] = Field(default_factory=list, description="推荐的标准SOP流程列表")
+
+  @field_validator("standard_sop_reco", mode="before")
+  @classmethod
+  def normalize_standard_sop_reco(cls, value):
+    if not isinstance(value, list):
+      return value
+
+    normalized = []
+    for item in value:
+      if isinstance(item, str):
+        normalized.append({
+          "scenario_id": None,
+          "scenario_name": item,
+          "stages": [{
+            "cmd_name": item,
+            "stage_name": None,
+            "audio_file": None,
+            "guide_file": None,
+            "light_scene": None,
+            "aroma_mode": None,
+          }]
+        })
+      else:
+        normalized.append(item)
+    return normalized
 
   behaviors: Dict[str, List[Tuple[int, Any]]] = Field(
     default_factory=lambda: {

@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import random
 import re
 from functools import lru_cache
 from typing import Any, List, Optional
@@ -21,6 +22,12 @@ _TOPOLOGY_PATH = os.path.join(
     os.path.dirname(__file__),
     "db",
     "topology.md",
+)
+
+_SOP_CANDIDATES_PATH = os.path.join(
+    os.path.dirname(__file__),
+    "data",
+    "reco_candidates.json",
 )
 
 _SCENARIO_CANDIDATES: list[dict[str, Any]] = [
@@ -93,6 +100,13 @@ _SYSTEM_PROMPT = (
     "Do not invent new field names, do not add commentary, and do not include markdown fences."
 )
 
+_SOP_SYSTEM_PROMPT = (
+    "You are Mindora's sleep intervention recommender. "
+    "Return ONLY JSON with the exact field names requested. "
+    "Choose SOP process ids only from the given candidate list. "
+    "Do not invent new field names, do not add commentary, and do not include markdown fences."
+)
+
 
 def _safe_profile_json(profile: UserProfile) -> str:
     payload = profile.model_dump(mode="json", exclude_none=True)
@@ -154,6 +168,50 @@ Task:
 """
 
 
+def _build_sop_reco_prompt(profile: UserProfile, candidates: List[str]) -> str:
+    knowledge = _load_text(_KNOWLEDGE_BASE_PATH)
+    topology = _load_text(_TOPOLOGY_PATH)
+    return f"""
+User profile JSON:
+{_safe_profile_json(profile)}
+
+Sleep intervention knowledge base:
+{knowledge}
+
+Sleep strategy topology:
+{topology}
+
+Standard SOP process candidates:
+{json.dumps(candidates, ensure_ascii=False, indent=2)}
+
+Task:
+1. Read the user profile and infer the most likely sleep issue pattern, preferences, and suitable intervention style.
+2. Select the best 3 SOP process candidates from the provided candidate list.
+3. You may reorder candidates, but every returned value must come from the candidate list.
+4. Keep the output schema exactly compatible with this JSON structure:
+{{
+  "scenarios": [
+    {{
+      "scenario_id": null,
+      "scenario_name": null,
+      "stages": [
+        {{
+          "cmd_name": "string",
+          "stage_name": null,
+          "audio_file": null,
+          "guide_file": null,
+          "light_scene": null,
+          "aroma_mode": null
+        }}
+      ]
+    }}
+  ]
+}}
+5. Only set `cmd_name`; all other fields should be null.
+6. Return exactly 3 SOP process ids.
+"""
+
+
 def _get_model() -> Optional[VolcEngineArkChat]:
     api_key = os.getenv("ARK_API_KEY")
     endpoint_id = os.getenv("ARK_ENDPOINT_ID", "ep-20260325170723-znh7n")
@@ -211,6 +269,121 @@ def _fallback_scenarios() -> List[SleepScenario]:
     return [SleepScenario.model_validate(item) for item in _SCENARIO_CANDIDATES[:2]]
 
 
+def _default_sop_candidates() -> List[str]:
+    profile_candidates = [
+        key.replace("sleep.scene.", "")
+        for key in UserProfile().mindora_record.keys()
+    ]
+    return list(dict.fromkeys(profile_candidates))
+
+
+@lru_cache(maxsize=1)
+def _load_sop_candidate_scenarios() -> List[SleepScenario]:
+    try:
+        with open(_SOP_CANDIDATES_PATH, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except Exception as e:
+        logging.warning("failed to load SOP candidates from %s: %s", _SOP_CANDIDATES_PATH, e)
+        return [_build_sop_reco_scenario(item) for item in _default_sop_candidates()]
+
+    if not isinstance(payload, list):
+        logging.warning("SOP candidates file must contain a JSON array: %s", _SOP_CANDIDATES_PATH)
+        return [_build_sop_reco_scenario(item) for item in _default_sop_candidates()]
+
+    scenarios: List[SleepScenario] = []
+    for item in payload:
+        try:
+            scenario = SleepScenario.model_validate(item)
+        except Exception as e:
+            logging.warning("invalid SOP candidate in %s: %s item=%s", _SOP_CANDIDATES_PATH, e, item)
+            continue
+        cmd_name = _extract_sop_cmd_name(scenario)
+        if cmd_name is None:
+            continue
+        scenarios.append(scenario)
+    return scenarios
+
+
+def _build_sop_reco_scenario(cmd_name: str) -> SleepScenario:
+    return SleepScenario(
+        scenario_id=None,
+        scenario_name=None,
+        stages=[
+            {
+                "cmd_name": cmd_name,
+                "stage_name": None,
+                "audio_file": None,
+                "guide_file": None,
+                "light_scene": None,
+                "aroma_mode": None,
+            }
+        ],
+    )
+
+
+def _clone_sleep_scenario(scenario: SleepScenario) -> SleepScenario:
+    return SleepScenario.model_validate(scenario.model_dump())
+
+
+def _extract_sop_cmd_name(item: Any) -> Optional[str]:
+    if isinstance(item, SleepScenario):
+        if item.stages and item.stages[0].cmd_name:
+            return item.stages[0].cmd_name
+        return None
+    if not isinstance(item, dict):
+        return None
+
+    stages = item.get("stages", [])
+    if not isinstance(stages, list) or not stages:
+        return None
+    first_stage = stages[0]
+    if not isinstance(first_stage, dict):
+        return None
+    cmd_name = first_stage.get("cmd_name")
+    if isinstance(cmd_name, str) and cmd_name:
+        return cmd_name
+    return None
+
+
+def _validate_sop_reco(payload: Any, candidates: List[SleepScenario]) -> List[SleepScenario]:
+    if isinstance(payload, dict):
+        payload = payload.get("scenarios", [])
+    if not isinstance(payload, list):
+        return []
+
+    candidate_map = {}
+    for scenario in candidates:
+        cmd_name = _extract_sop_cmd_name(scenario)
+        if cmd_name is not None:
+            candidate_map[cmd_name] = scenario
+
+    reco: List[SleepScenario] = []
+    seen_cmd_names: set[str] = set()
+    for item in payload:
+        cmd_name = _extract_sop_cmd_name(item)
+        if cmd_name is None:
+            continue
+        if cmd_name not in candidate_map or cmd_name in seen_cmd_names:
+            continue
+        reco.append(_clone_sleep_scenario(candidate_map[cmd_name]))
+        seen_cmd_names.add(cmd_name)
+        if len(reco) == 3:
+            break
+    return reco
+
+
+def _fallback_sop_reco(candidates: List[SleepScenario]) -> List[SleepScenario]:
+    if candidates:
+        return [_clone_sleep_scenario(item) for item in candidates[:3]]
+    return [_build_sop_reco_scenario(item) for item in _default_sop_candidates()[:3]]
+
+
+def _pick_random_sop_reco(scenarios: List[SleepScenario]) -> List[SleepScenario]:
+    if not scenarios:
+        return []
+    return [random.choice(scenarios)]
+
+
 class RecommendationEngine:
     """根据用户画像生成 Sleep Scenarios 的引擎"""
 
@@ -256,3 +429,44 @@ class RecommendationEngine:
             logging.error("sleep recommendation llm call failed: %s", e)
 
         return _fallback_scenarios()
+
+    @staticmethod
+    def generate_sop_reco(profile: UserProfile, candidates: Optional[List[str]] = None) -> List[SleepScenario]:
+        file_candidates = _load_sop_candidate_scenarios()
+        candidate_scenarios = file_candidates
+        if not candidate_scenarios:
+            normalized_candidates = list(dict.fromkeys(item for item in (candidates or []) if isinstance(item, str) and item))
+            candidate_scenarios = [_build_sop_reco_scenario(item) for item in normalized_candidates]
+        if not candidate_scenarios:
+            candidate_scenarios = [_build_sop_reco_scenario(item) for item in _default_sop_candidates()]
+
+        normalized_candidates = [
+            cmd_name
+            for scenario in candidate_scenarios
+            if (cmd_name := _extract_sop_cmd_name(scenario)) is not None
+        ]
+
+        fallback = _fallback_sop_reco(candidate_scenarios)
+        if not fallback:
+            return []
+
+        model = _get_model()
+        if model is None:
+            logging.warning("ARK_API_KEY not set, using fallback SOP candidates")
+            return _pick_random_sop_reco(fallback)
+
+        prompt = _build_sop_reco_prompt(profile, normalized_candidates)
+        try:
+            response = model.invoke([
+                SystemMessage(content=_SOP_SYSTEM_PROMPT),
+                HumanMessage(content=prompt),
+            ])
+            parsed = _extract_json(response.content)
+            reco = _validate_sop_reco(parsed, candidate_scenarios)
+            if len(reco) == min(3, len(normalized_candidates)):
+                return _pick_random_sop_reco(reco)
+            logging.warning("sleep sop recommendation llm returned %s valid candidates, using fallback", len(reco))
+        except Exception as e:
+            logging.error("sleep sop recommendation llm call failed: %s", e)
+
+        return _pick_random_sop_reco(fallback)

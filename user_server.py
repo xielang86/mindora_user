@@ -82,6 +82,13 @@ class UserProfileServ:
 
     return sleep_scenarios
 
+  def calc_standard_sop_reco(self, uid: str, new_profile: UserProfile, old_profile: UserProfile) -> List[SleepScenario]:
+    sop_reco = old_profile.standard_sop_reco
+    candidates = []
+    logging.info(f"Rerunning standard SOP recommendation for {uid} with candidates={candidates}")
+    sop_reco = RecommendationEngine.generate_sop_reco(new_profile, candidates)
+    return sop_reco
+
   def update_profile(self, uid: str, new_profile: UserProfile) -> bool:
     """写入用户行为（仅更新单个用户数据）"""
     if new_profile is None or uid is None or not isinstance(uid, str):
@@ -92,6 +99,11 @@ class UserProfileServ:
     profile = self.get_profile(uid)
     old_profile = profile
     if profile is None:
+      new_profile.sleep_scenarios_reco = RecommendationEngine.generate(new_profile)
+      new_profile.standard_sop_reco = RecommendationEngine.generate_sop_reco(
+        new_profile,
+        [key.replace("sleep.scene.", "") for key in new_profile.mindora_record.keys()],
+      )
       self.save_profile(uid, new_profile)
       return True
 
@@ -104,6 +116,7 @@ class UserProfileServ:
     profile.behaviors = self._merge_behavior(profile.behaviors, new_profile.behaviors)
 
     profile.sleep_scenarios_reco = self.calc_sleep_reco(uid, profile, old_profile)
+    profile.standard_sop_reco = self.calc_standard_sop_reco(uid, profile, old_profile)
     # 仅保存当前用户的更新（而非全量数据）
     self.save_profile(uid, profile)
     logging.info(f"Behavior data for uid '{uid}' updated")
