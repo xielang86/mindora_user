@@ -156,7 +156,7 @@ async def query_profile(jwt_token: str, server_uri: str) :
 
 class UserServer:
   def __init__(self):
-    server_semaphore = asyncio.Semaphore(Config.MaxServerConcurrent)
+    self.server_semaphore = asyncio.Semaphore(Config.MaxServerConcurrent)
     self.host = Config.HOST
     self.port = Config.PORT
     self.user_serv = UserProfileServ()
@@ -232,7 +232,7 @@ class UserServer:
       return ProfileResponse(code=0, msg=f"User with uid '{request.data}' not found", request_type=request.request_type, data=None)
 
     # incr update the behaviors by time, and update long term weight
-  def handle_update_profile(self, request: ProfileRequest) -> BaseResponse:
+  async def handle_update_profile(self, request: ProfileRequest) -> BaseResponse:
     """写入用户行为（仅更新单个用户数据）"""
     if request.data is None:
       logging.error("update request without any data")
@@ -244,7 +244,12 @@ class UserServer:
     if uid is None:
       return InvalidOrExpiredTokenResp()
 
-    succ = self.user_serv.update_profile(uid, request.data.user_profile)
+    async with self.server_semaphore:
+      succ = await asyncio.to_thread(
+        self.user_serv.update_profile,
+        uid,
+        request.data.user_profile,
+      )
     if succ:
       return ProfileResponse(code=0, msg=f"update profile for '{request.timestamp}' succ", request_type=request.request_type, data=None)
     else:
@@ -314,7 +319,7 @@ class UserServer:
           if req.request_type == "query_profile":
             response_obj = self.handle_query_profile(req)
           elif req.request_type == "update_profile":
-            response_obj = self.handle_update_profile(req)
+            response_obj = await self.handle_update_profile(req)
           else:
             response_obj = BaseResponse(code=400, msg="Invalid request type")
 
@@ -346,7 +351,7 @@ class UserServer:
         return web.json_response(response_obj.model_dump(), status=get_http_status(response_obj))
 
       elif req.request_type == "update_profile":
-        response_obj = self.handle_update_profile(req)
+        response_obj = await self.handle_update_profile(req)
         if (
           response_obj.code == 0
           and Config.RemoteHost is not None and len(Config.RemoteHost) > 8
