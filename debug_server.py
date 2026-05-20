@@ -15,6 +15,7 @@ USER_SERVER_URL = "http://127.0.0.1:9001/user_profile"
 TEST_UID = "test_debug_user_001"
 LOG_DIR = Path(__file__).resolve().parent / "user_server_logs"
 LOG_TAIL_BYTES = 32 * 1024
+LLM_TRACE_LOG_PATH = Path(__file__).resolve().parent / "llm_request_response.log"
 
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -100,6 +101,8 @@ HTML_TEMPLATE = """
             font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
             font-size: 0.82rem; line-height: 1.45; white-space: pre-wrap;
         }
+        .check-row { display: inline-flex; align-items: center; gap: 8px; color: var(--muted); font-size: 0.95rem; }
+        .check-row input { width: auto; }
     </style>
 </head>
 <body>
@@ -146,10 +149,25 @@ HTML_TEMPLATE = """
         <pre class="log-viewer" id="logViewer">点击“开启日志显示”后加载最新日志...</pre>
     </div>
 
+    <div class="card">
+        <h3>4. LLM 请求与响应日志</h3>
+        <div class="log-toolbar">
+            <button type="button" class="btn-fetch" onclick="refreshLlmTraceViewer()">刷新 LLM 日志</button>
+            <label class="check-row">
+                <input type="checkbox" id="llmAutoRefreshToggle" onchange="toggleLlmAutoRefresh()">
+                自动刷新 5 秒
+            </label>
+            <div class="status-chip" id="llmTraceStatus">LLM 日志等待刷新</div>
+        </div>
+        <div class="log-meta" id="llmTraceMeta">展示 `llm_request_response.log` 的最新内容，包含发送给 LLM 的 prompt 和收到的 response。</div>
+        <pre class="log-viewer" id="llmTraceViewer">点击“刷新 LLM 日志”后加载内容...</pre>
+    </div>
+
     <script>
       const TEST_UID = "{{ uid }}";
       let logViewerEnabled = false;
       let logRefreshTimer = null;
+      let llmTraceRefreshTimer = null;
       const profileFieldDefs = [
             {
                 name: 'user_type',
@@ -374,6 +392,46 @@ HTML_TEMPLATE = """
             }
         }
 
+        function setLlmTraceStatus(text) {
+            document.getElementById('llmTraceStatus').innerText = text;
+        }
+
+        function toggleLlmAutoRefresh() {
+            const enabled = document.getElementById('llmAutoRefreshToggle').checked;
+            if (llmTraceRefreshTimer) {
+                clearInterval(llmTraceRefreshTimer);
+                llmTraceRefreshTimer = null;
+            }
+            if (enabled) {
+                setLlmTraceStatus('LLM 日志自动刷新已开启');
+                refreshLlmTraceViewer();
+                llmTraceRefreshTimer = setInterval(refreshLlmTraceViewer, 5000);
+            } else {
+                setLlmTraceStatus('LLM 日志自动刷新已关闭');
+            }
+        }
+
+        async function refreshLlmTraceViewer() {
+            const traceViewer = document.getElementById('llmTraceViewer');
+            const traceMeta = document.getElementById('llmTraceMeta');
+            setLlmTraceStatus('LLM 日志刷新中...');
+            try {
+                const resp = await fetch('/api/llm-trace-log');
+                const resJson = await resp.json();
+                if (!resp.ok || resJson.code !== 0) {
+                    throw new Error(resJson.msg || 'LLM 日志读取失败');
+                }
+                traceMeta.innerText = `当前日志: ${resJson.filename} | 修改时间: ${resJson.modified_at} | 显示尾部 ${resJson.line_count} 行`;
+                traceViewer.textContent = resJson.content || '(LLM 日志为空)';
+                traceViewer.scrollTop = traceViewer.scrollHeight;
+                setLlmTraceStatus(`LLM 日志最近刷新: ${resJson.refreshed_at}`);
+            } catch (e) {
+                traceMeta.innerText = '读取 LLM 日志失败，请先触发一次 LLM 请求，或检查日志文件权限。';
+                traceViewer.textContent = String(e);
+                setLlmTraceStatus('LLM 日志刷新失败');
+            }
+        }
+
         renderFieldGrid();
         updateAllDescs();
     </script>
@@ -383,16 +441,11 @@ HTML_TEMPLATE = """
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-def _read_latest_user_server_log():
-    if not LOG_DIR.exists() or not LOG_DIR.is_dir():
-        raise FileNotFoundError(f"log dir not found: {LOG_DIR}")
+def _read_log_tail(path: Path):
+    if not path.exists() or not path.is_file():
+        raise FileNotFoundError(f"log file not found: {path}")
 
-    log_files = [path for path in LOG_DIR.iterdir() if path.is_file()]
-    if not log_files:
-        raise FileNotFoundError(f"no log files found in {LOG_DIR}")
-
-    latest_log = max(log_files, key=lambda path: path.stat().st_mtime)
-    with latest_log.open("rb") as handle:
+    with path.open("rb") as handle:
         file_size = handle.seek(0, os.SEEK_END)
         read_size = min(file_size, LOG_TAIL_BYTES)
         handle.seek(-read_size, os.SEEK_END if file_size else os.SEEK_SET)
@@ -405,12 +458,23 @@ def _read_latest_user_server_log():
             text = text[first_newline + 1 :]
 
     return {
-        "filename": latest_log.name,
-        "modified_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(latest_log.stat().st_mtime)),
+        "filename": path.name,
+        "modified_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(path.stat().st_mtime)),
         "content": text.strip() or "",
         "line_count": len(text.splitlines()),
         "refreshed_at": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
+
+def _read_latest_user_server_log():
+    if not LOG_DIR.exists() or not LOG_DIR.is_dir():
+        raise FileNotFoundError(f"log dir not found: {LOG_DIR}")
+
+    log_files = [path for path in LOG_DIR.iterdir() if path.is_file()]
+    if not log_files:
+        raise FileNotFoundError(f"no log files found in {LOG_DIR}")
+
+    latest_log = max(log_files, key=lambda path: path.stat().st_mtime)
+    return _read_log_tail(latest_log)
 
 @app.route('/')
 def index():
@@ -440,6 +504,16 @@ def proxy():
 def user_server_log():
     try:
         payload = _read_latest_user_server_log()
+        return jsonify({"code": 0, "msg": "ok", **payload})
+    except FileNotFoundError as e:
+        return jsonify({"code": -1, "msg": str(e)}), 404
+    except Exception as e:
+        return jsonify({"code": -1, "msg": f"log read error: {str(e)}"}), 500
+
+@app.route('/api/llm-trace-log', methods=['GET'])
+def llm_trace_log():
+    try:
+        payload = _read_log_tail(LLM_TRACE_LOG_PATH)
         return jsonify({"code": 0, "msg": "ok", **payload})
     except FileNotFoundError as e:
         return jsonify({"code": -1, "msg": str(e)}), 404

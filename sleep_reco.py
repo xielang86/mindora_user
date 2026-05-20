@@ -3,7 +3,9 @@ import logging
 import os
 import random
 import re
+import time
 from functools import lru_cache
+from pathlib import Path
 from typing import Any, List, Optional
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -29,6 +31,8 @@ _SOP_CANDIDATES_PATH = os.path.join(
     "data",
     "reco_candidates.json",
 )
+
+_LLM_TRACE_LOG_PATH = Path(__file__).resolve().parent / "llm_request_response.log"
 
 _SCENARIO_CANDIDATES: list[dict[str, Any]] = [
     {
@@ -107,6 +111,29 @@ _SOP_SYSTEM_PROMPT = (
     "Do not choose any pure_music candidate. "
     "Do not invent new field names, do not add commentary, and do not include markdown fences."
 )
+
+
+def _append_llm_trace(entry_type: str, flow: str, prompt: str, response_text: str = "", error_text: str = "") -> None:
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    lines = [
+        "=" * 88,
+        f"time: {timestamp}",
+        f"flow: {flow}",
+        f"entry_type: {entry_type}",
+        "prompt:",
+        prompt,
+    ]
+    if response_text:
+        lines.extend(["response:", response_text])
+    if error_text:
+        lines.extend(["error:", error_text])
+    lines.append("")
+    try:
+        _LLM_TRACE_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with _LLM_TRACE_LOG_PATH.open("a", encoding="utf-8") as handle:
+            handle.write("\n".join(lines))
+    except Exception as e:
+        logging.warning("failed to append llm trace log %s: %s", _LLM_TRACE_LOG_PATH, e)
 
 
 def _safe_profile_json(profile: UserProfile) -> str:
@@ -421,17 +448,21 @@ class RecommendationEngine:
             return _fallback_scenarios()
 
         prompt = _build_prompt(profile)
+        _append_llm_trace("request", "sleep_scenario_reco", prompt)
         try:
             response = model.invoke([
                 SystemMessage(content=_SYSTEM_PROMPT),
                 HumanMessage(content=prompt),
             ])
+            response_text = response.content if isinstance(response.content, str) else json.dumps(response.content, ensure_ascii=False)
+            _append_llm_trace("response", "sleep_scenario_reco", prompt, response_text=response_text)
             parsed = _extract_json(response.content)
             scenarios = _validate_scenarios(parsed)
             if len(scenarios) == 2:
                 return scenarios
             logging.warning("sleep recommendation llm returned %s valid scenarios, using fallback", len(scenarios))
         except Exception as e:
+            _append_llm_trace("error", "sleep_scenario_reco", prompt, error_text=str(e))
             logging.error("sleep recommendation llm call failed: %s", e)
 
         return _fallback_scenarios()
@@ -462,17 +493,21 @@ class RecommendationEngine:
             return _pick_random_sop_reco(fallback)
 
         prompt = _build_sop_reco_prompt(profile, normalized_candidates)
+        _append_llm_trace("request", "sleep_sop_reco", prompt)
         try:
             response = model.invoke([
                 SystemMessage(content=_SOP_SYSTEM_PROMPT),
                 HumanMessage(content=prompt),
             ])
+            response_text = response.content if isinstance(response.content, str) else json.dumps(response.content, ensure_ascii=False)
+            _append_llm_trace("response", "sleep_sop_reco", prompt, response_text=response_text)
             parsed = _extract_json(response.content)
             reco = _validate_sop_reco(parsed, candidate_scenarios)
             if len(reco) == min(3, len(normalized_candidates)):
                 return _pick_random_sop_reco(reco)
             logging.warning("sleep sop recommendation llm returned %s valid candidates, using fallback", len(reco))
         except Exception as e:
+            _append_llm_trace("error", "sleep_sop_reco", prompt, error_text=str(e))
             logging.error("sleep sop recommendation llm call failed: %s", e)
 
         return _pick_random_sop_reco(fallback)
