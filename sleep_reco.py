@@ -104,6 +104,7 @@ _SOP_SYSTEM_PROMPT = (
     "You are Mindora's sleep intervention recommender. "
     "Return ONLY JSON with the exact field names requested. "
     "Choose SOP process ids only from the given candidate list. "
+    "Do not choose any pure_music candidate. "
     "Do not invent new field names, do not add commentary, and do not include markdown fences."
 )
 
@@ -188,7 +189,8 @@ Task:
 1. Read the user profile and infer the most likely sleep issue pattern, preferences, and suitable intervention style.
 2. Select the best 3 SOP process candidates from the provided candidate list.
 3. You may reorder candidates, but every returned value must come from the candidate list.
-4. Keep the output schema exactly compatible with this JSON structure:
+4. Do not return any `sleep.pure_music.*` candidate. Restrict the result to guided `sleep.scene.*` candidates only.
+5. Keep the output schema exactly compatible with this JSON structure:
 {{
   "scenarios": [
     {{
@@ -207,8 +209,8 @@ Task:
     }}
   ]
 }}
-5. Only set `cmd_name`; all other fields should be null.
-6. Return exactly 3 SOP process ids.
+6. Only set `cmd_name`; all other fields should be null.
+7. Return exactly 3 SOP process ids.
 """
 
 
@@ -298,7 +300,7 @@ def _load_sop_candidate_scenarios() -> List[SleepScenario]:
             logging.warning("invalid SOP candidate in %s: %s item=%s", _SOP_CANDIDATES_PATH, e, item)
             continue
         cmd_name = _extract_sop_cmd_name(scenario)
-        if cmd_name is None:
+        if cmd_name is None or _is_pure_music_cmd(cmd_name):
             continue
         scenarios.append(scenario)
     return scenarios
@@ -345,6 +347,10 @@ def _extract_sop_cmd_name(item: Any) -> Optional[str]:
     return None
 
 
+def _is_pure_music_cmd(cmd_name: Optional[str]) -> bool:
+    return isinstance(cmd_name, str) and cmd_name.startswith("sleep.pure_music.")
+
+
 def _validate_sop_reco(payload: Any, candidates: List[SleepScenario]) -> List[SleepScenario]:
     if isinstance(payload, dict):
         payload = payload.get("scenarios", [])
@@ -354,14 +360,14 @@ def _validate_sop_reco(payload: Any, candidates: List[SleepScenario]) -> List[Sl
     candidate_map = {}
     for scenario in candidates:
         cmd_name = _extract_sop_cmd_name(scenario)
-        if cmd_name is not None:
+        if cmd_name is not None and not _is_pure_music_cmd(cmd_name):
             candidate_map[cmd_name] = scenario
 
     reco: List[SleepScenario] = []
     seen_cmd_names: set[str] = set()
     for item in payload:
         cmd_name = _extract_sop_cmd_name(item)
-        if cmd_name is None:
+        if cmd_name is None or _is_pure_music_cmd(cmd_name):
             continue
         if cmd_name not in candidate_map or cmd_name in seen_cmd_names:
             continue

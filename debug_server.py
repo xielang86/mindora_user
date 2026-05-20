@@ -1,6 +1,7 @@
 from flask import Flask, render_template_string, request, jsonify
 import requests
 import time,os,urllib3
+from pathlib import Path
 
 app = Flask(__name__)
 proxy_vars = ["http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"]
@@ -12,6 +13,8 @@ for var in proxy_vars:
 # USER_SERVER_URL = "https://api.mindora316.com/user_server/user_profile"
 USER_SERVER_URL = "http://127.0.0.1:9001/user_profile"
 TEST_UID = "test_debug_user_001"
+LOG_DIR = Path(__file__).resolve().parent / "user_server_logs"
+LOG_TAIL_BYTES = 32 * 1024
 
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -84,6 +87,19 @@ HTML_TEMPLATE = """
         }
         .scenario-card { border: 1px solid var(--line); border-radius: 12px; padding: 20px; margin-top: 16px; background: white; }
         .stage-item { background: #f1f5f9; margin: 10px 0; padding: 12px; border-radius: 8px; border-left: 4px solid var(--blue); }
+        .log-toolbar { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-bottom: 16px; }
+        .btn-secondary { background: #0f172a; color: white; }
+        .status-chip {
+            display: inline-flex; align-items: center; min-height: 40px; padding: 0 14px;
+            border-radius: 999px; background: #f1f5f9; color: var(--muted); font-size: 0.9rem;
+        }
+        .log-meta { color: var(--muted); font-size: 0.9rem; margin-bottom: 12px; }
+        .log-viewer {
+            background: #020617; color: #dbeafe; border-radius: 14px; border: 1px solid #0f172a;
+            padding: 18px; min-height: 260px; max-height: 520px; overflow: auto;
+            font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+            font-size: 0.82rem; line-height: 1.45; white-space: pre-wrap;
+        }
     </style>
 </head>
 <body>
@@ -119,8 +135,21 @@ HTML_TEMPLATE = """
         <div id="result">控制台输出等待中...</div>
     </div>
 
+    <div class="card">
+        <h3>3. User Server 日志查看</h3>
+        <div class="log-toolbar">
+            <button type="button" class="btn-secondary" id="toggleLogBtn" onclick="toggleLogViewer()">开启日志显示</button>
+            <button type="button" class="btn-fetch" onclick="refreshLogViewer()" id="refreshLogBtn" disabled>立即刷新</button>
+            <div class="status-chip" id="logStatus">日志显示未开启</div>
+        </div>
+        <div class="log-meta" id="logMeta">将从 `user_server_logs/` 中读取最新日志文件，并在开启后每 10 秒自动刷新。</div>
+        <pre class="log-viewer" id="logViewer">点击“开启日志显示”后加载最新日志...</pre>
+    </div>
+
     <script>
       const TEST_UID = "{{ uid }}";
+      let logViewerEnabled = false;
+      let logRefreshTimer = null;
       const profileFieldDefs = [
             {
                 name: 'user_type',
@@ -287,6 +316,64 @@ HTML_TEMPLATE = """
             }
         }
 
+        function setLogStatus(text) {
+            document.getElementById('logStatus').innerText = text;
+        }
+
+        function scheduleLogRefresh() {
+            if (logRefreshTimer) {
+                clearInterval(logRefreshTimer);
+            }
+            if (logViewerEnabled) {
+                logRefreshTimer = setInterval(refreshLogViewer, 10000);
+            }
+        }
+
+        async function refreshLogViewer() {
+            if (!logViewerEnabled) {
+                return;
+            }
+            const logViewer = document.getElementById('logViewer');
+            const logMeta = document.getElementById('logMeta');
+            setLogStatus('日志刷新中...');
+            try {
+                const resp = await fetch('/api/user-server-log');
+                const resJson = await resp.json();
+                if (!resp.ok || resJson.code !== 0) {
+                    throw new Error(resJson.msg || '日志读取失败');
+                }
+                logMeta.innerText = `当前日志: ${resJson.filename} | 修改时间: ${resJson.modified_at} | 显示尾部 ${resJson.line_count} 行`;
+                logViewer.textContent = resJson.content || '(最新日志为空)';
+                logViewer.scrollTop = logViewer.scrollHeight;
+                setLogStatus(`日志显示已开启，每 10 秒刷新一次。最近刷新: ${resJson.refreshed_at}`);
+            } catch (e) {
+                logMeta.innerText = '读取日志失败，请检查 `user_server_logs/` 目录或服务权限。';
+                logViewer.textContent = String(e);
+                setLogStatus('日志刷新失败');
+            }
+        }
+
+        function toggleLogViewer() {
+            logViewerEnabled = !logViewerEnabled;
+            const toggleBtn = document.getElementById('toggleLogBtn');
+            const refreshBtn = document.getElementById('refreshLogBtn');
+            if (logViewerEnabled) {
+                toggleBtn.innerText = '关闭日志显示';
+                refreshBtn.disabled = false;
+                setLogStatus('日志显示已开启，准备加载...');
+                scheduleLogRefresh();
+                refreshLogViewer();
+            } else {
+                toggleBtn.innerText = '开启日志显示';
+                refreshBtn.disabled = true;
+                if (logRefreshTimer) {
+                    clearInterval(logRefreshTimer);
+                    logRefreshTimer = null;
+                }
+                setLogStatus('日志显示未开启');
+            }
+        }
+
         renderFieldGrid();
         updateAllDescs();
     </script>
@@ -295,6 +382,35 @@ HTML_TEMPLATE = """
 """
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+def _read_latest_user_server_log():
+    if not LOG_DIR.exists() or not LOG_DIR.is_dir():
+        raise FileNotFoundError(f"log dir not found: {LOG_DIR}")
+
+    log_files = [path for path in LOG_DIR.iterdir() if path.is_file()]
+    if not log_files:
+        raise FileNotFoundError(f"no log files found in {LOG_DIR}")
+
+    latest_log = max(log_files, key=lambda path: path.stat().st_mtime)
+    with latest_log.open("rb") as handle:
+        file_size = handle.seek(0, os.SEEK_END)
+        read_size = min(file_size, LOG_TAIL_BYTES)
+        handle.seek(-read_size, os.SEEK_END if file_size else os.SEEK_SET)
+        raw_content = handle.read(read_size)
+
+    text = raw_content.decode("utf-8", errors="replace")
+    if read_size < file_size:
+        first_newline = text.find("\n")
+        if first_newline != -1:
+            text = text[first_newline + 1 :]
+
+    return {
+        "filename": latest_log.name,
+        "modified_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(latest_log.stat().st_mtime)),
+        "content": text.strip() or "",
+        "line_count": len(text.splitlines()),
+        "refreshed_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
 
 @app.route('/')
 def index():
@@ -319,6 +435,16 @@ def proxy():
     except Exception as e:
         print(f"--- Final Proxy Error: {str(e)} ---")
         return jsonify({"code": -1, "msg": f"Final Proxy Error: {str(e)}"}), 500
+
+@app.route('/api/user-server-log', methods=['GET'])
+def user_server_log():
+    try:
+        payload = _read_latest_user_server_log()
+        return jsonify({"code": 0, "msg": "ok", **payload})
+    except FileNotFoundError as e:
+        return jsonify({"code": -1, "msg": str(e)}), 404
+    except Exception as e:
+        return jsonify({"code": -1, "msg": f"log read error: {str(e)}"}), 500
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5001, debug=True)
