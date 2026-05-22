@@ -14,7 +14,9 @@ for var in proxy_vars:
 USER_SERVER_URL = "http://127.0.0.1:9001/user_profile"
 TEST_UID = "test_debug_user_001"
 LOG_DIR = Path(__file__).resolve().parent / "user_server_logs"
-LOG_TAIL_BYTES = 32 * 1024
+LOG_TAIL_LINES = 120
+LOG_TAIL_MAX_BYTES = 512 * 1024
+LOG_TAIL_CHUNK_BYTES = 64 * 1024
 LLM_TRACE_LOG_PATH = Path(__file__).resolve().parent / "llm_request_response.log"
 
 HTML_TEMPLATE = """
@@ -132,25 +134,7 @@ HTML_TEMPLATE = """
     </div>
 
     <div class="card">
-        <h3>2. 推荐候选展示</h3>
-        <button class="btn-fetch" onclick="fetchScenarios()">获取最新推荐序列</button>
-        <div id="scenarioDisplay"></div>
-        <div id="result">控制台输出等待中...</div>
-    </div>
-
-    <div class="card">
-        <h3>3. User Server 日志查看</h3>
-        <div class="log-toolbar">
-            <button type="button" class="btn-secondary" id="toggleLogBtn" onclick="toggleLogViewer()">开启日志显示</button>
-            <button type="button" class="btn-fetch" onclick="refreshLogViewer()" id="refreshLogBtn" disabled>立即刷新</button>
-            <div class="status-chip" id="logStatus">日志显示未开启</div>
-        </div>
-        <div class="log-meta" id="logMeta">将从 `user_server_logs/` 中读取最新日志文件，并在开启后每 10 秒自动刷新。</div>
-        <pre class="log-viewer" id="logViewer">点击“开启日志显示”后加载最新日志...</pre>
-    </div>
-
-    <div class="card">
-        <h3>4. LLM 请求与响应日志</h3>
+        <h3>2. LLM 请求与响应日志</h3>
         <div class="log-toolbar">
             <button type="button" class="btn-fetch" onclick="refreshLlmTraceViewer()">刷新 LLM 日志</button>
             <label class="check-row">
@@ -161,6 +145,24 @@ HTML_TEMPLATE = """
         </div>
         <div class="log-meta" id="llmTraceMeta">展示 `llm_request_response.log` 的最新内容，包含发送给 LLM 的 prompt 和收到的 response。</div>
         <pre class="log-viewer" id="llmTraceViewer">点击“刷新 LLM 日志”后加载内容...</pre>
+    </div>
+
+    <div class="card">
+        <h3>3. 推荐候选展示</h3>
+        <button class="btn-fetch" onclick="fetchScenarios()">获取最新推荐序列</button>
+        <div id="scenarioDisplay"></div>
+        <div id="result">控制台输出等待中...</div>
+    </div>
+
+    <div class="card">
+        <h3>4. User Server 日志查看</h3>
+        <div class="log-toolbar">
+            <button type="button" class="btn-secondary" id="toggleLogBtn" onclick="toggleLogViewer()">开启日志显示</button>
+            <button type="button" class="btn-fetch" onclick="refreshLogViewer()" id="refreshLogBtn" disabled>立即刷新</button>
+            <div class="status-chip" id="logStatus">日志显示未开启</div>
+        </div>
+        <div class="log-meta" id="logMeta">将从 `user_server_logs/` 中读取最新日志文件，并在开启后每 10 秒自动刷新。</div>
+        <pre class="log-viewer" id="logViewer">点击“开启日志显示”后加载最新日志...</pre>
     </div>
 
     <script>
@@ -441,27 +443,43 @@ HTML_TEMPLATE = """
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-def _read_log_tail(path: Path):
+def _read_log_tail(path: Path, max_lines: int = LOG_TAIL_LINES):
     if not path.exists() or not path.is_file():
         raise FileNotFoundError(f"log file not found: {path}")
 
+    if max_lines <= 0:
+        max_lines = LOG_TAIL_LINES
+
     with path.open("rb") as handle:
         file_size = handle.seek(0, os.SEEK_END)
-        read_size = min(file_size, LOG_TAIL_BYTES)
-        handle.seek(-read_size, os.SEEK_END if file_size else os.SEEK_SET)
-        raw_content = handle.read(read_size)
+        if file_size <= 0:
+            raw_content = b""
+        else:
+            position = file_size
+            buffer = b""
+            newline_count = 0
+            bytes_read = 0
+            while position > 0 and newline_count <= max_lines and bytes_read < LOG_TAIL_MAX_BYTES:
+                chunk_size = min(LOG_TAIL_CHUNK_BYTES, position, LOG_TAIL_MAX_BYTES - bytes_read)
+                position -= chunk_size
+                handle.seek(position, os.SEEK_SET)
+                chunk = handle.read(chunk_size)
+                buffer = chunk + buffer
+                bytes_read += len(chunk)
+                newline_count = buffer.count(b"\n")
+            raw_content = buffer
 
     text = raw_content.decode("utf-8", errors="replace")
-    if read_size < file_size:
-        first_newline = text.find("\n")
-        if first_newline != -1:
-            text = text[first_newline + 1 :]
+    lines = text.splitlines()
+    if len(lines) > max_lines:
+        lines = lines[-max_lines:]
+    text = "\n".join(lines)
 
     return {
         "filename": path.name,
         "modified_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(path.stat().st_mtime)),
         "content": text.strip() or "",
-        "line_count": len(text.splitlines()),
+        "line_count": len(lines),
         "refreshed_at": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
 

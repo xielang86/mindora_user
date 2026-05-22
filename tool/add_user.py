@@ -39,9 +39,22 @@ class UserProfileUpdater:
     """发送单个用户画像更新请求"""
     jwt_token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1aWQiOiJkYTRiYzFiNmJhZjBjOGFiMGJlN2E3ZjE1NzE0NGY0Y2EyNzQzNTllNTgzNmM5OTQxYzFjZDQxMjJjMzliNjFhIiwiZW1haWwiOiJ4aWVsYW5ndGNAMTYzLmNvbSIsImV4cCI6MTc2OTAwNTUzNn0.4Rn4RjKfXfsr_oT_gFfhZMjKDGaaB0sSGxDfyProYF8"
     async with self.semaphore:  # 限制并发数量
-      req = ProfileRequest(request_type="update_profile", timestamp=int(time.time()), version="1.0", data=ProfileData(uid=uid, user_profile=UserProfile.model_validate(profile)))
+      req = ProfileRequest(
+        request_type="update_profile",
+        timestamp=int(time.time()),
+        version="1.0",
+        data=ProfileData(
+          uid=uid,
+          user_profile=UserProfile.model_validate(profile),
+          skip_sleep_scenarios_reco_update=False,
+        ),
+      )
       if uid is None or len(uid) < 4:
-        req.data = ProfileData(jwt_token = jwt_token, user_profile=UserProfile.model_validate(profile))
+        req.data = ProfileData(
+          jwt_token=jwt_token,
+          user_profile=UserProfile.model_validate(profile),
+          skip_sleep_scenarios_reco_update=False,
+        )
       try:
         # 构造更新请求数据
         payload = req.model_dump()

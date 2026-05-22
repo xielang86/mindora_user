@@ -79,6 +79,7 @@ def req_update_profile():
         "version": "1.0",
         "data": {
             **_auth_data(),
+            "skip_sleep_scenarios_reco_update": False,
             "user_profile": {
                 "uid_emb": [],
                 "long_term_profile": [],

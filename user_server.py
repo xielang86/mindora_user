@@ -1,12 +1,16 @@
-import asyncio,datetime,json,logging,os,time
+import asyncio,datetime,json,logging,os,threading,time
 from typing import Any, Optional, List
+from pathlib import Path
 from dotenv import load_dotenv
 import jwt
 from pydantic import ValidationError
 import websockets
 from aiohttp import ClientResponseError, ClientSession, web
 from sleep_reco import RecommendationEngine
-import plyvel
+try:
+  import plyvel
+except ImportError:
+  plyvel = None
 from user_profile import UserProfile, SleepScenario
 from config import Config
 from common import util
@@ -33,25 +37,83 @@ REMOTE_SYNC_HEADER = "X-Mindora-Remote-Sync"
 class UserProfileServ:
   MAX_BEHAVIOR_LEN = 1024
   def __init__(self):
-    # 初始化LevelDB（若路径不存在则自动创建）
-    self.db = plyvel.DB(f"{run_dir}/{Config.DB_PATH}", create_if_missing=True)
+    self.lock = threading.RLock()
+    self.storage_mode = (Config.USER_PROFILE_STORAGE_MODE or "leveldb").strip().lower()
+    self.db = None
+    self.json_path = Path(run_dir) / Config.USER_PROFILE_JSON_PATH
+    self.text_profiles: dict[str, Any] = {}
+
+    if self.storage_mode == "leveldb":
+      if plyvel is None:
+        raise ImportError("plyvel is required when USER_PROFILE_STORAGE_MODE=leveldb")
+      # 初始化LevelDB（若路径不存在则自动创建）
+      self.db = plyvel.DB(f"{run_dir}/{Config.DB_PATH}", create_if_missing=True)
+    elif self.storage_mode not in {"txt_json", "json_txt", "json"}:
+      raise ValueError(f"unsupported USER_PROFILE_STORAGE_MODE: {self.storage_mode}")
+    else:
+      self.text_profiles = self._load_profiles_from_text_unlocked()
+      logging.info(f"preloaded {len(self.text_profiles)} user profiles from {self.json_path}")
+
+    logging.info(f"user profile storage mode={self.storage_mode}")
+
+  def _profile_to_json_data(self, profile: UserProfile) -> dict:
+    return profile.model_dump(mode="json")
+
+  def _load_profiles_from_text_unlocked(self) -> dict[str, Any]:
+    if not self.json_path.exists():
+      return {}
+
+    raw_text = self.json_path.read_text(encoding="utf-8").strip()
+    if not raw_text:
+      return {}
+
+    profiles = json.loads(raw_text)
+    if not isinstance(profiles, dict):
+      raise ValueError(f"profile json file should be a dict keyed by uid: {self.json_path}")
+    return profiles
+
+  def _save_profiles_to_text_unlocked(self, profiles: dict[str, Any]):
+    self.json_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = self.json_path.with_suffix(self.json_path.suffix + ".tmp")
+    tmp_path.write_text(
+      json.dumps(profiles, ensure_ascii=False, indent=2),
+      encoding="utf-8",
+    )
+    tmp_path.replace(self.json_path)
+
+  def _flush_text_profiles_unlocked(self):
+    self._save_profiles_to_text_unlocked(self.text_profiles)
 
   def get_profile(self, uid: str) -> Optional[UserProfile]:
-    """从LevelDB读取单个用户的画像"""
+    """读取单个用户画像"""
     if not uid or not isinstance(uid, str):
       logging.error(f"erro uid : {uid}")
       return None
 
-    data = self.db.get(uid.encode('utf-8'))  # LevelDB键值为bytes类型
-    logging.info(f"get from leveldb data {data}")
-    if data:
-      return UserProfile.model_validate(json.loads(data.decode('utf-8')))
-    return None
+    with self.lock:
+      if self.storage_mode == "leveldb":
+        data = self.db.get(uid.encode('utf-8'))  # LevelDB键值为bytes类型
+        logging.info(f"get from leveldb data {data}")
+        if data:
+          return UserProfile.model_validate(json.loads(data.decode('utf-8')))
+        return None
+
+      data = self.text_profiles.get(uid)
+      logging.info(f"get from json txt data for uid={uid}: {data}")
+      if data is not None:
+        return UserProfile.model_validate(data)
+      return None
 
   def save_profile(self, uid: str, profile: UserProfile):
-    """将单个用户的画像写入LevelDB"""
-    data = json.dumps(profile.model_dump()).encode('utf-8')
-    self.db.put(uid.encode('utf-8'), data)
+    """将单个用户的画像写入持久化存储"""
+    with self.lock:
+      if self.storage_mode == "leveldb":
+        data = json.dumps(self._profile_to_json_data(profile)).encode('utf-8')
+        self.db.put(uid.encode('utf-8'), data)
+        return
+
+      self.text_profiles[uid] = self._profile_to_json_data(profile)
+      self._flush_text_profiles_unlocked()
 
   def _merge_profile(self, old_profile, new_profile):
     return old_profile
@@ -89,41 +151,45 @@ class UserProfileServ:
     sop_reco = RecommendationEngine.generate_sop_reco(new_profile, candidates)
     return sop_reco
 
-  def update_profile(self, uid: str, new_profile: UserProfile) -> bool:
+  def update_profile(self, uid: str, new_profile: UserProfile, skip_sleep_scenarios_reco_update: bool = False) -> bool:
     """写入用户行为（仅更新单个用户数据）"""
     if new_profile is None or uid is None or not isinstance(uid, str):
       logging.error(f"invalid new profile {new_profile} or uid {uid}")
       return False
 
-    # 读取或创建用户画像（仅操作单个用户，避免全量加载）
-    profile = self.get_profile(uid)
-    old_profile = profile
-    if profile is None:
-      new_profile.sleep_scenarios_reco = RecommendationEngine.generate(new_profile)
-      new_profile.standard_sop_reco = RecommendationEngine.generate_sop_reco(
-        new_profile,
-        [key.replace("sleep.scene.", "") for key in new_profile.mindora_record.keys()],
-      )
-      self.save_profile(uid, new_profile)
+    with self.lock:
+      # 读取或创建用户画像（仅操作单个用户，避免全量加载）
+      profile = self.get_profile(uid)
+      old_profile = profile
+      if profile is None:
+        if not skip_sleep_scenarios_reco_update:
+          new_profile.sleep_scenarios_reco = RecommendationEngine.generate(new_profile)
+          new_profile.standard_sop_reco = RecommendationEngine.generate_sop_reco(
+            new_profile,
+            [key for key in new_profile.mindora_record.keys() if "sleep.scene." in key],
+        )
+        self.save_profile(uid, new_profile)
+        return True
+
+      # just replace, if need
+      if len(new_profile.uid_emb) > 16 or profile.uid_emb is None or len(profile.uid_emb) == 0:
+        profile.uid_emb = new_profile.uid_emb
+
+      profile.long_term_profile = self._merge_profile(profile.long_term_profile, new_profile.long_term_profile)
+       
+      profile.behaviors = self._merge_behavior(profile.behaviors, new_profile.behaviors)
+
+      if not skip_sleep_scenarios_reco_update:
+        profile.sleep_scenarios_reco = self.calc_sleep_reco(uid, profile, old_profile)
+        profile.standard_sop_reco = self.calc_standard_sop_reco(uid, profile, old_profile)
+      # 仅保存当前用户的更新（而非全量数据）
+      self.save_profile(uid, profile)
+      logging.info(f"Behavior data for uid '{uid}' updated")
       return True
-
-    # just replace, if need
-    if len(new_profile.uid_emb) > 16 or profile.uid_emb is None or len(profile.uid_emb) == 0:
-      profile.uid_emb = new_profile.uid_emb
-
-    profile.long_term_profile = self._merge_profile(profile.long_term_profile, new_profile.long_term_profile)
-     
-    profile.behaviors = self._merge_behavior(profile.behaviors, new_profile.behaviors)
-
-    profile.sleep_scenarios_reco = self.calc_sleep_reco(uid, profile, old_profile)
-    profile.standard_sop_reco = self.calc_standard_sop_reco(uid, profile, old_profile)
-    # 仅保存当前用户的更新（而非全量数据）
-    self.save_profile(uid, profile)
-    logging.info(f"Behavior data for uid '{uid}' updated")
-    return True
   
   def close(self):
-    self.db.close()
+    if self.db is not None:
+      self.db.close()
 
 def get_http_status(resp: BaseResponse):
   status = 200
@@ -249,6 +315,7 @@ class UserServer:
         self.user_serv.update_profile,
         uid,
         request.data.user_profile,
+        request.data.skip_sleep_scenarios_reco_update,
       )
     if succ:
       return ProfileResponse(code=0, msg=f"update profile for '{request.timestamp}' succ", request_type=request.request_type, data=None)
@@ -270,6 +337,8 @@ class UserServer:
       sync_data["jwt_token"] = request.data.jwt_token
     else:
       sync_data["uid"] = uid
+    if request.data.skip_sleep_scenarios_reco_update:
+      sync_data["skip_sleep_scenarios_reco_update"] = True
 
     payload = ProfileRequest(
       request_type="update_profile",

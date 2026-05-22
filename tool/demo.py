@@ -144,7 +144,12 @@ class UserServerHttpClient:
     async with ClientSession() as session:
       try:
         # 构造请求数据（仅包含非None的字段）
-        req = ProfileRequest(request_type="update_profile", timestamp=int(time.time()), version="1.0", data=ProfileData(user_profile=user_profile))
+        req = ProfileRequest(
+          request_type="update_profile",
+          timestamp=int(time.time()),
+          version="1.0",
+          data=ProfileData(user_profile=user_profile, skip_sleep_scenarios_reco_update=False),
+        )
         payload = req.model_dump()
         # 发送POST请求
         async with session.post(

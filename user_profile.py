@@ -206,6 +206,10 @@ class ProfileData(BaseModel):
   uid: Optional[str] = Field(None, description="uid, just for debug")
   jwt_token: str | None = Field(None, description="JWT token，in wan should be fixed")
   user_profile: Optional[UserProfile] = Field(None, description="user profile")
+  skip_sleep_scenarios_reco_update: bool = Field(
+    True,
+    description="When true, keep the existing sleep_scenarios_reco instead of regenerating it during update_profile",
+  )
 
 
 class ProfileRequest(BaseModel):
