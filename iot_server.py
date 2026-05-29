@@ -4,7 +4,10 @@ import os
 import socket
 import threading
 from time import sleep
-from websockets import serve as websocket_serve
+try:
+    from websockets import serve as websocket_serve
+except ModuleNotFoundError:
+    websocket_serve = None
 try:
     from zeroconf import Zeroconf, ServiceInfo  # 使用同步版本
 except ModuleNotFoundError:
@@ -239,6 +242,9 @@ async def websocket_handler(websocket):
 
 async def run_websocket_server():
     """启动WebSocket服务器"""
+    if websocket_serve is None:
+        raise RuntimeError("websockets is required to start the WebSocket server")
+
     print("启动WebSocket服务器...")
     async with websocket_serve(websocket_handler, "0.0.0.0", WEBSOCKET_PORT):
         print(f"WebSocket服务器已启动，端口: {WEBSOCKET_PORT}")
