@@ -72,6 +72,7 @@ class SleepResult(BaseModel):
   timestamp: int = Field(..., description="数据 update 时间戳（秒级）")
   sleep_quality: Optional[float] = Field(None, description="睡眠得分，范围0-100") 
   soe: Optional[float] = Field(None, description="入睡效率，范围0-100")
+  onset: Optional[float] = Field(None, description="入睡时长，范围0-100, minites")
   sleep_arch_index: Optional[float] = Field(None, description="睡眠结构，包含快速动眼、核心、深度睡眠占比，单位%")
   night_var_index: Optional[float] = Field(None, description="夜间波动，包含觉醒次数、觉醒时长、心率波动等，单位%")
 
