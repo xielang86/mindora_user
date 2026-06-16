@@ -1,9 +1,9 @@
-import asyncio,datetime,json,logging,os,threading,time
+import asyncio,copy,datetime,json,logging,os,threading,time
 from typing import Any, Optional, List
 from pathlib import Path
 from dotenv import load_dotenv
 import jwt
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 import websockets
 from aiohttp import ClientResponseError, ClientSession, web
 from sleep_reco import RecommendationEngine
@@ -35,7 +35,7 @@ REMOTE_SYNC_HEADER = "X-Mindora-Remote-Sync"
 
 # all bloking sync api
 class UserProfileServ:
-  MAX_BEHAVIOR_LEN = 1024
+  MAX_BEHAVIOR_LEN = 100
   def __init__(self):
     self.lock = threading.RLock()
     self.storage_mode = (Config.USER_PROFILE_STORAGE_MODE or "leveldb").strip().lower()
@@ -93,13 +93,14 @@ class UserProfileServ:
     with self.lock:
       if self.storage_mode == "leveldb":
         data = self.db.get(uid.encode('utf-8'))  # LevelDB键值为bytes类型
-        logging.info(f"get from leveldb data {data}")
         if data:
+          logging.info("get from leveldb uid=%s size=%d bytes", uid, len(data))
           return UserProfile.model_validate(json.loads(data.decode('utf-8')))
+        logging.info("get from leveldb uid=%s not found", uid)
         return None
 
       data = self.text_profiles.get(uid)
-      logging.info(f"get from json txt data for uid={uid}: {data}")
+      logging.info("get from json txt uid=%s found=%s size=%d", uid, data is not None, len(json.dumps(data)) if data else 0)
       if data is not None:
         return UserProfile.model_validate(data)
       return None
@@ -118,23 +119,74 @@ class UserProfileServ:
   def _merge_profile(self, old_profile, new_profile):
     return old_profile
 
+  @staticmethod
+  def _behavior_counts(behaviors: dict) -> dict:
+    """Return a compact count summary for logging."""
+    return {k: len(v) if isinstance(v, list) else v for k, v in behaviors.items()}
+
   def _merge_behavior(self, old_behaviors, new_behaviors):
     # merge sort, consider the old ones is sorted already
-    logging.info(f"merge {old_behaviors} and {new_behaviors}")
+    logging.info(
+      "merge behavior counts before=%s new=%s",
+      self._behavior_counts(old_behaviors),
+      self._behavior_counts(new_behaviors),
+    )
     for behavior_type, values in new_behaviors.items():
       values.sort(key=lambda x:x[0])
       if behavior_type in old_behaviors and isinstance(values, list):
         old_behaviors[behavior_type].sort(key=lambda x:x[0])
-        old_behaviors[behavior_type]= util.merge_two_sorted_dedup(old_behaviors[behavior_type], values) 
+        old_behaviors[behavior_type]= util.merge_two_sorted_dedup(old_behaviors[behavior_type], values)
       else:
         old_behaviors[behavior_type] = values
 
       if len(old_behaviors[behavior_type]) > UserProfileServ.MAX_BEHAVIOR_LEN:
-        old_behaviors[behavior_type] = old_behaviors[behavior_type][len(old_behaviors[behavior_type]) - UserProfileServ.MAX_BEHAVIOR_LEN:]
+        old_behaviors[behavior_type] = old_behaviors[behavior_type][-UserProfileServ.MAX_BEHAVIOR_LEN:]
 
-    logging.info(f"after update {old_behaviors}")
+    logging.info("after update behavior counts=%s", self._behavior_counts(old_behaviors))
     return old_behaviors
-  
+
+  @staticmethod
+  def _extract_sop_start_events(plays: list) -> list[tuple[str, int, dict]]:
+    """Extract SOP start events from a plays list.
+
+    Returns tuples of (cmd, timestamp, event_dict).
+    """
+    events: list[tuple[str, int, dict]] = []
+    if not isinstance(plays, list):
+      return events
+    for item in plays:
+      if not isinstance(item, (list, tuple)) or len(item) < 2:
+        continue
+      ts, event = item
+      if not isinstance(event, dict):
+        continue
+      cmd = event.get("cmd")
+      event_type = event.get("event")
+      if isinstance(cmd, str) and cmd.startswith("sleep.scene.") and event_type == "sop_start":
+        events.append((cmd, int(ts), event))
+    return events
+
+  def _update_mindora_record(self, profile: UserProfile, new_profile: UserProfile):
+    """Move SOP play counts from behaviors.plays into mindora_record."""
+    plays = new_profile.behaviors.get("plays", [])
+    for cmd, ts, event in self._extract_sop_start_events(plays):
+      record = profile.mindora_record.setdefault(cmd, [])
+      record.append((ts, event))
+      # keep the list sorted by timestamp and cap the length
+      record.sort(key=lambda x: x[0])
+      if len(record) > UserProfileServ.MAX_BEHAVIOR_LEN:
+        record[:] = record[-UserProfileServ.MAX_BEHAVIOR_LEN:]
+
+  @staticmethod
+  def _profile_for_log(profile: UserProfile) -> dict:
+    """Return a compact dict for logging (behaviors are replaced by counts)."""
+    data = profile.model_dump(mode="json", exclude_none=True)
+    if isinstance(data.get("behaviors"), dict):
+      data["behaviors"] = {
+        k: len(v) if isinstance(v, list) else v for k, v in data["behaviors"].items()
+      }
+    return data
+
   def calc_sleep_reco(self, uid: str, new_profile: UserProfile, old_profile: UserProfile) -> List[SleepScenario]:
     # 1. 触发推荐引擎逻辑
     sleep_scenarios = old_profile.sleep_scenarios_reco
@@ -176,8 +228,11 @@ class UserProfileServ:
         profile.uid_emb = new_profile.uid_emb
 
       profile.long_term_profile = self._merge_profile(profile.long_term_profile, new_profile.long_term_profile)
-       
+
       profile.behaviors = self._merge_behavior(profile.behaviors, new_profile.behaviors)
+
+      # aggregate SOP play events into mindora_record so we can keep behaviors small
+      self._update_mindora_record(profile, new_profile)
 
       if not skip_sleep_scenarios_reco_update:
         profile.sleep_scenarios_reco = self.calc_sleep_reco(uid, profile, old_profile)
@@ -188,7 +243,11 @@ class UserProfileServ:
         profile.standard_sop_reco = self.calc_standard_sop_reco(uid, profile, old_profile)
       # 仅保存当前用户的更新（而非全量数据）
       self.save_profile(uid, profile)
-      logging.info(f"Behavior data for uid '{uid}' updated")
+      logging.info(
+        "Profile updated uid=%s summary=%s",
+        uid,
+        self._profile_for_log(profile),
+      )
       return True
   
   def close(self):
@@ -225,6 +284,23 @@ async def query_profile(jwt_token: str, server_uri: str) :
       raise Exception(f"查询用户画像失败: {str(e)}") from e
 
 class UserServer:
+  @staticmethod
+  def _request_for_log(req_or_data) -> Any:
+    """Return a log-safe copy with behaviors summarized by count."""
+    if isinstance(req_or_data, BaseModel):
+      data = req_or_data.model_dump(mode="json", exclude_none=True)
+    elif isinstance(req_or_data, dict):
+      data = copy.deepcopy(req_or_data)
+    else:
+      return req_or_data
+
+    up = ((data.get("data") or {}).get("user_profile") or {})
+    if isinstance(up.get("behaviors"), dict):
+      up["behaviors"] = {
+        k: len(v) if isinstance(v, list) else v for k, v in up["behaviors"].items()
+      }
+    return data
+
   def __init__(self):
     self.server_semaphore = asyncio.Semaphore(Config.MaxServerConcurrent)
     self.host = Config.HOST
@@ -278,7 +354,7 @@ class UserServer:
     return uid
 
   def handle_query_profile(self, request: ProfileRequest) -> BaseResponse:
-    logging.info(f"handle: {request}")
+    logging.info("handle query_profile request=%s", self._request_for_log(request))
     """查询用户画像（从LevelDB按需读取）"""
     if request.data is None:
       logging.error("query request without any data")
@@ -294,11 +370,11 @@ class UserServer:
       uid = self.active_uid
 
     profile = self.user_serv.get_profile(uid)
-    logging.info(f"profile found: {profile}")
     if profile:
+      logging.info("profile found uid=%s summary=%s", uid, self.user_serv._profile_for_log(profile))
       return ProfileResponse(code=0, msg="succ", request_type=request.request_type, data={"user_profile": profile.model_dump()})
     else:
-      logging.warning(f"{uid}, {request} not found")
+      logging.warning("uid=%s query not found request=%s", uid, self._request_for_log(request))
       return ProfileResponse(code=0, msg=f"User with uid '{request.data}' not found", request_type=request.request_type, data=None)
 
     # incr update the behaviors by time, and update long term weight
@@ -415,9 +491,9 @@ class UserServer:
   async def handle_profile_request_http(self, request: web.Request) -> web.Response:
     try:
       data = await request.json()
-      logging.info(f"req {data}")
+      logging.info("req %s", self._request_for_log(data))
       req = ProfileRequest.model_validate(data)
-      logging.info(f"request {req}")
+      logging.info("request %s", self._request_for_log(req))
 
       if req.request_type == "query_profile":
         response_obj = self.handle_query_profile(req)
@@ -476,7 +552,7 @@ class UserServer:
         logging.error(f"Validation error: {e}")
         return web.json_response(InvalidReqFormatResp().model_dump(), status=400)
     except Exception as e:
-        logging.error(f"Unexpected error: {e}")
+        logging.exception("Unexpected error: %s", e)
         return web.json_response(BaseResponse(code=500, msg="Internal server error").model_dump(), status=500)
       
   # -------------------- /analysis endpoint --------------------
