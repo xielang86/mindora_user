@@ -182,6 +182,10 @@ class UserProfileServ:
       if not skip_sleep_scenarios_reco_update:
         profile.sleep_scenarios_reco = self.calc_sleep_reco(uid, profile, old_profile)
         profile.standard_sop_reco = self.calc_standard_sop_reco(uid, profile, old_profile)
+      elif not profile.standard_sop_reco:
+        # make sure we never leave standard_sop_reco empty just because the
+        # sleep-scenarios skip flag is set
+        profile.standard_sop_reco = self.calc_standard_sop_reco(uid, profile, old_profile)
       # 仅保存当前用户的更新（而非全量数据）
       self.save_profile(uid, profile)
       logging.info(f"Behavior data for uid '{uid}' updated")
