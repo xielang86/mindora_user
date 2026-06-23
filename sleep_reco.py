@@ -336,7 +336,7 @@ def _load_sop_candidate_scenarios() -> List[SleepScenario]:
 def _build_sop_reco_scenario(cmd_name: str) -> SleepScenario:
     return SleepScenario(
         scenario_id=None,
-        scenario_name=None,
+        scenario_name=cmd_name,
         stages=[
             {
                 "cmd_name": cmd_name,

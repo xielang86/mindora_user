@@ -371,8 +371,28 @@ class UserServer:
 
     profile = self.user_serv.get_profile(uid)
     if profile:
-      profile.behaviors = None
-      profile.mindora_record = None
+      profile.behaviors = {
+      # 生命体征
+      "heart_rate": [], "blood_oxygen": [], "resting_heart_rate": [],
+      "heart_rate_variability_sdnn": [], "respiratory_rate": [],
+      "sleeping_wrist_temperature": [], "body_temperature": [],
+      # 睡眠状态
+      "sleep_status": [],
+      "sleep_stage_deep": [], "sleep_stage_rem": [], "sleep_stage_light": [],
+      # 交互行为
+      "clicks": [], "plays": [],
+      }     
+
+      profile.mindora_record = {
+      "sleep.scene.cocos_island_moonlight": [],
+      "sleep.scene.amalfi_breeze": [],
+      "sleep.scene.kyoto_forest": [],
+      "sleep.scene.andaman_rainforest_sanctuary": [],
+      "sleep.scene.bhutan_misty_forest": [],
+      "sleep.scene.sedona_red_rock_peace": [],
+      "sleep.scene.fogo_island_cookie_box": [],
+      "sleep.scene.seychelles_moonlight_lullaby": []
+    }
       logging.info("profile found uid=%s summary=%s", uid, self.user_serv._profile_for_log(profile))
       return ProfileResponse(code=0, msg="succ", request_type=request.request_type, data={"user_profile": profile.model_dump()})
     else:
