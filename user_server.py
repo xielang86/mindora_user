@@ -371,6 +371,8 @@ class UserServer:
 
     profile = self.user_serv.get_profile(uid)
     if profile:
+      profile.behaviors = None
+      profile.mindora_record = None
       logging.info("profile found uid=%s summary=%s", uid, self.user_serv._profile_for_log(profile))
       return ProfileResponse(code=0, msg="succ", request_type=request.request_type, data={"user_profile": profile.model_dump()})
     else:
