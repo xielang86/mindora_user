@@ -18,11 +18,13 @@ Mindora 设备端 IoT 服务（mDNS + WebSocket + BLE）
   pip install -r requirements.txt
   （含 bless / zeroconf / websockets）
 """
+import argparse
 import asyncio
 import json
 import os
 import socket
 import sys
+import uuid
 
 try:
     from websockets import serve as websocket_serve
@@ -50,7 +52,11 @@ def read_device_id():
     """启动时读取唯一 device_id，按优先级查多个位置：
       1. /etc/mindora/device_id      生产环境（产线烧录，需 root）
       2. ~/.mindora/device_id        开发期 fallback（用户态文件，免 sudo）
-      3. mnd-dev-0000                兜底硬编码，仅警示用，不应进生产
+      3. mnd-dev-<mac>               兜底，仅警示用，不应进生产
+
+    兜底必须带本机 MAC（uuid.getnode）——绝不能用固定常量。否则同一 LAN 上多台都没
+    烧 device_id 文件的开发机会拿到同一个 id，mDNS service name / host slug 全撞，
+    照样抛 NonUniqueNameException。MAC 稳定（重启不变）且 LAN 内唯一，正好做兜底。
     """
     for path in ["/etc/mindora/device_id", os.path.expanduser("~/.mindora/device_id")]:
         try:
@@ -60,7 +66,7 @@ def read_device_id():
                     return value
         except FileNotFoundError:
             continue
-    return "mnd-dev-0000"
+    return f"mnd-dev-{uuid.getnode():012x}"
 
 
 DEVICE_ID = read_device_id()
@@ -94,8 +100,12 @@ WEBSOCKET_PORT = 8765
 USER_SERVER_PORT = 9001
 
 # mDNS：iOS BonjourDiscovery 监听 _mindora._tcp.
-# service name 用带空格的 DEVICE_MODEL = "Mindora 2026"——这就是用户看到的型号；
-# 同款多台在同一 LAN 时 Bonjour 自动加 (2) (3) 后缀避免重名。
+# ⚠️ service 实例名必须保持干净的 DEVICE_MODEL（"Mindora 2026"）——iOS 端 UnifiedDeviceDiscovery
+#    直接拿 service.name 当列表显示名（不读 TXT name），任何塞进实例名的后缀都会原样显示成
+#    "Mindora 2026 (xxx)" 那种长串。所以唯一性绝不靠实例名扛：
+#      - LAN 内唯一靠 hostname（MDNS_LOCAL_NAME，带 DEVICE_HOST_SLUG，iOS 不显示）+ TXT device_id；
+#      - 同款多台真撞实例名时，register_service(allow_name_change=True) 让 zeroconf 自动加 " (2)"，
+#        这正是 iOS 侧注释里预期的行为（设备端处理，App 不用管）。
 # DNS hostname 必须用 dash 形式 DEVICE_HOST_SLUG（DNS 协议不允许空格），且需在 LAN 唯一。
 MDNS_SERVICE_TYPE = "_mindora._tcp.local."
 MDNS_SERVICE_NAME = f"{DEVICE_MODEL}._mindora._tcp.local."
@@ -290,7 +300,11 @@ def register_mdns_sync():
     )
 
     zeroconf_instance = Zeroconf()
-    zeroconf_instance.register_service(service_info)
+    # allow_name_change=True：实例名保持干净的 "Mindora 2026"，同款多台同 LAN 必然撞实例名，
+    # 靠 zeroconf 自动加 " (2)" 兜底（iOS 列表显示 "Mindora 2026" / "Mindora 2026 (2)"，正是
+    # iOS 侧预期行为）。同时兜住"本机崩溃没 unregister 就快速重启、旧记录未过 TTL"的自撞。
+    # 真正的设备唯一性靠 hostname(DEVICE_HOST_SLUG) + TXT device_id，不靠实例名。
+    zeroconf_instance.register_service(service_info, allow_name_change=True)
     print("mDNS服务已注册:")
     print(f"  device_id     : {DEVICE_ID}")
     print(f"  service type  : {MDNS_SERVICE_TYPE}")
@@ -312,31 +326,69 @@ def unregister_mdns_sync(service_info):
 # ==========================================
 # Main
 # ==========================================
-async def main():
+def parse_args():
+    """命令行开关：默认全开（mDNS + BLE + WebSocket）。子系统可按需禁用，方便排查
+    单一信道的问题，或在没装 zeroconf / websockets / bless 的环境跑一部分。
+
+    常用组合：
+      python iot_server.py                 # 默认全开
+      python iot_server.py --ble-only      # 只开 BLE（= --no-mdns --no-ws 的快捷）
+      python iot_server.py --no-mdns       # 不注册 mDNS（断网 / 排查 Bonjour 时常用）
+      python iot_server.py --no-ble        # 不开 BLE（无蓝牙硬件的环境）
+      python iot_server.py --no-ws         # 不起 WebSocket（iOS 端不用 ws，省个端口）
+    """
+    p = argparse.ArgumentParser(description="Mindora IoT Server")
+    p.add_argument("--ble-only", action="store_true",
+                   help="只开 BLE，跳过 mDNS 注册和 WebSocket 服务")
+    p.add_argument("--no-ble", action="store_true", help="跳过 BLE GATT 广播")
+    p.add_argument("--no-mdns", action="store_true", help="跳过 mDNS 注册")
+    p.add_argument("--no-ws", action="store_true", help="跳过 WebSocket 服务")
+    return p.parse_args()
+
+
+async def main(args):
+    enable_mdns = not (args.no_mdns or args.ble_only)
+    enable_ble = not args.no_ble
+    enable_ws = not (args.no_ws or args.ble_only)
+
     print("=" * 60)
     print(f"Mindora IoT Server  device_id={DEVICE_ID}  device_model={DEVICE_MODEL}")
     print(f"  platform: {sys.platform}")
+    print(f"  enabled : mDNS={enable_mdns}  BLE={enable_ble}  WebSocket={enable_ws}")
     print("=" * 60)
 
-    loop = asyncio.get_event_loop()
-    service_info = await loop.run_in_executor(None, register_mdns_sync)
+    if not (enable_mdns or enable_ble or enable_ws):
+        print("[FATAL] 所有子系统都被禁用，无事可做。退出。")
+        return
 
-    ble_task = asyncio.create_task(run_ble_server())
+    loop = asyncio.get_event_loop()
+    service_info = await loop.run_in_executor(None, register_mdns_sync) if enable_mdns else None
+    ble_task = asyncio.create_task(run_ble_server()) if enable_ble else None
+
+    # 主阻塞点优先级：WebSocket（如果开）→ 否则等 BLE task → 否则纯 mDNS 模式只睡等 Ctrl+C
     try:
-        await run_websocket_server()
+        if enable_ws:
+            await run_websocket_server()
+        elif ble_task is not None:
+            await ble_task
+        else:
+            await asyncio.Event().wait()
     except KeyboardInterrupt:
         print("服务器正在关闭...")
     finally:
-        ble_task.cancel()
-        try:
-            await ble_task
-        except (asyncio.CancelledError, Exception):
-            pass
-        await loop.run_in_executor(None, unregister_mdns_sync, service_info)
+        if ble_task is not None:
+            ble_task.cancel()
+            try:
+                await ble_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        if service_info is not None:
+            await loop.run_in_executor(None, unregister_mdns_sync, service_info)
 
 
 if __name__ == "__main__":
+    args = parse_args()
     try:
-        asyncio.run(main())
+        asyncio.run(main(args))
     except KeyboardInterrupt:
         print("程序已退出")

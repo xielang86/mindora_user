@@ -107,9 +107,101 @@ class SleepResult(BaseModel):
       "night_awake_duration": sum(seq.duration for seq in self.sleep_status if seq.sleep_type == "awake"),
       "night_awake_count": sum(1 for seq in self.sleep_status if seq.sleep_type == "awake"),
       "night_awake_type": max_awake_type,
-      "time_in_bed": sum(seq.duration for seq in self.sleep_status) 
+      "time_in_bed": sum(seq.duration for seq in self.sleep_status)
     }
-  
+
+# -------------------------- 睡眠统计辅助 --------------------------
+
+def _most_common(items: List[Any]) -> Optional[Any]:
+  """Return the most common item in a list, or None if empty."""
+  if not items:
+    return None
+  counts: Dict[Any, int] = {}
+  for item in items:
+    counts[item] = counts.get(item, 0) + 1
+  return max(counts, key=counts.get)
+
+
+def compute_recent_sleep_stats(profile: "UserProfile", days: int = 7) -> Dict[str, Any]:
+  """Compute aggregated sleep statistics from the most recent `days` records.
+
+  Stats are calculated locally from ``profile.sleep_data`` so callers never need
+  to send raw sleep sequences to an LLM.  Returns averages for quality, onset,
+  stage durations / percentages, awakenings, and the typical first-sleep time.
+  """
+  if not profile or not profile.sleep_data:
+    return {}
+
+  recent = profile.sleep_data[-days:]
+  if not recent:
+    return {}
+
+  def _avg(values: List[Optional[float]]) -> Optional[float]:
+    nums = [v for v in values if v is not None]
+    return round(sum(nums) / len(nums), 1) if nums else None
+
+  stats: Dict[str, Any] = {
+    "record_count": len(recent),
+    "avg_sleep_quality": _avg([r.sleep_quality for r in recent]),
+    "avg_soe": _avg([r.soe for r in recent]),
+    "avg_onset_min": _avg([r.onset for r in recent]),
+    "avg_hr_before_sleep": _avg([r.hr_before_sleep for r in recent]),
+    "avg_rr_before_sleep": _avg([r.rr_before_sleep for r in recent]),
+    "avg_heart_rate": _avg([r.avg_heart_rate for r in recent]),
+    "avg_hrv": _avg([r.hrv for r in recent]),
+    "typical_first_sleep_time": _most_common([r.first_sleep_time for r in recent if r.first_sleep_time]),
+  }
+
+  # Aggregate stage stats across the week.
+  total_time_in_bed = 0.0
+  total_deep = 0.0
+  total_core = 0.0
+  total_rem = 0.0
+  total_awake = 0.0
+  total_awake_count = 0
+
+  for record in recent:
+    summ = record.sequence_summaries if record.sleep_status else {}
+    total_time_in_bed += summ.get("time_in_bed", 0)
+    total_deep += summ.get("deep_sleep_duration", 0)
+    total_core += summ.get("core_sleep_duration", 0)
+    total_rem += summ.get("rem_sleep_duration", 0)
+    total_awake += summ.get("night_awake_duration", 0)
+    total_awake_count += summ.get("night_awake_count", 0)
+
+  stats["avg_time_in_bed_min"] = round(total_time_in_bed / len(recent), 1) if recent else 0
+  stats["avg_deep_min"] = round(total_deep / len(recent), 1) if recent else 0
+  stats["avg_core_min"] = round(total_core / len(recent), 1) if recent else 0
+  stats["avg_rem_min"] = round(total_rem / len(recent), 1) if recent else 0
+  stats["avg_awake_min"] = round(total_awake / len(recent), 1) if recent else 0
+  stats["avg_awake_count"] = round(total_awake_count / len(recent), 1) if recent else 0
+
+  denom = total_time_in_bed or 1
+  stats["avg_deep_pct"] = round(total_deep / denom * 100, 1)
+  stats["avg_rem_pct"] = round(total_rem / denom * 100, 1)
+  stats["avg_core_pct"] = round(total_core / denom * 100, 1)
+  stats["avg_awake_pct"] = round(total_awake / denom * 100, 1)
+
+  # Recent scene title from mindora_record (only the most recently used title).
+  recent_scene_title = None
+  latest_ts = 0
+  for scene_key, records in (profile.mindora_record or {}).items():
+    if not isinstance(records, list) or not records:
+      continue
+    title = scene_key.replace("sleep.scene.", "").replace("_", " ").title()
+    for entry in records:
+      if isinstance(entry, (list, tuple)) and len(entry) >= 1:
+        try:
+          ts = int(entry[0])
+        except (TypeError, ValueError):
+          continue
+        if ts > latest_ts:
+          latest_ts = ts
+          recent_scene_title = title
+  stats["recent_scene_title"] = recent_scene_title
+
+  return stats
+
 # -------------------------- 助眠场景推荐模型 --------------------------
 class SleepStage(BaseModel):
   """助眠阶段模型"""
@@ -180,10 +272,11 @@ class UserProfile(BaseModel):
 
   sleep_analysis: Dict[str, Any] = Field(
     default_factory=lambda: {
-      "sleep_trend_week": "", 
+      "sleep_trend_week": "",
       "sleep_trend_month": "",
       "scene": {"title":"", "music":"", "text":"", "image_url": ""},
       "sleep_advice": "",
+      "sleep_advice_structured": None,
     }
   )
 

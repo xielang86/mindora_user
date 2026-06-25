@@ -32,6 +32,9 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from tool.doubao_langchain import VolcEngineArkChat
 
 
+from user_profile import compute_recent_sleep_stats
+
+
 _PROFILE_JSON_MAX_CHARS = 12000
 _KNOWLEDGE_BASE_PATH = os.path.join(
     os.path.dirname(__file__),
@@ -48,6 +51,10 @@ def extract_sleep_context(profile, data) -> dict:
     """
     Pull key sleep metrics from UserProfile into a flat dict
     that can be embedded in an LLM prompt.
+
+    Raw sleep sequences and behavior series are intentionally excluded.
+    Sleep stage statistics are aggregated locally; only the stats are
+    exposed, along with the ``sleep_analysis`` fields stored in the profile.
     """
     ctx: dict[str, Any] = {
         "date":       getattr(data, "date", None) or "",
@@ -56,43 +63,21 @@ def extract_sleep_context(profile, data) -> dict:
         "language":   getattr(data, "language", "en"),
     }
 
-    if not profile or not profile.sleep_data:
+    if not profile:
         return ctx
 
-    recent = profile.sleep_data[-7:]
-    scores = [s.sleep_quality for s in recent if s.sleep_quality is not None]
-    ctx["avg_score"]    = round(sum(scores) / len(scores)) if scores else None
-    ctx["latest_score"] = int(recent[-1].sleep_quality) if recent[-1].sleep_quality else None
+    # Locally computed 7-day sleep statistics (no raw sequences).
+    stats = compute_recent_sleep_stats(profile, days=7)
+    ctx.update(stats)
 
-    latest = recent[-1]
-    ctx["first_sleep_time"]  = latest.first_sleep_time
-    ctx["hr_before_sleep"]   = latest.hr_before_sleep
-    ctx["rr_before_sleep"]   = latest.rr_before_sleep
-    ctx["avg_heart_rate"]    = latest.avg_heart_rate
-    ctx["hrv"]               = latest.hrv
-    ctx["onset_score"]       = int(latest.soe) if latest.soe else None
+    # Profile sleep_analysis fields drive the prompt content.
+    sleep_analysis = profile.sleep_analysis or {}
+    ctx["sleep_trend_week"]  = sleep_analysis.get("sleep_trend_week", "")
+    ctx["sleep_trend_month"] = sleep_analysis.get("sleep_trend_month", "")
+    ctx["scene_title"]       = (sleep_analysis.get("scene") or {}).get("title", "")
+    ctx["scene_text"]        = (sleep_analysis.get("scene") or {}).get("text", "")
+    ctx["profile_sleep_advice"] = sleep_analysis.get("sleep_advice", "")
 
-    summ = latest.sequence_summaries if latest.sleep_status else {}
-    tb   = summ.get("time_in_bed") or 1
-    ctx["deep_min"]    = round(summ.get("deep_sleep_duration", 0))
-    ctx["rem_min"]     = round(summ.get("rem_sleep_duration",  0))
-    ctx["core_min"]    = round(summ.get("core_sleep_duration", 0))
-    ctx["awake_count"] = summ.get("night_awake_count", 0)
-    ctx["awake_min"]   = round(summ.get("night_awake_duration", 0))
-    ctx["awake_type"]  = summ.get("night_awake_type") or "brief awakening"
-    ctx["deep_pct"]    = round(summ.get("deep_sleep_duration", 0) / tb * 100, 1)
-    ctx["rem_pct"]     = round(summ.get("rem_sleep_duration",  0) / tb * 100, 1)
-    ctx["core_pct"]    = round(summ.get("core_sleep_duration", 0) / tb * 100, 1)
-
-    # best scene from mindora_record
-    if profile.mindora_record:
-        best = max(profile.mindora_record.items(), key=lambda x: len(x[1]), default=None)
-        if best and best[1]:
-            ctx["scene_id"]    = best[0].replace("sleep.scene.", "")
-            ctx["scene_name"]  = ctx["scene_id"].replace("_", " ").title()
-            ctx["used_times"]  = len(best[1])
-
-    ctx["user_profile_json"] = _serialize_profile_for_prompt(profile)
     ctx["sleep_knowledge"] = _load_sleep_knowledge()
 
     return ctx
@@ -118,6 +103,7 @@ def _summarize_behavior_series(behaviors: dict[str, Any]) -> dict[str, Any]:
 
 
 def _serialize_profile_for_prompt(profile) -> str:
+    """Kept for non-sleep-advice prompts; still omits bulky image payloads."""
     profile_dict = profile.model_dump(mode="json", exclude_none=True)
 
     if isinstance(profile_dict.get("profile"), dict):
@@ -129,6 +115,36 @@ def _serialize_profile_for_prompt(profile) -> str:
 
     text = json.dumps(profile_dict, ensure_ascii=False, indent=2)
     return _truncate_text(text, _PROFILE_JSON_MAX_CHARS)
+
+
+def _summarize_profile_for_prompt(profile) -> str:
+    """Return a compact, LLM-friendly snapshot of the user profile.
+
+    Includes only stable user info and the stored sleep_analysis fields.
+    Raw behaviors and full mindora_record history are intentionally omitted.
+    """
+    if not profile:
+        return "{}"
+
+    data: dict[str, Any] = {}
+    if profile.basic_info:
+        data["basic_info"] = profile.basic_info
+    if profile.long_term_profile:
+        data["long_term_profile"] = profile.long_term_profile
+    if profile.profile:
+        prof = profile.profile.model_dump(mode="json", exclude_none=True)
+        prof.pop("avatar_base64", None)
+        data["profile"] = prof
+
+    sleep_analysis = profile.sleep_analysis or {}
+    data["sleep_analysis"] = {
+        "sleep_trend_week": sleep_analysis.get("sleep_trend_week", ""),
+        "sleep_trend_month": sleep_analysis.get("sleep_trend_month", ""),
+        "scene": sleep_analysis.get("scene", {}),
+        "sleep_advice": sleep_analysis.get("sleep_advice", ""),
+    }
+
+    return json.dumps(data, ensure_ascii=False, indent=2)
 
 
 @lru_cache(maxsize=1)
@@ -275,46 +291,56 @@ Return JSON with exactly these keys:
 def _prompt_sleep_advice(ctx: dict) -> str:
     """Prompt for the /sleep_advice endpoint.
 
-    Asks the LLM for a structured JSON with analysis paragraph,
-    actionable advice bullets, and optional per-pillar highlights.
+    Uses locally aggregated sleep statistics plus the ``sleep_analysis`` fields
+    stored in the user profile.  Raw sleep sequences and behavior history are
+    intentionally omitted; only the most recently used Mindora scene title is
+    included.
     """
     focus = ctx.get("focus") or []
     focus_hint = ""
     if focus:
         focus_hint = f"\nFocus especially on: {', '.join(focus)}."
 
-    hr = ctx.get('avg_heart_rate', '—')
-    hr_lo = round(hr - 15) if isinstance(hr, (int, float)) else '—'
-    hr_hi = round(hr + 15) if isinstance(hr, (int, float)) else '—'
-    profile_json = ctx.get("user_profile_json", "{}")
     knowledge = ctx.get("sleep_knowledge", "")
     knowledge_block = f"\nMindora sleep recommendation knowledge base:\n{knowledge}\n" if knowledge else ""
 
+    def _fmt(value, suffix=""):
+        if value is None:
+            return "—"
+        if isinstance(value, float):
+            return f"{value:g}{suffix}"
+        return f"{value}{suffix}"
+
     return f"""{_lang_instruction(ctx.get('language', 'en'))}
 
-Sleep data for {ctx.get('date', 'last night')}:
-- Overall score: {ctx.get('latest_score', '—')} / 100
-- Onset efficiency (SOE): {ctx.get('onset_score', '—')} / 100
-- First sleep time: {ctx.get('first_sleep_time', '—')}
-- Pre-sleep HR: {ctx.get('hr_before_sleep', '—')} bpm   RR: {ctx.get('rr_before_sleep', '—')} brpm
-- Deep: {ctx.get('deep_pct', '—')}%   REM: {ctx.get('rem_pct', '—')}%   Core: {ctx.get('core_pct', '—')}%
-- Night wakings: {ctx.get('awake_count', '—')} × {ctx.get('awake_min', '—')} min   type: {ctx.get('awake_type', '—')}
-- HR range: {hr_lo}–{hr_hi} bpm   HRV: {ctx.get('hrv', '—')}
-- Preferred scene (7 days): {ctx.get('scene_name', '—')} (used {ctx.get('used_times', 0)} times)
+Recent 7-day sleep statistics (aggregated locally):
+- Records used: {ctx.get('record_count', '—')}
+- Average sleep quality: {_fmt(ctx.get('avg_sleep_quality'))} / 100
+- Average sleep-onset latency: {_fmt(ctx.get('avg_onset_min'), ' min')}
+- Typical first sleep time: {ctx.get('typical_first_sleep_time', '—')}
+- Average time in bed: {_fmt(ctx.get('avg_time_in_bed_min'), ' min')}
+- Deep sleep: {_fmt(ctx.get('avg_deep_min'), ' min')} ({_fmt(ctx.get('avg_deep_pct'), '%')})
+- REM sleep: {_fmt(ctx.get('avg_rem_min'), ' min')} ({_fmt(ctx.get('avg_rem_pct'), '%')})
+- Core sleep: {_fmt(ctx.get('avg_core_min'), ' min')} ({_fmt(ctx.get('avg_core_pct'), '%')})
+- Night awakenings: {_fmt(ctx.get('avg_awake_count'))} × {_fmt(ctx.get('avg_awake_min'), ' min')}
+- Pre-sleep HR: {_fmt(ctx.get('avg_hr_before_sleep'), ' bpm')}   RR: {_fmt(ctx.get('avg_rr_before_sleep'), ' brpm')}
+- Average HR: {_fmt(ctx.get('avg_heart_rate'), ' bpm')}   HRV: {_fmt(ctx.get('avg_hrv'))}
+- Most recently used scene: {ctx.get('recent_scene_title', '—')}
+
+Sleep analysis context from the user profile:
+- Weekly trend: {ctx.get('sleep_trend_week', '—')}
+- Monthly trend: {ctx.get('sleep_trend_month', '—')}
+- Scene insight: {ctx.get('scene_text', '—')}
+- Previous advice: {ctx.get('profile_sleep_advice', '—')}
 {focus_hint}
 {knowledge_block}
-Full user profile JSON snapshot:
-```json
-{profile_json}
-```
-
 Your task:
-1. Use both the structured sleep metrics and the user profile JSON to infer the user's likely sleep issues, context, and preferences.
-2. Ground your recommendations in the Mindora sleep recommendation knowledge base when it is relevant.
+1. Use the 7-day sleep statistics and the profile sleep-analysis context to infer the user's likely sleep issues and preferences.
+2. Ground your recommendations in the Mindora sleep recommendation knowledge base when relevant.
 3. Write a brief sleep analysis (2–4 sentences), warm, concrete, and personalized.
 4. Provide 2–4 personalised, actionable advice bullets based on the data.
 5. For each relevant pillar, give a one-line highlight.
-6. Do not mention missing fields, raw JSON, or that you used a knowledge base.
+6. Do not mention missing fields, raw sequences, or that you used a knowledge base.
 
 Return ONLY a JSON object (no markdown, no explanation):
 {{
@@ -494,3 +520,43 @@ class SleepAnalysisLLM:
 
         raw = await self._call(prompt_fn())
         return self._parse(raw)
+
+    def generate_sync(
+        self,
+        request_type: str,
+        ctx: dict,
+        language: str,
+        modules: list,
+    ) -> Optional[dict]:
+        """
+        Synchronous version of generate().
+
+        Dispatches to the same prompt builders and parses the response.
+        Used from synchronous contexts such as UserProfileServ.update_profile().
+        """
+        if not self.enabled:
+            return None
+
+        ctx = {**ctx, "language": language}
+
+        prompt_fn = {
+            "analysis_overview":       lambda: _prompt_overview(ctx),
+            "analysis_sleep_day":      lambda: _prompt_sleep_day(ctx),
+            "analysis_sleep_week":     lambda: _prompt_sleep_week(ctx),
+            "analysis_sleep_month":    lambda: _prompt_sleep_month(ctx),
+            "analysis_explore":        lambda: _prompt_explore(ctx, modules),
+            "sleep_analysis_advice":   lambda: _prompt_sleep_advice(ctx),
+        }.get(request_type)
+
+        if prompt_fn is None:
+            return None
+
+        try:
+            resp = self._model.invoke([
+                SystemMessage(content=_SYSTEM),
+                HumanMessage(content=prompt_fn()),
+            ])
+            return self._parse(resp.content)
+        except Exception as e:
+            logging.error("LLM sync call error: %s", e)
+            return None

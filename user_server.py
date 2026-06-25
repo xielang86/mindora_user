@@ -36,12 +36,13 @@ REMOTE_SYNC_HEADER = "X-Mindora-Remote-Sync"
 # all bloking sync api
 class UserProfileServ:
   MAX_BEHAVIOR_LEN = 100
-  def __init__(self):
+  def __init__(self, llm: Optional[SleepAnalysisLLM] = None):
     self.lock = threading.RLock()
     self.storage_mode = (Config.USER_PROFILE_STORAGE_MODE or "leveldb").strip().lower()
     self.db = None
     self.json_path = Path(run_dir) / Config.USER_PROFILE_JSON_PATH
     self.text_profiles: dict[str, Any] = {}
+    self.llm = llm or SleepAnalysisLLM()
 
     if self.storage_mode == "leveldb":
       if plyvel is None:
@@ -203,6 +204,34 @@ class UserProfileServ:
     sop_reco = RecommendationEngine.generate_sop_reco(new_profile, candidates)
     return sop_reco
 
+  def calc_sleep_advice(self, uid: str, profile: UserProfile) -> dict:
+    """Generate sleep advice via LLM and return a structured dict for storage."""
+    if not self.llm or not self.llm.enabled:
+      return {}
+
+    class _FakeData:
+      date = datetime.date.today().isoformat()
+      start_date = None
+      end_date = None
+      language = "en"
+
+    ctx = extract_sleep_context(profile, _FakeData())
+    ctx["focus"] = []
+
+    llm_result = self.llm.generate_sync("sleep_analysis_advice", ctx, "en", [])
+    if not llm_result:
+      return {}
+
+    return {
+      "analysis": llm_result.get("analysis", ""),
+      "advice": llm_result.get("advice", []),
+      "highlights": llm_result.get("highlights", {}),
+      "date": datetime.date.today().isoformat(),
+      "language": "en",
+      "llm_used": True,
+      "generated_at": int(time.time()),
+    }
+
   def update_profile(self, uid: str, new_profile: UserProfile, skip_sleep_scenarios_reco_update: bool = False) -> bool:
     """写入用户行为（仅更新单个用户数据）"""
     if new_profile is None or uid is None or not isinstance(uid, str):
@@ -219,7 +248,11 @@ class UserProfileServ:
           new_profile.standard_sop_reco = RecommendationEngine.generate_sop_reco(
             new_profile,
             [key for key in new_profile.mindora_record.keys() if "sleep.scene." in key],
-        )
+          )
+          sleep_advice_structured = self.calc_sleep_advice(uid, new_profile)
+          if sleep_advice_structured:
+            new_profile.sleep_analysis["sleep_advice_structured"] = sleep_advice_structured
+            new_profile.sleep_analysis["sleep_advice"] = sleep_advice_structured.get("analysis", "")
         self.save_profile(uid, new_profile)
         return True
 
@@ -237,6 +270,10 @@ class UserProfileServ:
       if not skip_sleep_scenarios_reco_update:
         profile.sleep_scenarios_reco = self.calc_sleep_reco(uid, profile, old_profile)
         profile.standard_sop_reco = self.calc_standard_sop_reco(uid, profile, old_profile)
+        sleep_advice_structured = self.calc_sleep_advice(uid, profile)
+        if sleep_advice_structured:
+          profile.sleep_analysis["sleep_advice_structured"] = sleep_advice_structured
+          profile.sleep_analysis["sleep_advice"] = sleep_advice_structured.get("analysis", "")
       elif not profile.standard_sop_reco:
         # make sure we never leave standard_sop_reco empty just because the
         # sleep-scenarios skip flag is set
@@ -305,13 +342,13 @@ class UserServer:
     self.server_semaphore = asyncio.Semaphore(Config.MaxServerConcurrent)
     self.host = Config.HOST
     self.port = Config.PORT
-    self.user_serv = UserProfileServ()
+    self.llm = SleepAnalysisLLM()
+    self.user_serv = UserProfileServ(llm=self.llm)
     self.update_task = None
     self.app = web.Application()
     self.active_uid = ""
     self.system_uid = get_or_create_uuid()
     self.debug_uid_set = {"mindora_test_uid1", "mindora_test_uid2", "mindora_test_uid3", "test_debug_user_001"}
-    self.llm = SleepAnalysisLLM()
     self.setup_routes()
 
   def close(self):
@@ -628,7 +665,7 @@ class UserServer:
   }
 
   async def handle_sleep_advice_http(self, request: web.Request) -> web.Response:
-    """POST /sleep_advice — LLM-powered sleep analysis + actionable advice."""
+    """POST /sleep_advice — return stored sleep advice from the user profile."""
     try:
       body = await request.json()
       req = SleepAdviceRequest.model_validate(body)
@@ -643,27 +680,22 @@ class UserServer:
       date = req.data.date or datetime.date.today().isoformat()
       language = req.data.language or "en"
 
-      # --- try LLM generation -------------------------------------------------
-      llm_result = None
-      if self.llm.enabled and profile:
-        ctx = extract_sleep_context(profile, req.data)
-        ctx["focus"] = req.data.focus
-        llm_result = await self.llm.generate(
-          "sleep_analysis_advice", ctx, language, [],
-        )
+      # --- read stored advice first --------------------------------------------
+      stored = None
+      if profile and profile.sleep_analysis:
+        stored = profile.sleep_analysis.get("sleep_advice_structured")
 
-      # --- assemble response ---------------------------------------------------
-      if llm_result:
+      if stored:
         result = SleepAdviceResult(
-          analysis=llm_result.get("analysis", self._DEFAULT_ADVICE_ANALYSIS),
-          advice=llm_result.get("advice", self._DEFAULT_ADVICE_BULLETS),
-          highlights=llm_result.get("highlights", self._DEFAULT_ADVICE_HIGHLIGHTS),
-          date=date,
-          language=language,
-          llm_used=True,
+          analysis=stored.get("analysis", self._DEFAULT_ADVICE_ANALYSIS),
+          advice=stored.get("advice", list(self._DEFAULT_ADVICE_BULLETS)),
+          highlights=stored.get("highlights", dict(self._DEFAULT_ADVICE_HIGHLIGHTS)),
+          date=stored.get("date", date),
+          language=stored.get("language", language),
+          llm_used=stored.get("llm_used", True),
         )
       else:
-        # Fallback: static defaults when LLM is disabled or fails
+        # Fallback: static defaults when no stored advice exists
         result = SleepAdviceResult(
           analysis=self._DEFAULT_ADVICE_ANALYSIS,
           advice=list(self._DEFAULT_ADVICE_BULLETS),
