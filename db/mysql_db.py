@@ -364,7 +364,7 @@ def create_redemption_codes(
   conn = None
   try:
     conn = mysql_db.get_connection()
-    conn.autocommit(False)
+    conn.begin()
     with conn.cursor() as cursor:
       for _ in range(quantity):
         plain_code = _generate_redemption_code_text()
@@ -401,10 +401,6 @@ def create_redemption_codes(
     raise
   finally:
     if conn:
-      try:
-        conn.autocommit(True)
-      except Exception:
-        pass
       conn.close()
 
 
@@ -415,7 +411,7 @@ def redeem_redemption_code(uid: str, redemption_code: str) -> dict:
   conn = None
   try:
     conn = mysql_db.get_connection()
-    conn.autocommit(False)
+    conn.begin()
     now = datetime.now()
     code_hash = _hash_redemption_code(redemption_code)
 
@@ -513,10 +509,6 @@ def redeem_redemption_code(uid: str, redemption_code: str) -> dict:
     return {"code": 500, "msg": f"redeem redemption code failed: {e}", "data": None}
   finally:
     if conn:
-      try:
-        conn.autocommit(True)
-      except Exception:
-        pass
       conn.close()
 
 

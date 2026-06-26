@@ -143,6 +143,36 @@ def _safe_profile_json(profile: UserProfile) -> str:
     return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
+def _summarize_profile_for_prompt(profile: UserProfile) -> str:
+    """Return a compact profile snapshot suitable for LLM prompts.
+
+    Omits bulky raw behaviors and full sleep sequences to keep prompts small
+    and avoid HTTP read timeouts.
+    """
+    if not profile:
+        return "{}"
+
+    data: dict[str, Any] = {}
+    if profile.basic_info:
+        data["basic_info"] = profile.basic_info
+    if profile.long_term_profile:
+        data["long_term_profile"] = profile.long_term_profile
+    if profile.profile:
+        prof = profile.profile.model_dump(mode="json", exclude_none=True)
+        prof.pop("avatar_base64", None)
+        data["profile"] = prof
+
+    sleep_analysis = profile.sleep_analysis or {}
+    data["sleep_analysis"] = {
+        "sleep_trend_week": sleep_analysis.get("sleep_trend_week", ""),
+        "sleep_trend_month": sleep_analysis.get("sleep_trend_month", ""),
+        "scene": sleep_analysis.get("scene", {}),
+        "sleep_advice": sleep_analysis.get("sleep_advice", ""),
+    }
+
+    return json.dumps(data, ensure_ascii=False, indent=2)
+
+
 @lru_cache(maxsize=1)
 def _load_text(path: str) -> str:
     try:
@@ -158,7 +188,7 @@ def _build_prompt(profile: UserProfile) -> str:
     topology = _load_text(_TOPOLOGY_PATH)
     return f"""
 User profile JSON:
-{_safe_profile_json(profile)}
+{_summarize_profile_for_prompt(profile)}
 
 Sleep intervention knowledge base:
 {knowledge}
@@ -201,7 +231,7 @@ def _build_sop_reco_prompt(profile: UserProfile, candidates: List[str]) -> str:
     topology = _load_text(_TOPOLOGY_PATH)
     return f"""
 User profile JSON:
-{_safe_profile_json(profile)}
+{_summarize_profile_for_prompt(profile)}
 
 Sleep intervention knowledge base:
 {knowledge}

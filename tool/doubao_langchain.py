@@ -79,12 +79,13 @@ class VolcEngineArkChat(BaseChatModel):
         }
 
         # 4. 调用方舟平台API并解析结果
+        timeout_seconds = int(os.getenv("ARK_TIMEOUT", "120"))
         try:
             response = requests.post(
                 url=self.api_base,
                 json=request_body,
                 headers=headers,
-                timeout=30
+                timeout=timeout_seconds
             )
             response.raise_for_status()  # 抛出HTTP错误（如401/403）
             # Try to parse JSON; if decoding fails, include raw text for debugging

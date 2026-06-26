@@ -468,9 +468,11 @@ class SleepAnalysisLLM:
 
         try:
             loop = asyncio.get_running_loop()
+            # Slightly longer than the HTTP timeout inside VolcEngineArkChat
+            # so thread-pool scheduling overhead does not trigger this first.
             return await asyncio.wait_for(
                 loop.run_in_executor(None, _invoke),
-                timeout=120,
+                timeout=130,
             )
         except asyncio.TimeoutError:
             logging.warning("LLM call timed out")
