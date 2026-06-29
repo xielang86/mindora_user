@@ -449,7 +449,13 @@ class SleepAnalysisLLM:
 
     @property
     def enabled(self) -> bool:
+        if hasattr(self, "_enabled_override"):
+            return self._enabled_override
         return self._model is not None
+
+    @enabled.setter
+    def enabled(self, value: bool):
+        self._enabled_override = value
 
     # ── internal ──────────────────────────────────────────────
 

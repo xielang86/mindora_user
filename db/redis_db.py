@@ -41,7 +41,27 @@ class RedisDB:
     try:
       return client.get(key)
     except RedisError as e:
-      raise Exception(f"Redis读取失败：{str(e)}")
+      logging.error(
+        "Redis get failed: %s, key_len=%d, host=%s:%s/%s",
+        e, len(key) if key else 0, self.host, self.port, self.db,
+      )
+      try:
+        self._reset_pool()
+        client = self.get_client()
+        return client.get(key)
+      except RedisError as e2:
+        logging.exception("Redis get retry also failed")
+        raise Exception(f"Redis读取失败：{str(e2)}") from e2
+
+  def _reset_pool(self):
+    """Close and recreate the connection pool (used after connection errors)."""
+    try:
+      if RedisDB._pool:
+        RedisDB._pool.disconnect(inuse_connections=True)
+    except Exception as e:
+      logging.warning(f"Redis reset_pool disconnect warning: {e}")
+    RedisDB._pool = None
+    self._init_pool()
 
   def set(self, key: str, value: str, expire_seconds: int = None) -> bool:
     """
@@ -51,6 +71,14 @@ class RedisDB:
     :param expire_seconds: 过期时间（秒），None则永久
     :return: 是否成功
     """
+    if expire_seconds is not None:
+      try:
+        expire_seconds = int(expire_seconds)
+      except (TypeError, ValueError) as e:
+        raise ValueError(f"Invalid expire_seconds for Redis set: {expire_seconds!r}") from e
+      if expire_seconds <= 0:
+        raise ValueError(f"Redis expire_seconds must be positive, got {expire_seconds}")
+
     client = self.get_client()
     try:
       if expire_seconds:
@@ -59,7 +87,23 @@ class RedisDB:
         client.set(key, value)
       return True
     except RedisError as e:
-      raise Exception(f"Redis写入失败：{str(e)}")
+      logging.error(
+        "Redis set failed: %s, key_len=%d, value_len=%d, expire=%s, host=%s:%s/%s",
+        e, len(key) if key else 0, len(value) if value else 0,
+        expire_seconds, self.host, self.port, self.db,
+      )
+      # Try once more with a fresh pool in case the connection was dropped.
+      try:
+        self._reset_pool()
+        client = self.get_client()
+        if expire_seconds:
+          client.setex(key, expire_seconds, value)
+        else:
+          client.set(key, value)
+        return True
+      except RedisError as e2:
+        logging.exception("Redis set retry also failed")
+        raise Exception(f"Redis写入失败：{str(e2)}") from e2
 
 # 初始化Redis实例（全局单例）
 redis_db = RedisDB()

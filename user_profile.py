@@ -277,6 +277,7 @@ class UserProfile(BaseModel):
       "scene": {"title":"", "music":"", "text":"", "image_url": ""},
       "sleep_advice": "",
       "sleep_advice_structured": None,
+      "analysis_cache": {},
     }
   )
 
