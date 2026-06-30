@@ -17,13 +17,6 @@ class BaseResponse(BaseModel):
   msg: str = ""
 
 # -------------------------- 子模型定义（对应data下一级字段的嵌套结构） --------------------------
-class UserAddress(BaseModel):
-  """用户地址信息模型"""
-  province: str = Field(..., description="省份")
-  city: str = Field(..., description="城市")
-  detail: str = Field(..., description="详细地址")
-  zip_code: Optional[str] = Field(None, description="邮政编码")
-
 class UserSocial(BaseModel):
   """用户社交账号信息模型"""
   wechat: Optional[str] = Field(None, description="微信号")
@@ -54,6 +47,7 @@ class Profile(BaseModel):
   address_list: List[Address] = Field(default_factory=list, description="地址列表")
   avatar_base64: Optional[str] = Field("", description="头像的 Base64 内容")
   avatar_mime_type: Optional[str] = Field("image/jpeg", description="头像 MIME 类型")
+  weight: Optional[float] = Field(None, description="体重，单位 kg")
 
 
 # 建议新增：环境与敏感度
@@ -185,6 +179,9 @@ def compute_recent_sleep_stats(profile: "UserProfile", days: int = 7) -> Dict[st
   # Recent scene title from mindora_record (only the most recently used title).
   recent_scene_title = None
   latest_ts = 0
+  # Most frequently used scene in the requested window.
+  cutoff_ts = int(time.time()) - days * 86400
+  scene_counts: Dict[str, int] = {}
   for scene_key, records in (profile.mindora_record or {}).items():
     if not isinstance(records, list) or not records:
       continue
@@ -198,7 +195,14 @@ def compute_recent_sleep_stats(profile: "UserProfile", days: int = 7) -> Dict[st
         if ts > latest_ts:
           latest_ts = ts
           recent_scene_title = title
+        if ts >= cutoff_ts:
+          scene_counts[title] = scene_counts.get(title, 0) + 1
+
   stats["recent_scene_title"] = recent_scene_title
+
+  weekly_top_scene = max(scene_counts, key=scene_counts.get) if scene_counts else None
+  stats["weekly_top_scene_title"] = weekly_top_scene
+  stats["weekly_top_scene_count"] = scene_counts.get(weekly_top_scene, 0) if weekly_top_scene else 0
 
   return stats
 
@@ -275,6 +279,8 @@ class UserProfile(BaseModel):
       "sleep_trend_week": "",
       "sleep_trend_month": "",
       "scene": {"title":"", "music":"", "text":"", "image_url": ""},
+      "most_used_scene": None,
+      "most_used_scene_7d": None,
       "sleep_advice": "",
       "sleep_advice_structured": None,
       "analysis_cache": {},

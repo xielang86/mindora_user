@@ -21,10 +21,19 @@ Mindora 设备端 IoT 服务（mDNS + WebSocket + BLE）
 import argparse
 import asyncio
 import json
+import logging
 import os
 import socket
 import sys
 import uuid
+
+from dotenv import load_dotenv
+
+import logger
+
+load_dotenv()
+run_dir = os.getenv("RUN_DIR")
+logger.init_log(f"{run_dir}/iot_server_logs")
 
 try:
     from websockets import serve as websocket_serve
@@ -159,7 +168,7 @@ def build_user_server_info():
 
 def process_message(message):
     """处理 WebSocket 收到的 JSON 消息。iOS 不发任何消息，这里给其他客户端用。"""
-    print(f"处理消息: {message}")
+    logging.info(f"处理消息: {message}")
     if message.get('type') == 'ping':
         return {
             'type': 'pong',
@@ -187,7 +196,7 @@ async def run_ble_server():
        macOS → CoreBluetooth；Linux → BlueZ via DBus；Windows → WinRT。
     """
     if BlessServer is None:
-        print("[BLE] 缺依赖 bless，跳过 BLE 服务。解决: pip install bless")
+        logging.warning("[BLE] 缺依赖 bless，跳过 BLE 服务。解决: pip install bless")
         return
 
     device_id_bytes = DEVICE_ID.encode("utf-8")
@@ -208,13 +217,13 @@ async def run_ble_server():
         GATTAttributePermissions.readable,
     )
 
-    print("[BLE] 启动 bless peripheral...")
+    logging.info("[BLE] 启动 bless peripheral...")
     await server.start()
-    print("[BLE] 广播已启动:")
-    print(f"  device model : {DEVICE_MODEL}")
-    print(f"  service UUID : {BLE_SERVICE_UUID}")
-    print(f"  char UUID    : {BLE_CHARACTERISTIC_UUID}")
-    print(f"  char value   : {DEVICE_ID}")
+    logging.info("[BLE] 广播已启动:")
+    logging.info(f"  device model : {DEVICE_MODEL}")
+    logging.info(f"  service UUID : {BLE_SERVICE_UUID}")
+    logging.info(f"  char UUID    : {BLE_CHARACTERISTIC_UUID}")
+    logging.info(f"  char value   : {DEVICE_ID}")
 
     try:
         # 阻塞直到外层 cancel
@@ -224,9 +233,9 @@ async def run_ble_server():
     finally:
         try:
             await server.stop()
-            print("[BLE] 已停止")
+            logging.info("[BLE] 已停止")
         except Exception as e:
-            print(f"[BLE] 停止时报错（忽略）: {e}")
+            logging.error(f"[BLE] 停止时报错（忽略）: {e}")
 
 
 # ==========================================
@@ -234,12 +243,12 @@ async def run_ble_server():
 # ==========================================
 async def websocket_handler(websocket):
     """处理 WebSocket 连接。iOS 不连这里，给其他客户端 / 未来扩展用。"""
-    print("WebSocket客户端已连接")
+    logging.info("WebSocket客户端已连接")
     try:
         async for message in websocket:
             try:
                 data = json.loads(message)
-                print(f"WebSocket收到数据: {data}")
+                logging.info(f"WebSocket收到数据: {data}")
                 response = process_message(data)
                 await websocket.send(json.dumps(response))
             except json.JSONDecodeError:
@@ -247,20 +256,20 @@ async def websocket_handler(websocket):
             except Exception as e:
                 await websocket.send(json.dumps({'type': 'error', 'message': f'处理消息时出错: {str(e)}'}))
     except Exception as e:
-        print(f"WebSocket错误: {e}")
+        logging.error(f"WebSocket错误: {e}")
     finally:
-        print("WebSocket客户端已断开")
+        logging.info("WebSocket客户端已断开")
 
 
 async def run_websocket_server():
     if websocket_serve is None:
-        print("[WS] 缺依赖 websockets，跳过 WebSocket 服务。解决: pip install websockets")
+        logging.warning("[WS] 缺依赖 websockets，跳过 WebSocket 服务。解决: pip install websockets")
         # 不能 return，否则 main() 会立即退出。挂起让 BLE 继续跑。
         await asyncio.Event().wait()
         return
-    print("启动WebSocket服务器...")
+    logging.info("启动WebSocket服务器...")
     async with websocket_serve(websocket_handler, "0.0.0.0", WEBSOCKET_PORT):
-        print(f"WebSocket服务器已启动，端口: {WEBSOCKET_PORT}")
+        logging.info(f"WebSocket服务器已启动，端口: {WEBSOCKET_PORT}")
         await asyncio.Event().wait()
 
 
@@ -271,10 +280,10 @@ def register_mdns_sync():
     """同步注册 mDNS 服务。"""
     global zeroconf_instance
     if Zeroconf is None or ServiceInfo is None:
-        print("[mDNS] 缺依赖 zeroconf，跳过 mDNS 注册。解决: pip install zeroconf")
+        logging.warning("[mDNS] 缺依赖 zeroconf，跳过 mDNS 注册。解决: pip install zeroconf")
         return None
 
-    print("注册mDNS服务...")
+    logging.info("注册mDNS服务...")
     ip_address = get_lan_ip()
 
     service_info = ServiceInfo(
@@ -305,13 +314,13 @@ def register_mdns_sync():
     # iOS 侧预期行为）。同时兜住"本机崩溃没 unregister 就快速重启、旧记录未过 TTL"的自撞。
     # 真正的设备唯一性靠 hostname(DEVICE_HOST_SLUG) + TXT device_id，不靠实例名。
     zeroconf_instance.register_service(service_info, allow_name_change=True)
-    print("mDNS服务已注册:")
-    print(f"  device_id     : {DEVICE_ID}")
-    print(f"  service type  : {MDNS_SERVICE_TYPE}")
-    print(f"  service name  : {MDNS_SERVICE_NAME}")
-    print(f"  host          : {MDNS_HOST_NAME}")
-    print(f"  IP            : {ip_address}")
-    print(f"  port          : {WEBSOCKET_PORT}")
+    logging.info("mDNS服务已注册:")
+    logging.info(f"  device_id     : {DEVICE_ID}")
+    logging.info(f"  service type  : {MDNS_SERVICE_TYPE}")
+    logging.info(f"  service name  : {MDNS_SERVICE_NAME}")
+    logging.info(f"  host          : {MDNS_HOST_NAME}")
+    logging.info(f"  IP            : {ip_address}")
+    logging.info(f"  port          : {WEBSOCKET_PORT}")
     return service_info
 
 
@@ -320,7 +329,7 @@ def unregister_mdns_sync(service_info):
     if zeroconf_instance and service_info is not None:
         zeroconf_instance.unregister_service(service_info)
         zeroconf_instance.close()
-        print("mDNS服务已注销")
+        logging.info("mDNS服务已注销")
 
 
 # ==========================================
@@ -351,14 +360,14 @@ async def main(args):
     enable_ble = not args.no_ble
     enable_ws = not (args.no_ws or args.ble_only)
 
-    print("=" * 60)
-    print(f"Mindora IoT Server  device_id={DEVICE_ID}  device_model={DEVICE_MODEL}")
-    print(f"  platform: {sys.platform}")
-    print(f"  enabled : mDNS={enable_mdns}  BLE={enable_ble}  WebSocket={enable_ws}")
-    print("=" * 60)
+    logging.info("=" * 60)
+    logging.info(f"Mindora IoT Server  device_id={DEVICE_ID}  device_model={DEVICE_MODEL}")
+    logging.info(f"  platform: {sys.platform}")
+    logging.info(f"  enabled : mDNS={enable_mdns}  BLE={enable_ble}  WebSocket={enable_ws}")
+    logging.info("=" * 60)
 
     if not (enable_mdns or enable_ble or enable_ws):
-        print("[FATAL] 所有子系统都被禁用，无事可做。退出。")
+        logging.error("[FATAL] 所有子系统都被禁用，无事可做。退出。")
         return
 
     loop = asyncio.get_event_loop()
@@ -374,7 +383,7 @@ async def main(args):
         else:
             await asyncio.Event().wait()
     except KeyboardInterrupt:
-        print("服务器正在关闭...")
+        logging.info("服务器正在关闭...")
     finally:
         if ble_task is not None:
             ble_task.cancel()
@@ -391,4 +400,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main(args))
     except KeyboardInterrupt:
-        print("程序已退出")
+        logging.info("程序已退出")

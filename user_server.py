@@ -189,46 +189,79 @@ class UserProfileServ:
         record[:] = record[-UserProfileServ.MAX_BEHAVIOR_LEN:]
 
   @staticmethod
-  def _calc_scene_stats(mindora_record: dict) -> dict:
-    """Compute usage counts and total duration per scene from mindora_record."""
+  def _calc_scene_stats(mindora_record: dict, days: int | None = None) -> dict:
+    """Compute usage counts and total duration per scene from mindora_record.
+
+    If ``days`` is given, only entries whose timestamp is within the last
+    ``days`` days are counted.
+    """
+    cutoff_ts = int(time.time()) - days * 86400 if days else 0
     stats: dict[str, dict] = {}
     for scene_id, records in (mindora_record or {}).items():
       if not isinstance(records, list) or not records:
         continue
       total_duration = 0
+      count = 0
       for entry in records:
-        if isinstance(entry, (list, tuple)) and len(entry) >= 2 and entry[1] is not None:
+        if isinstance(entry, (list, tuple)) and len(entry) >= 1:
           try:
-            total_duration += float(entry[1])
+            ts = int(entry[0])
           except (TypeError, ValueError):
-            pass
-      stats[scene_id] = {"count": len(records), "total_duration": total_duration}
+            continue
+          if ts < cutoff_ts:
+            continue
+          count += 1
+          if len(entry) >= 2 and entry[1] is not None:
+            try:
+              total_duration += float(entry[1])
+            except (TypeError, ValueError):
+              pass
+      if count > 0:
+        stats[scene_id] = {"count": count, "total_duration": round(total_duration, 1)}
     return stats
 
   @staticmethod
-  def _pick_most_used_scene(mindora_record: dict) -> Optional[tuple[str, dict]]:
+  def _pick_most_used_scene(mindora_record: dict, days: int | None = None) -> Optional[tuple[str, dict]]:
     """Return (scene_id, stats) for the scene with the highest usage count."""
-    stats = UserProfileServ._calc_scene_stats(mindora_record)
+    stats = UserProfileServ._calc_scene_stats(mindora_record, days=days)
     if not stats:
       return None
     best_id = max(stats.items(), key=lambda x: x[1]["count"])[0]
     return best_id, stats[best_id]
 
   def _update_scene_stats(self, profile: UserProfile):
-    """Pre-compute most-used scene and persist it in sleep_analysis."""
+    """Pre-compute most-used scene (all-time and last 7 days) and persist them in sleep_analysis."""
+    now = int(time.time())
+
+    # All-time most used scene
     most_used = self._pick_most_used_scene(profile.mindora_record)
     if most_used is None:
       profile.sleep_analysis.pop("most_used_scene", None)
-      return
-    scene_id, scene_stats = most_used
-    short_id = scene_id.replace("sleep.scene.", "")
-    profile.sleep_analysis["most_used_scene"] = {
-      "scene_id": short_id,
-      "scene_name": short_id.replace("_", " ").title(),
-      "count": scene_stats["count"],
-      "total_duration": scene_stats["total_duration"],
-      "updated_at": int(time.time()),
-    }
+    else:
+      scene_id, scene_stats = most_used
+      short_id = scene_id.replace("sleep.scene.", "")
+      profile.sleep_analysis["most_used_scene"] = {
+        "scene_id": short_id,
+        "scene_name": short_id.replace("_", " ").title(),
+        "count": scene_stats["count"],
+        "total_duration": scene_stats["total_duration"],
+        "updated_at": now,
+      }
+
+    # Most used scene in the last 7 days
+    most_used_7d = self._pick_most_used_scene(profile.mindora_record, days=7)
+    if most_used_7d is None:
+      profile.sleep_analysis.pop("most_used_scene_7d", None)
+    else:
+      scene_id, scene_stats = most_used_7d
+      short_id = scene_id.replace("sleep.scene.", "")
+      profile.sleep_analysis["most_used_scene_7d"] = {
+        "scene_id": short_id,
+        "scene_name": short_id.replace("_", " ").title(),
+        "count": scene_stats["count"],
+        "total_duration": scene_stats["total_duration"],
+        "updated_at": now,
+      }
 
   @staticmethod
   def _profile_for_log(profile: UserProfile) -> dict:
