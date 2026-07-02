@@ -120,7 +120,15 @@ def get_active_user_by_email_or_uid(email: str, uid: str = None) -> UserData| No
   if user == None or user.status != 1:
     return None
   return user
-  
+
+
+def get_user_contact(uid: str) -> dict | None:
+  """查询用户联系方式（email、phone），用于登录后发送敏感操作验证码"""
+  if not uid or not isinstance(uid, str):
+    return None
+  sql = "SELECT email, phone FROM user_auth WHERE uid = %s"
+  return mysql_db.query_one(sql, (uid,))
+
 
 def insert_user(email: str, uid: str, salt: str, device_list: str) -> int:
   """插入新用户"""

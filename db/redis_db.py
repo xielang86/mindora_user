@@ -105,6 +105,24 @@ class RedisDB:
         logging.exception("Redis set retry also failed")
         raise Exception(f"Redis写入失败：{str(e2)}") from e2
 
+  def delete(self, key: str) -> bool:
+    """删除Redis键"""
+    client = self.get_client()
+    try:
+      return bool(client.delete(key))
+    except RedisError as e:
+      logging.error(
+        "Redis delete failed: %s, key_len=%d, host=%s:%s/%s",
+        e, len(key) if key else 0, self.host, self.port, self.db,
+      )
+      try:
+        self._reset_pool()
+        client = self.get_client()
+        return bool(client.delete(key))
+      except RedisError as e2:
+        logging.exception("Redis delete retry also failed")
+        raise Exception(f"Redis删除失败：{str(e2)}") from e2
+
 # 初始化Redis实例（全局单例）
 redis_db = RedisDB()
 
@@ -117,6 +135,11 @@ def get_verify_code(email: str, device_id: str) -> str | None:
 def set_verify_code(email: str, device_id: str, code: str, expire_seconds: int ) -> int:
   key = f"verify_code:{email}:{device_id}"
   return redis_db.set(key, code, expire_seconds)
+
+def delete_verify_code(email: str, device_id: str) -> bool:
+  """删除验证码（成功验证后消费，防止重放）"""
+  key = f"verify_code:{email}:{device_id}"
+  return redis_db.delete(key)
 
 def set_jwt_token(uid: str, device_id: str, token: str, expire_seconds: int):
   """存储JWT Token（key格式：jwt_token:{uid}:{device_id}）"""

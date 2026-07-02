@@ -264,6 +264,118 @@ class UserProfileServ:
       }
 
   @staticmethod
+  def _pick_best_sleep_quality_scene(profile: UserProfile, days: int = 7) -> Optional[dict]:
+    """Return the scene whose usage before sleep onset produced the highest avg sleep_quality.
+
+    For each sleep night in the last ``days`` days:
+      - Compute sleep onset datetime from sleep_data.timestamp + first_sleep_time.
+      - Look at scene usages in the 4-hour wind-down window before onset.
+      - Pick the scene usage closest to onset as the "effective" scene for that night.
+      - Attribute that night's sleep_quality to that scene.
+
+    The returned dict contains the scene with the highest average sleep_quality.
+    """
+    if not profile or not profile.sleep_data or not profile.mindora_record:
+      return None
+
+    now_ts = int(time.time())
+    cutoff_ts = now_ts - days * 86400
+
+    # Collect all scene usages with metadata.
+    usages: list[dict] = []
+    for scene_id, records in profile.mindora_record.items():
+      if not isinstance(records, list) or not records:
+        continue
+      short_id = scene_id.replace("sleep.scene.", "")
+      scene_name = short_id.replace("_", " ").title()
+      for entry in records:
+        if isinstance(entry, (list, tuple)) and len(entry) >= 1:
+          try:
+            ts = int(entry[0])
+          except (TypeError, ValueError):
+            continue
+          if ts < cutoff_ts:
+            continue
+          usages.append({
+            "scene_id": short_id,
+            "scene_name": scene_name,
+            "timestamp": ts,
+          })
+
+    if not usages:
+      return None
+
+    # Attribute sleep_quality to the effective scene per night.
+    scene_qualities: dict[str, list[float]] = {}
+    for record in profile.sleep_data[-days:]:
+      if record.timestamp < cutoff_ts:
+        continue
+      if record.sleep_quality is None or not record.first_sleep_time:
+        continue
+
+      try:
+        sleep_dt = datetime.datetime.fromtimestamp(record.timestamp)
+        hour, minute = record.first_sleep_time.split(":")
+        onset_dt = sleep_dt.replace(hour=int(hour), minute=int(minute), second=0, microsecond=0)
+        if onset_dt > sleep_dt:
+          onset_dt -= datetime.timedelta(days=1)
+      except Exception:
+        continue
+
+      onset_ts = int(onset_dt.timestamp())
+      window_start_ts = onset_ts - 4 * 3600  # 4-hour wind-down window
+
+      # Pick the scene usage closest to onset but not after it.
+      best_usage = None
+      best_delta = None
+      for usage in usages:
+        ts = usage["timestamp"]
+        if ts < window_start_ts or ts > onset_ts:
+          continue
+        delta = onset_ts - ts
+        if best_delta is None or delta < best_delta:
+          best_delta = delta
+          best_usage = usage
+
+      if best_usage is None:
+        continue
+
+      scene_qualities.setdefault(best_usage["scene_id"], []).append(record.sleep_quality)
+
+    if not scene_qualities:
+      return None
+
+    best_scene_id = max(
+      scene_qualities.items(),
+      key=lambda item: sum(item[1]) / len(item[1]),
+    )[0]
+    qualities = scene_qualities[best_scene_id]
+    avg_quality = round(sum(qualities) / len(qualities), 1)
+
+    # Find a human-readable name for the best scene.
+    scene_name = best_scene_id.replace("_", " ").title()
+    for usage in usages:
+      if usage["scene_id"] == best_scene_id:
+        scene_name = usage["scene_name"]
+        break
+
+    return {
+      "scene_id": best_scene_id,
+      "scene_name": scene_name,
+      "avg_sleep_quality": avg_quality,
+      "nights": len(qualities),
+      "updated_at": now_ts,
+    }
+
+  def _update_best_scene_by_sleep_quality(self, profile: UserProfile):
+    """Persist the scene with the highest avg sleep_quality in the last 7 days."""
+    best = self._pick_best_sleep_quality_scene(profile, days=7)
+    if best is None:
+      profile.sleep_analysis.pop("best_sleep_quality_scene_7d", None)
+      return
+    profile.sleep_analysis["best_sleep_quality_scene_7d"] = best
+
+  @staticmethod
   def _profile_for_log(profile: UserProfile) -> dict:
     """Return a compact dict for logging (large fields are summarized)."""
     data = profile.model_dump(mode="json", exclude_none=True)
@@ -420,6 +532,7 @@ class UserProfileServ:
       old_profile = profile
       if profile is None:
         self._update_scene_stats(new_profile)
+        self._update_best_scene_by_sleep_quality(new_profile)
         if not skip_sleep_scenarios_reco_update:
           new_profile.sleep_scenarios_reco = RecommendationEngine.generate(new_profile)
           new_profile.standard_sop_reco = RecommendationEngine.generate_sop_reco(
@@ -445,6 +558,7 @@ class UserProfileServ:
       # aggregate SOP play events into mindora_record so we can keep behaviors small
       self._update_mindora_record(profile, new_profile)
       self._update_scene_stats(profile)
+      self._update_best_scene_by_sleep_quality(profile)
 
       if not skip_sleep_scenarios_reco_update:
         profile.sleep_scenarios_reco = self.calc_sleep_reco(uid, profile, old_profile)
