@@ -11,3 +11,6 @@ class Config:
   RemoteHost="http://121.43.54.25:9001"
   # RemoteHost="http://localhost:9001"
   ALGORITHM="HS256"
+  # 边缘端轻量化开关：关闭后 user_server 不会 import/实例化 LLM 与推荐引擎
+  ENABLE_LLM = False
+  ENABLE_SLEEP_RECO = False

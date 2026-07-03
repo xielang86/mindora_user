@@ -6,11 +6,19 @@ import jwt
 from pydantic import BaseModel, ValidationError
 import websockets
 from aiohttp import ClientResponseError, ClientSession, web
-from sleep_reco import RecommendationEngine
+# 边缘端轻量化：LLM 与推荐引擎作为可选依赖
+try:
+  from sleep_reco import RecommendationEngine
+  _HAS_RECO = True
+except ImportError:
+  RecommendationEngine = None
+  _HAS_RECO = False
+
 try:
   import plyvel
 except ImportError:
   plyvel = None
+
 from user_profile import UserProfile, SleepScenario
 from config import Config
 from common import util
@@ -22,7 +30,16 @@ from user_profile import (
 )
 from auth import AuthRequest
 from uid.uuid import get_or_create_uuid
-from llm_service import SleepAnalysisLLM, extract_sleep_context, deep_merge
+
+try:
+  from llm_service import SleepAnalysisLLM, extract_sleep_context, deep_merge
+  _HAS_LLM = True
+except ImportError:
+  SleepAnalysisLLM = None
+  extract_sleep_context = None
+  deep_merge = None
+  _HAS_LLM = False
+
 import logger
 import copy
 
@@ -36,13 +53,16 @@ REMOTE_SYNC_HEADER = "X-Mindora-Remote-Sync"
 # all bloking sync api
 class UserProfileServ:
   MAX_BEHAVIOR_LEN = 100
-  def __init__(self, llm: Optional[SleepAnalysisLLM] = None):
+  def __init__(self, llm: Optional[Any] = None):
     self.lock = threading.RLock()
     self.storage_mode = (Config.USER_PROFILE_STORAGE_MODE or "leveldb").strip().lower()
     self.db = None
     self.json_path = Path(run_dir) / Config.USER_PROFILE_JSON_PATH
     self.text_profiles: dict[str, Any] = {}
-    self.llm = llm or SleepAnalysisLLM()
+    # 边缘端可配置关闭 LLM，避免 import/实例化
+    self.llm = llm
+    if self.llm is None and Config.ENABLE_LLM and _HAS_LLM:
+      self.llm = SleepAnalysisLLM()
 
     if self.storage_mode == "leveldb":
       if plyvel is None:
@@ -402,6 +422,9 @@ class UserProfileServ:
     return data
 
   def calc_sleep_reco(self, uid: str, new_profile: UserProfile, old_profile: UserProfile) -> List[SleepScenario]:
+    # 边缘端关闭推荐引擎时直接复用旧数据
+    if not _HAS_RECO or not Config.ENABLE_SLEEP_RECO:
+      return old_profile.sleep_scenarios_reco or []
     # 1. 触发推荐引擎逻辑
     sleep_scenarios = old_profile.sleep_scenarios_reco
     # if RecommendationEngine.should_rerun_recommendation(old_profile, new_profile):
@@ -411,6 +434,8 @@ class UserProfileServ:
     return sleep_scenarios
 
   def calc_standard_sop_reco(self, uid: str, new_profile: UserProfile, old_profile: UserProfile) -> List[SleepScenario]:
+    if not _HAS_RECO or not Config.ENABLE_SLEEP_RECO:
+      return old_profile.standard_sop_reco or []
     sop_reco = old_profile.standard_sop_reco
     candidates = []
     logging.info(f"Rerunning standard SOP recommendation for {uid} with candidates={candidates}")
@@ -533,7 +558,7 @@ class UserProfileServ:
       if profile is None:
         self._update_scene_stats(new_profile)
         self._update_best_scene_by_sleep_quality(new_profile)
-        if not skip_sleep_scenarios_reco_update:
+        if not skip_sleep_scenarios_reco_update and _HAS_RECO and Config.ENABLE_SLEEP_RECO:
           new_profile.sleep_scenarios_reco = RecommendationEngine.generate(new_profile)
           new_profile.standard_sop_reco = RecommendationEngine.generate_sop_reco(
             new_profile,
@@ -560,7 +585,7 @@ class UserProfileServ:
       self._update_scene_stats(profile)
       self._update_best_scene_by_sleep_quality(profile)
 
-      if not skip_sleep_scenarios_reco_update:
+      if not skip_sleep_scenarios_reco_update and _HAS_RECO and Config.ENABLE_SLEEP_RECO:
         profile.sleep_scenarios_reco = self.calc_sleep_reco(uid, profile, old_profile)
         profile.standard_sop_reco = self.calc_standard_sop_reco(uid, profile, old_profile)
         sleep_advice_structured = self.calc_sleep_advice(uid, profile)
@@ -636,7 +661,8 @@ class UserServer:
     self.server_semaphore = asyncio.Semaphore(Config.MaxServerConcurrent)
     self.host = Config.HOST
     self.port = Config.PORT
-    self.llm = SleepAnalysisLLM()
+    # 边缘端可配置关闭 LLM，避免 import/实例化
+    self.llm = SleepAnalysisLLM() if Config.ENABLE_LLM and _HAS_LLM else None
     self.user_serv = UserProfileServ(llm=self.llm)
     self.update_task = None
     self.app = web.Application()
@@ -901,7 +927,7 @@ class UserServer:
       profile = self.user_serv.get_profile(uid)
       response_data = self._build_analysis_data(req, profile)
 
-      if self.llm.enabled:
+      if self.llm is not None and self.llm.enabled:
         d = req.data
         today_str = datetime.date.today().isoformat()
         anchor_date = d.end_date or d.date or today_str

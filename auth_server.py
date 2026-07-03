@@ -344,7 +344,13 @@ def send_delete_verify_code_handler(data: AuthData) -> AuthResponse:
     data=None,
   )
 
-  payload = decode_access_token(data.jwt_token)
+  try:
+    payload = decode_access_token(data.jwt_token)
+  except HTTPException as e:
+    resp.code = e.status_code
+    resp.msg = e.detail
+    return resp
+
   uid = payload.get("uid")
   jwt_email = payload.get("email")
 
@@ -355,11 +361,15 @@ def send_delete_verify_code_handler(data: AuthData) -> AuthResponse:
 
   user = get_active_user_by_email_or_uid(email=None, uid=uid)
   if user is None:
-    raise HTTPException(status_code=401, detail="用户不存在或已被注销")
+    resp.code = 401
+    resp.msg = "用户不存在或已被注销"
+    return resp
 
   contact, is_email = _resolve_delete_verify_contact(uid, jwt_email)
   if not contact:
-    raise HTTPException(status_code=400, detail="用户未绑定有效的邮箱或手机号")
+    resp.code = 400
+    resp.msg = "用户未绑定有效的邮箱或手机号"
+    return resp
 
   verify_code = generate_verify_code(4)
   set_verify_code(
@@ -382,7 +392,6 @@ def send_delete_verify_code_handler(data: AuthData) -> AuthResponse:
     logging.error("send_delete_verify_code failed for uid=%s contact=%s: %s", uid, contact, resp.msg)
     # 发送失败时删除已写入的验证码，避免脏数据
     delete_verify_code(contact, DELETE_VERIFY_CODE_DEVICE_ID)
-    raise HTTPException(status_code=500, detail=resp.msg)
 
   logging.info(">>> [DELETE VERIFY CODE SENT] uid=%s contact=%s is_email=%s", uid, contact, is_email)
   return resp
@@ -397,28 +406,42 @@ def delete_user_with_code_handler(data: AuthData) -> AuthResponse:
     data=None,
   )
 
-  payload = decode_access_token(data.jwt_token)
+  try:
+    payload = decode_access_token(data.jwt_token)
+  except HTTPException as e:
+    resp.code = e.status_code
+    resp.msg = e.detail
+    return resp
+
   uid = payload.get("uid")
   jwt_email = payload.get("email")
 
   if Config.Mode == 1:
     stored = mock_db["verify_codes"].get(f"{uid}@{DELETE_VERIFY_CODE_DEVICE_ID}")
     if stored != data.verify_code:
-      raise HTTPException(status_code=401, detail="验证码错误或已过期")
+      resp.code = 401
+      resp.msg = "验证码错误或已过期"
+      return resp
     mock_db["verify_codes"].pop(f"{uid}@{DELETE_VERIFY_CODE_DEVICE_ID}", None)
     return resp
 
   user = get_active_user_by_email_or_uid(email=None, uid=uid)
   if user is None:
-    raise HTTPException(status_code=401, detail="用户不存在或已被注销")
+    resp.code = 401
+    resp.msg = "用户不存在或已被注销"
+    return resp
 
   contact, _ = _resolve_delete_verify_contact(uid, jwt_email)
   if not contact:
-    raise HTTPException(status_code=400, detail="用户未绑定有效的邮箱或手机号")
+    resp.code = 400
+    resp.msg = "用户未绑定有效的邮箱或手机号"
+    return resp
 
   stored_code = get_verify_code(contact, DELETE_VERIFY_CODE_DEVICE_ID)
   if not stored_code or stored_code != data.verify_code:
-    raise HTTPException(status_code=401, detail="验证码错误或已过期")
+    resp.code = 401
+    resp.msg = "验证码错误或已过期"
+    return resp
 
   # 消费验证码，防止重放
   delete_verify_code(contact, DELETE_VERIFY_CODE_DEVICE_ID)
@@ -428,7 +451,6 @@ def delete_user_with_code_handler(data: AuthData) -> AuthResponse:
   if code != 0 and code != 200:
     resp.code = code
     resp.msg = result.get("msg", "账号注销失败")
-    raise HTTPException(status_code=500, detail=resp.msg)
 
   return resp
 
