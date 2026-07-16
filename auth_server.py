@@ -2,7 +2,7 @@ import datetime
 import hashlib
 import secrets
 import jwt
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from auth import AuthRequest, AuthResponse, AuthRequestType, JWTTokenData, AuthData
@@ -72,6 +72,68 @@ MY_163_AUTH_CODE = "RZkiYNHsVxLGvVHG"  # deadline=20260412
 
 # 删除账号验证码使用的固定 device_id，避免与登录验证码冲突
 DELETE_VERIFY_CODE_DEVICE_ID = "delete"
+
+# 业务响应码：与 AuthResponse 的 code 字段语义保持一致（2 = JWT token 过期）
+JWT_EXPIRED_AUTH_CODE = 2
+
+# 删除账号流程专用业务码
+DELETE_VERIFY_SEND_FAILED_CODE = 409  # 注销验证码发送失败（邮件/SMS 通道异常）
+DELETE_DB_FAILED_CODE = 500           # 注销时 DB 软删除失败，统一为服务端内部错误
+
+
+def _auth_code_from_http_exc(exc: HTTPException) -> int:
+  """将 JWT/认证类 HTTPException 映射为业务响应码。"""
+  if exc.status_code == 401 and exc.detail == "Token expired":
+    return JWT_EXPIRED_AUTH_CODE
+  return exc.status_code
+
+
+def _normalize_mac(mac: str | None) -> str:
+  """统一 MAC 地址格式：去空、去分隔符、转小写。"""
+  if not mac:
+    return ""
+  return mac.strip().lower().replace(":", "").replace("-", "").replace(".", "")
+
+
+def _get_client_ip(request: Request) -> str:
+  """获取客户端真实 IP，优先读取 X-Forwarded-For / X-Real-IP。"""
+  forwarded = request.headers.get("X-Forwarded-For")
+  if forwarded:
+    return forwarded.split(",")[0].strip()
+  real_ip = request.headers.get("X-Real-IP")
+  if real_ip:
+    return real_ip.strip()
+  if request.client:
+    return request.client.host
+  return ""
+
+
+def _is_legacy_delete_allowed(request: Request) -> tuple[bool, str]:
+  """
+  校验旧版 DELETE_USER 接口是否允许当前请求调用。
+  返回 (allowed, reason)。
+  """
+  allowed_ips = Config.DELETE_USER_ALLOWED_IPS
+  allowed_macs = Config.DELETE_USER_ALLOWED_MACS
+
+  # 未配置任何白名单时默认拒绝，避免旧接口被意外开放
+  if not allowed_ips and not allowed_macs:
+    return False, "旧版删除接口未配置允许列表，已禁用"
+
+  client_ip = _get_client_ip(request).lower()
+  if allowed_ips and client_ip not in allowed_ips:
+    return False, f"当前 IP {client_ip} 不在允许列表中"
+
+  raw_mac = request.headers.get(Config.DELETE_USER_MAC_HEADER)
+  client_mac = _normalize_mac(raw_mac)
+  if allowed_macs:
+    if not client_mac:
+      return False, "请求缺少允许的 MAC 地址"
+    if client_mac not in allowed_macs:
+      return False, f"当前 MAC {raw_mac} 不在允许列表中"
+
+  return True, ""
+
 
 # ── Password helpers (PBKDF2-SHA256, no extra deps) ──────────────────────────
 
@@ -292,16 +354,22 @@ def del_user(data: AuthData) -> AuthResponse:
   if Config.Mode == 1:
     return resp
 
-  payload = decode_access_token(data.jwt_token) 
+  try:
+    payload = decode_access_token(data.jwt_token)
+  except HTTPException as e:
+    resp.code = _auth_code_from_http_exc(e)
+    resp.msg = e.detail
+    return resp
+
   if payload is None:
     resp.code = 500
     resp.msg = "internal error"
-    raise HTTPException(status_code=500, detail=resp.msg)
+    return resp
 
   uid = payload.get("uid")
   result = soft_delete_user(uid=uid)
   code = result.get("code")
-  if code != 0 and result.get("code")!= 200:
+  if code != 0 and code != 200:
     resp.code = code
     resp.msg = result.get("msg")
 
@@ -344,7 +412,13 @@ def send_delete_verify_code_handler(data: AuthData) -> AuthResponse:
     data=None,
   )
 
-  payload = decode_access_token(data.jwt_token)
+  try:
+    payload = decode_access_token(data.jwt_token)
+  except HTTPException as e:
+    resp.code = _auth_code_from_http_exc(e)
+    resp.msg = e.detail
+    return resp
+
   uid = payload.get("uid")
   jwt_email = payload.get("email")
 
@@ -378,7 +452,9 @@ def send_delete_verify_code_handler(data: AuthData) -> AuthResponse:
     resp.code = status_data.get("code", 0)
     resp.msg = status_data.get("msg", "短信发送失败")
 
+  # 发送通道失败统一使用 409，不暴露底层服务商的具体错误码
   if resp.code != 0:
+    resp.code = DELETE_VERIFY_SEND_FAILED_CODE
     logging.error("send_delete_verify_code failed for uid=%s contact=%s: %s", uid, contact, resp.msg)
     # 发送失败时删除已写入的验证码，避免脏数据
     delete_verify_code(contact, DELETE_VERIFY_CODE_DEVICE_ID)
@@ -397,7 +473,13 @@ def delete_user_with_code_handler(data: AuthData) -> AuthResponse:
     data=None,
   )
 
-  payload = decode_access_token(data.jwt_token)
+  try:
+    payload = decode_access_token(data.jwt_token)
+  except HTTPException as e:
+    resp.code = _auth_code_from_http_exc(e)
+    resp.msg = e.detail
+    return resp
+
   uid = payload.get("uid")
   jwt_email = payload.get("email")
 
@@ -426,7 +508,8 @@ def delete_user_with_code_handler(data: AuthData) -> AuthResponse:
   result = soft_delete_user(uid=uid)
   code = result.get("code")
   if code != 0 and code != 200:
-    resp.code = code
+    # DB 层错误统一映射为服务端内部错误，不暴露底层 DB 细节
+    resp.code = DELETE_DB_FAILED_CODE
     resp.msg = result.get("msg", "账号注销失败")
     raise HTTPException(status_code=500, detail=resp.msg)
 
@@ -682,10 +765,22 @@ def generate_redemption_codes_handler(data: AuthData) -> AuthResponse:
 
 # --- Handlers ---
 @app.post("/auth", response_model=AuthResponse)
-async def handle_auth(request: AuthRequest):
+async def handle_auth(request: AuthRequest, raw_request: Request):
   logging.info(f"request {request}")
   req_type = request.request_type
   data = request.data
+
+  # 旧版 DELETE_USER 接口：先校验 IP/MAC 白名单
+  if req_type == AuthRequestType.DELETE_USER:
+    allowed, reason = _is_legacy_delete_allowed(raw_request)
+    if not allowed:
+      logging.warning("[DELETE_USER] rejected: %s", reason)
+      return AuthResponse(
+        request_type=AuthRequestType.DELETE_USER,
+        code=403,
+        msg=reason,
+        data=None,
+      )
 
   # 1. SEND EMAIL VERIFY CODE
   if req_type == AuthRequestType.SEND_VERIFY_CODE:

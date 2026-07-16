@@ -36,6 +36,10 @@ run_dir = os.getenv("RUN_DIR")
 logger.init_log(f"{run_dir}/iot_server_logs")
 
 try:
+    from aiohttp import ClientSession
+except ModuleNotFoundError:
+    ClientSession = None
+try:
     from websockets import serve as websocket_serve
 except ModuleNotFoundError:
     websocket_serve = None
@@ -103,10 +107,13 @@ DEVICE_HOST_SLUG = "Mindora-2026-" + DEVICE_ID.split("-")[-1][-8:]
 # BLE：跟 iOS 端常量对齐的占位 UUID。
 # ⚠️ 上线前必须固件 + iOS 同步换成 `uuidgen` 真随机 UUID，避免跟全网用同样示例的 BLE 配件撞车。
 BLE_SERVICE_UUID = "12345678-1234-5678-1234-56789abcdef0"
-BLE_CHARACTERISTIC_UUID = "12345678-1234-5678-1234-56789abcdef1"
+BLE_DEVICE_ID_CHAR_UUID = "12345678-1234-5678-1234-56789abcdef1"
+BLE_REQUEST_CHAR_UUID = "12345678-1234-5678-1234-56789abcdef2"
+BLE_RESPONSE_CHAR_UUID = "12345678-1234-5678-1234-56789abcdef3"
 
 WEBSOCKET_PORT = 8765
 USER_SERVER_PORT = 9001
+USER_SERVER_BASE_URL = os.getenv("USER_SERVER_BASE_URL", f"http://127.0.0.1:{USER_SERVER_PORT}")
 
 # mDNS：iOS BonjourDiscovery 监听 _mindora._tcp.
 # ⚠️ service 实例名必须保持干净的 DEVICE_MODEL（"Mindora 2026"）——iOS 端 UnifiedDeviceDiscovery
@@ -189,9 +196,138 @@ def process_message(message):
 
 
 # ==========================================
-# BLE peripheral —— 用 bless 做跨平台
+# BLE data channel — proxy user_server API over BLE
 # ==========================================
-async def run_ble_server():
+
+class BleRequestBuffer:
+    """Buffer and reassemble chunked BLE writes into a single payload."""
+
+    def __init__(self, timeout: float = 10.0):
+        self._buffers: dict[int, dict] = {}
+        self._timeout = timeout
+
+    def feed(self, connection_id: int, chunk: bytes) -> bytes | None:
+        """Feed a chunk and return the full payload once complete.
+
+        Chunk format (little endian):
+          [2 bytes total_length] [1 byte chunk_index] [1 byte final_flag] [payload]
+        """
+        if len(chunk) < 4:
+            logging.warning("[BLE] malformed chunk header")
+            return None
+
+        total_length = int.from_bytes(chunk[0:2], "little")
+        chunk_index = chunk[2]
+        final_flag = chunk[3]
+        payload = chunk[4:]
+
+        buf = self._buffers.setdefault(connection_id, {
+            "total_length": total_length,
+            "chunks": {},
+            "received_length": 0,
+            "deadline": asyncio.get_event_loop().time() + self._timeout,
+        })
+
+        if buf["total_length"] != total_length:
+            logging.warning("[BLE] total length mismatch, resetting buffer")
+            self._buffers[connection_id] = {
+                "total_length": total_length,
+                "chunks": {chunk_index: payload},
+                "received_length": len(payload),
+                "deadline": asyncio.get_event_loop().time() + self._timeout,
+            }
+            return None
+
+        if chunk_index not in buf["chunks"]:
+            buf["chunks"][chunk_index] = payload
+            buf["received_length"] += len(payload)
+
+        if final_flag and buf["received_length"] >= total_length:
+            sorted_chunks = [buf["chunks"][i] for i in sorted(buf["chunks"].keys())]
+            full_payload = b"".join(sorted_chunks)[:total_length]
+            self._buffers.pop(connection_id, None)
+            return full_payload
+
+        return None
+
+    def cleanup_expired(self):
+        now = asyncio.get_event_loop().time()
+        expired = [cid for cid, buf in self._buffers.items() if buf["deadline"] < now]
+        for cid in expired:
+            self._buffers.pop(cid, None)
+
+
+class BleDataChannel:
+    """Proxy BLE requests to the local user_server HTTP API."""
+
+    def __init__(self, server: BlessServer | None, session: ClientSession | None):
+        self.server = server
+        self.session = session
+        self.request_buffer = BleRequestBuffer()
+        self.response_seq = 0
+
+    async def on_write(self, characteristic, value: bytearray, **_kwargs):
+        """Handle a BLE write on the request characteristic."""
+        if self.server is None:
+            logging.warning("[BLE] data channel not initialized")
+            return
+
+        # Use connection handle as buffer key if available, else fallback to 0.
+        connection_id = getattr(characteristic, "service", 0) or 0
+        payload = self.request_buffer.feed(connection_id, bytes(value))
+        if payload is None:
+            return
+
+        self.request_buffer.cleanup_expired()
+
+        try:
+            envelope = json.loads(payload.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            logging.error(f"[BLE] invalid JSON request: {e}")
+            await self._send_response(connection_id, {"code": 400, "msg": "invalid JSON", "data": None})
+            return
+
+        path = envelope.get("path", "/user_profile")
+        body = envelope.get("body", {})
+        if not isinstance(path, str) or not path.startswith("/"):
+            await self._send_response(connection_id, {"code": 400, "msg": "invalid path", "data": None})
+            return
+
+        logging.info(f"[BLE] proxy {path}")
+        try:
+            if self.session is None:
+                await self._send_response(connection_id, {"code": 503, "msg": "user_server proxy unavailable", "data": None})
+                return
+            async with self.session.post(f"{USER_SERVER_BASE_URL}{path}", json=body, timeout=30) as resp:
+                resp_data = await resp.json()
+                await self._send_response(connection_id, resp_data)
+        except Exception as e:
+            logging.error(f"[BLE] proxy error: {e}")
+            await self._send_response(connection_id, {"code": 500, "msg": f"proxy error: {e}", "data": None})
+
+    async def _send_response(self, connection_id: int, data: dict):
+        """Fragment and send a JSON response via BLE notify."""
+        if self.server is None:
+            return
+
+        payload = json.dumps(data, ensure_ascii=False).encode("utf-8")
+        total_length = len(payload)
+        chunk_size = 512 - 4  # reserve 4 bytes header
+        chunks = [payload[i:i + chunk_size] for i in range(0, len(payload), chunk_size)]
+
+        for idx, chunk in enumerate(chunks):
+            header = total_length.to_bytes(2, "little")
+            header += bytes([idx])
+            header += bytes([1 if idx == len(chunks) - 1 else 0])
+            frame = header + chunk
+            try:
+                await self.server.update_value(BLE_SERVICE_UUID, BLE_RESPONSE_CHAR_UUID, frame)
+            except Exception as e:
+                logging.error(f"[BLE] notify failed: {e}")
+                break
+
+
+async def run_ble_server(enable_data_channel: bool = True):
     """跨平台 BLE peripheral，bless 自动按 sys.platform 选后端：
        macOS → CoreBluetooth；Linux → BlueZ via DBus；Windows → WinRT。
     """
@@ -211,18 +347,43 @@ async def run_ble_server():
     await server.add_new_service(BLE_SERVICE_UUID)
     await server.add_new_characteristic(
         BLE_SERVICE_UUID,
-        BLE_CHARACTERISTIC_UUID,
+        BLE_DEVICE_ID_CHAR_UUID,
         GATTCharacteristicProperties.read,
         device_id_bytes,
         GATTAttributePermissions.readable,
     )
+
+    http_session = None
+    ble_channel = None
+    if enable_data_channel:
+        await server.add_new_characteristic(
+            BLE_SERVICE_UUID,
+            BLE_REQUEST_CHAR_UUID,
+            GATTCharacteristicProperties.write,
+            b"",
+            GATTAttributePermissions.writeable,
+        )
+        await server.add_new_characteristic(
+            BLE_SERVICE_UUID,
+            BLE_RESPONSE_CHAR_UUID,
+            GATTCharacteristicProperties.notify,
+            b"",
+            GATTAttributePermissions.readable,
+        )
+        if ClientSession is not None:
+            http_session = ClientSession()
+        ble_channel = BleDataChannel(server, http_session)
+        server.write_request_func = ble_channel.on_write
 
     logging.info("[BLE] 启动 bless peripheral...")
     await server.start()
     logging.info("[BLE] 广播已启动:")
     logging.info(f"  device model : {DEVICE_MODEL}")
     logging.info(f"  service UUID : {BLE_SERVICE_UUID}")
-    logging.info(f"  char UUID    : {BLE_CHARACTERISTIC_UUID}")
+    logging.info(f"  device_id char : {BLE_DEVICE_ID_CHAR_UUID}")
+    if enable_data_channel:
+        logging.info(f"  request char   : {BLE_REQUEST_CHAR_UUID}")
+        logging.info(f"  response char  : {BLE_RESPONSE_CHAR_UUID}")
     logging.info(f"  char value   : {DEVICE_ID}")
 
     try:
@@ -236,6 +397,8 @@ async def run_ble_server():
             logging.info("[BLE] 已停止")
         except Exception as e:
             logging.error(f"[BLE] 停止时报错（忽略）: {e}")
+        if http_session:
+            await http_session.close()
 
 
 # ==========================================
@@ -350,6 +513,7 @@ def parse_args():
     p.add_argument("--ble-only", action="store_true",
                    help="只开 BLE，跳过 mDNS 注册和 WebSocket 服务")
     p.add_argument("--no-ble", action="store_true", help="跳过 BLE GATT 广播")
+    p.add_argument("--no-ble-data", action="store_true", help="BLE 只广播 device_id，不开请求/响应数据通道")
     p.add_argument("--no-mdns", action="store_true", help="跳过 mDNS 注册")
     p.add_argument("--no-ws", action="store_true", help="跳过 WebSocket 服务")
     return p.parse_args()
@@ -358,12 +522,13 @@ def parse_args():
 async def main(args):
     enable_mdns = not (args.no_mdns or args.ble_only)
     enable_ble = not args.no_ble
+    enable_ble_data = enable_ble and not args.no_ble_data
     enable_ws = not (args.no_ws or args.ble_only)
 
     logging.info("=" * 60)
     logging.info(f"Mindora IoT Server  device_id={DEVICE_ID}  device_model={DEVICE_MODEL}")
     logging.info(f"  platform: {sys.platform}")
-    logging.info(f"  enabled : mDNS={enable_mdns}  BLE={enable_ble}  WebSocket={enable_ws}")
+    logging.info(f"  enabled : mDNS={enable_mdns}  BLE={enable_ble}  BLE_data={enable_ble_data}  WebSocket={enable_ws}")
     logging.info("=" * 60)
 
     if not (enable_mdns or enable_ble or enable_ws):
@@ -372,7 +537,7 @@ async def main(args):
 
     loop = asyncio.get_event_loop()
     service_info = await loop.run_in_executor(None, register_mdns_sync) if enable_mdns else None
-    ble_task = asyncio.create_task(run_ble_server()) if enable_ble else None
+    ble_task = asyncio.create_task(run_ble_server(enable_ble_data)) if enable_ble else None
 
     # 主阻塞点优先级：WebSocket（如果开）→ 否则等 BLE task → 否则纯 mDNS 模式只睡等 Ctrl+C
     try:
