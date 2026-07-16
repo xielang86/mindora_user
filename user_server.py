@@ -822,9 +822,8 @@ class UserServer:
   async def handle_profile_request_http(self, request: web.Request) -> web.Response:
     try:
       data = await request.json()
-      logging.info("req %s", self._request_for_log(data))
       req = ProfileRequest.model_validate(data)
-      logging.info("request %s", self._request_for_log(req))
+      # logging.info("request %s", self._request_for_log(req))
 
       if req.request_type == "query_profile":
         response_obj = self.handle_query_profile(req)
