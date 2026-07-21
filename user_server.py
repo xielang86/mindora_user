@@ -520,8 +520,45 @@ class UserProfileServ:
 
     return cache
 
+  def _apply_basic_update(self, uid: str, new_profile: UserProfile, profile: Optional[UserProfile]) -> UserProfile:
+    """Apply non-LLM profile updates. Must be called while holding self.lock.
+
+    Returns the profile object that should be saved.
+    """
+    if profile is None:
+      self._update_scene_stats(new_profile)
+      self._update_best_scene_by_sleep_quality(new_profile)
+      return new_profile
+
+    # just replace, if need
+    if len(new_profile.uid_emb) > 16 or profile.uid_emb is None or len(profile.uid_emb) == 0:
+      profile.uid_emb = new_profile.uid_emb
+
+    profile.long_term_profile = self._merge_profile(profile.long_term_profile, new_profile.long_term_profile)
+    profile.behaviors = self._merge_behavior(profile.behaviors, new_profile.behaviors)
+
+    # aggregate SOP play events into mindora_record so we can keep behaviors small
+    self._update_mindora_record(profile, new_profile)
+    self._update_scene_stats(profile)
+    self._update_best_scene_by_sleep_quality(profile)
+    return profile
+
+  def _apply_llm_update(self, uid: str, profile: UserProfile, old_profile: UserProfile) -> None:
+    """Apply LLM-generated fields to profile in place. Must be called while holding self.lock."""
+    profile.sleep_scenarios_reco = self.calc_sleep_reco(uid, profile, old_profile)
+    profile.standard_sop_reco = self.calc_standard_sop_reco(uid, profile, old_profile)
+    sleep_advice_structured = self.calc_sleep_advice(uid, profile)
+    if sleep_advice_structured:
+      profile.sleep_analysis["sleep_advice_structured"] = sleep_advice_structured
+      profile.sleep_analysis["sleep_advice"] = sleep_advice_structured.get("analysis", "")
+    profile.sleep_analysis["analysis_cache"] = self.calc_analysis_cache(uid, profile)
+
   def update_profile(self, uid: str, new_profile: UserProfile, skip_sleep_scenarios_reco_update: bool = False) -> bool:
-    """写入用户行为（仅更新单个用户数据）"""
+    """写入用户行为（仅更新单个用户数据）.
+
+    Synchronous full-update path. Preserved for backward compatibility with
+    fetch_profile_from_remote and direct callers/tests.
+    """
     if new_profile is None or uid is None or not isinstance(uid, str):
       logging.error(f"invalid new profile {new_profile} or uid {uid}")
       return False
@@ -530,48 +567,19 @@ class UserProfileServ:
       # 读取或创建用户画像（仅操作单个用户，避免全量加载）
       profile = self.get_profile(uid)
       old_profile = profile
-      if profile is None:
-        self._update_scene_stats(new_profile)
-        self._update_best_scene_by_sleep_quality(new_profile)
-        if not skip_sleep_scenarios_reco_update:
-          new_profile.sleep_scenarios_reco = RecommendationEngine.generate(new_profile)
-          new_profile.standard_sop_reco = RecommendationEngine.generate_sop_reco(
-            new_profile,
-            [key for key in new_profile.mindora_record.keys() if "sleep.scene." in key],
-          )
-          sleep_advice_structured = self.calc_sleep_advice(uid, new_profile)
-          if sleep_advice_structured:
-            new_profile.sleep_analysis["sleep_advice_structured"] = sleep_advice_structured
-            new_profile.sleep_analysis["sleep_advice"] = sleep_advice_structured.get("analysis", "")
-          new_profile.sleep_analysis["analysis_cache"] = self.calc_analysis_cache(uid, new_profile)
-        self.save_profile(uid, new_profile)
-        return True
-
-      # just replace, if need
-      if len(new_profile.uid_emb) > 16 or profile.uid_emb is None or len(profile.uid_emb) == 0:
-        profile.uid_emb = new_profile.uid_emb
-
-      profile.long_term_profile = self._merge_profile(profile.long_term_profile, new_profile.long_term_profile)
-
-      profile.behaviors = self._merge_behavior(profile.behaviors, new_profile.behaviors)
-
-      # aggregate SOP play events into mindora_record so we can keep behaviors small
-      self._update_mindora_record(profile, new_profile)
-      self._update_scene_stats(profile)
-      self._update_best_scene_by_sleep_quality(profile)
+      profile = self._apply_basic_update(uid, new_profile, profile)
+      # For newly created profiles there is no old profile; use the new profile
+      # object as the old-profile reference so calc_* helpers can read defaults.
+      if old_profile is None:
+        old_profile = profile
 
       if not skip_sleep_scenarios_reco_update:
-        profile.sleep_scenarios_reco = self.calc_sleep_reco(uid, profile, old_profile)
-        profile.standard_sop_reco = self.calc_standard_sop_reco(uid, profile, old_profile)
-        sleep_advice_structured = self.calc_sleep_advice(uid, profile)
-        if sleep_advice_structured:
-          profile.sleep_analysis["sleep_advice_structured"] = sleep_advice_structured
-          profile.sleep_analysis["sleep_advice"] = sleep_advice_structured.get("analysis", "")
-        profile.sleep_analysis["analysis_cache"] = self.calc_analysis_cache(uid, profile)
+        self._apply_llm_update(uid, profile, old_profile)
       elif not profile.standard_sop_reco:
         # make sure we never leave standard_sop_reco empty just because the
         # sleep-scenarios skip flag is set
         profile.standard_sop_reco = self.calc_standard_sop_reco(uid, profile, old_profile)
+
       # 仅保存当前用户的更新（而非全量数据）
       self.save_profile(uid, profile)
       logging.info(
@@ -580,7 +588,59 @@ class UserProfileServ:
         self._profile_for_log(profile),
       )
       return True
-  
+
+  def update_profile_basic(self, uid: str, new_profile: UserProfile) -> bool:
+    """Persist basic profile changes without LLM work. Fast path for HTTP update_profile."""
+    if new_profile is None or uid is None or not isinstance(uid, str):
+      logging.error(f"invalid new profile {new_profile} or uid {uid}")
+      return False
+
+    with self.lock:
+      profile = self.get_profile(uid)
+      profile = self._apply_basic_update(uid, new_profile, profile)
+      self.save_profile(uid, profile)
+      logging.info("Profile basic updated uid=%s", uid)
+      return True
+
+  def update_profile_llm(self, uid: str) -> bool:
+    """Run LLM work for an existing profile and persist results.
+
+    Does not hold self.lock during LLM calls so concurrent basic updates are
+    not blocked. Reloads the profile before saving to avoid overwriting
+    concurrent writes.
+    """
+    if uid is None or not isinstance(uid, str):
+      logging.error(f"invalid uid {uid}")
+      return False
+
+    with self.lock:
+      profile = self.get_profile(uid)
+      if profile is None:
+        logging.warning(f"skip llm update: profile not found for uid={uid}")
+        return False
+      old_profile = profile.model_copy(deep=True)
+      llm_profile = profile.model_copy(deep=True)
+
+    sleep_scenarios = self.calc_sleep_reco(uid, llm_profile, old_profile)
+    standard_sop = self.calc_standard_sop_reco(uid, llm_profile, old_profile)
+    sleep_advice_structured = self.calc_sleep_advice(uid, llm_profile)
+    analysis_cache = self.calc_analysis_cache(uid, llm_profile)
+
+    with self.lock:
+      profile = self.get_profile(uid)
+      if profile is None:
+        logging.warning(f"skip llm update: profile disappeared for uid={uid}")
+        return False
+      profile.sleep_scenarios_reco = sleep_scenarios
+      profile.standard_sop_reco = standard_sop
+      if sleep_advice_structured:
+        profile.sleep_analysis["sleep_advice_structured"] = sleep_advice_structured
+        profile.sleep_analysis["sleep_advice"] = sleep_advice_structured.get("analysis", "")
+      profile.sleep_analysis["analysis_cache"] = analysis_cache
+      self.save_profile(uid, profile)
+      logging.info("Profile llm updated uid=%s", uid)
+      return True
+
   def close(self):
     if self.db is not None:
       self.db.close()
@@ -643,12 +703,21 @@ class UserServer:
     self.active_uid = ""
     self.system_uid = get_or_create_uuid()
     self.debug_uid_set = {"mindora_test_uid1", "mindora_test_uid2", "mindora_test_uid3", "test_debug_user_001"}
+    # Per-user LLM background-update rate limiting and task tracking.
+    self._llm_tracker_lock = asyncio.Lock()
+    self._llm_update_tracker: dict[str, float] = {}
+    self._llm_tasks: set[asyncio.Task] = set()
+    self._llm_semaphore = asyncio.Semaphore(Config.MAX_LLM_BACKGROUND_TASKS)
     self.setup_routes()
 
   def close(self):
     self.user_serv.close()
     if self.update_task:
       self.update_task.cancel()
+    # Cancel pending LLM background tasks.
+    for task in list(self._llm_tasks):
+      task.cancel()
+    self._llm_tasks.clear()
 
   def setup_routes(self):
     """设置HTTP路由"""
@@ -723,15 +792,44 @@ class UserServer:
 
     async with self.server_semaphore:
       succ = await asyncio.to_thread(
-        self.user_serv.update_profile,
+        self.user_serv.update_profile_basic,
         uid,
         request.data.user_profile,
-        request.data.skip_sleep_scenarios_reco_update,
       )
-    if succ:
-      return ProfileResponse(code=0, msg=f"update profile for '{request.timestamp}' succ", request_type=request.request_type, data=None)
-    else:
+    if not succ:
       return ProfileResponse(code=500, msg=f"update profile failed", request_type=request.request_type, data=None)
+
+    if not request.data.skip_sleep_scenarios_reco_update:
+      await self._schedule_llm_update_if_needed(uid)
+
+    return ProfileResponse(code=0, msg=f"update profile for '{request.timestamp}' succ", request_type=request.request_type, data=None)
+
+  async def _schedule_llm_update_if_needed(self, uid: str) -> None:
+    """Schedule a background LLM update for uid unless one ran recently."""
+    async with self._llm_tracker_lock:
+      now = time.monotonic()
+      last = self._llm_update_tracker.get(uid)
+      if last is not None and now - last < Config.LLM_UPDATE_COOLDOWN_SECONDS:
+        logging.info("skip background llm update for uid=%s (last %.1fs ago)", uid, now - last)
+        return
+      self._llm_update_tracker[uid] = now
+
+    task = asyncio.create_task(self._run_llm_update(uid))
+    self._llm_tasks.add(task)
+    task.add_done_callback(self._llm_tasks.discard)
+
+  async def _run_llm_update(self, uid: str) -> None:
+    """Run LLM work in a background task."""
+    logging.info("start background llm update for uid=%s", uid)
+    try:
+      async with self._llm_semaphore:
+        await asyncio.to_thread(self.user_serv.update_profile_llm, uid)
+      logging.info("background llm update done for uid=%s", uid)
+    except asyncio.CancelledError:
+      logging.info("background llm update cancelled for uid=%s", uid)
+      raise
+    except Exception as e:
+      logging.error("background llm update failed for uid=%s: %s", uid, e)
 
   async def sync_profile_to_remote(self, uid: str, request: ProfileRequest) -> bool:
     if not Config.RemoteHost or len(Config.RemoteHost) < 10:

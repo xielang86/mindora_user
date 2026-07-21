@@ -22,8 +22,13 @@ class Config:
   # RemoteHost="http://localhost:9001"
   ALGORITHM="HS256"
   # 边缘端轻量化开关：关闭后 user_server 不会 import/实例化 LLM 与推荐引擎
-  ENABLE_LLM = True 
+  ENABLE_LLM = True
   ENABLE_SLEEP_RECO = True
+
+  # 同一用户两次 LLM 后台更新之间的最小间隔（秒）
+  LLM_UPDATE_COOLDOWN_SECONDS = 300
+  # 全局并发 LLM 后台任务上限
+  MAX_LLM_BACKGROUND_TASKS = 8
 
   # ---------------------------------------------------------------------------
   # 旧版 DELETE_USER 接口访问控制：JWT 直接删除风险较高，仅允许特定 IP/MAC 调用。
