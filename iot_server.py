@@ -225,7 +225,7 @@ class BleRequestBuffer:
             "total_length": total_length,
             "chunks": {},
             "received_length": 0,
-            "deadline": asyncio.get_event_loop().time() + self._timeout,
+            "deadline": asyncio.get_running_loop().time() + self._timeout,
         })
 
         if buf["total_length"] != total_length:
@@ -234,7 +234,7 @@ class BleRequestBuffer:
                 "total_length": total_length,
                 "chunks": {chunk_index: payload},
                 "received_length": len(payload),
-                "deadline": asyncio.get_event_loop().time() + self._timeout,
+                "deadline": asyncio.get_running_loop().time() + self._timeout,
             }
             return None
 
@@ -251,7 +251,7 @@ class BleRequestBuffer:
         return None
 
     def cleanup_expired(self):
-        now = asyncio.get_event_loop().time()
+        now = asyncio.get_running_loop().time()
         expired = [cid for cid, buf in self._buffers.items() if buf["deadline"] < now]
         for cid in expired:
             self._buffers.pop(cid, None)
@@ -312,8 +312,22 @@ class BleDataChannel:
 
         payload = json.dumps(data, ensure_ascii=False).encode("utf-8")
         total_length = len(payload)
+        if total_length > 0xFFFF:
+            # 2 字节长度头最多表达 65535；超出时回错误而不是让 to_bytes 抛 OverflowError
+            logging.error(f"[BLE] response too large: {total_length} bytes, sending error instead")
+            payload = json.dumps(
+                {"code": 413, "msg": f"response too large: {total_length} bytes", "data": None},
+                ensure_ascii=False,
+            ).encode("utf-8")
+            total_length = len(payload)
+
         chunk_size = 512 - 4  # reserve 4 bytes header
         chunks = [payload[i:i + chunk_size] for i in range(0, len(payload), chunk_size)]
+
+        response_char = self.server.get_characteristic(BLE_RESPONSE_CHAR_UUID)
+        if response_char is None:
+            logging.error("[BLE] response characteristic not found")
+            return
 
         for idx, chunk in enumerate(chunks):
             header = total_length.to_bytes(2, "little")
@@ -321,7 +335,15 @@ class BleDataChannel:
             header += bytes([1 if idx == len(chunks) - 1 else 0])
             frame = header + chunk
             try:
-                await self.server.update_value(BLE_SERVICE_UUID, BLE_RESPONSE_CHAR_UUID, frame)
+                # bless 的 update_value 是同步方法且不带 value 参数：
+                # 必须先写 characteristic.value，再调 update_value 触发 notify
+                response_char.value = frame
+                ok = self.server.update_value(BLE_SERVICE_UUID, BLE_RESPONSE_CHAR_UUID)
+                if not ok:
+                    logging.error("[BLE] notify failed: update_value returned False")
+                    break
+                # 给对端留点消化时间，避免高速 notify 丢包
+                await asyncio.sleep(0.01)
             except Exception as e:
                 logging.error(f"[BLE] notify failed: {e}")
                 break

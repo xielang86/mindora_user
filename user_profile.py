@@ -57,10 +57,37 @@ class EnvironmentalSensitivity(BaseModel):
   room_base_noise: Optional[float] = Field(None, description="卧室底噪分贝值")
 
 
+class StageVitals(BaseModel):
+  """单个睡眠阶段内的平均体征（用于各周期阶段解读：心率/呼吸/体温）"""
+  avg_heart_rate: Optional[float] = Field(None, description="该阶段平均心率，单位bpm")
+  avg_respiratory: Optional[float] = Field(None, description="该阶段平均呼吸频率，单位次/分钟")
+  avg_temperature: Optional[float] = Field(None, description="该阶段平均体温，单位摄氏度")
+
+
+class NightEvent(BaseModel):
+  """夜间事件：环境监测与设备交互日志（用于清醒/各周期时段的归因解读）
+
+  event_type 取值：
+    noise        环境噪音事件（声音监测）
+    dialog       语音交互/对话记录（声音监测）
+    screen       屏幕控制日志（用户是否活动）
+    light        光感监测（环境灯光变化）
+    intervention 设备干预动作（如播放自然噪屏蔽噪音）
+    bed_exit     红外/雷达传感器检测到离床
+    bed_activity 红外/雷达传感器检测到持续活动
+  """
+  timestamp: int = Field(..., description="事件发生时间戳（秒级）")
+  event_type: str = Field(..., description="事件类型：noise/dialog/screen/light/intervention/bed_exit/bed_activity")
+  duration: Optional[float] = Field(None, description="事件持续时长，单位秒")
+  detail: Optional[str] = Field(None, description="事件详情，如噪音分贝、干预动作名称、屏幕操作内容")
+
+
 class SleepElement(BaseModel):
   start_time: int = Field(..., description="睡眠阶段开始时间戳（秒级）")
   duration: float = Field(..., description="睡眠阶段持续时长，单位分钟")
   sleep_type: str = Field(..., description="睡眠阶段类型，如REM、core,deep,rem,awake")
+  vitals: Optional[StageVitals] = Field(None, description="该阶段内的平均体征（心率/呼吸/体温）")
+  events: List[NightEvent] = Field(default_factory=list, description="该阶段内发生的环境/设备事件（噪音、屏幕、语音、干预等）")
 
 class SleepResult(BaseModel):
   timestamp: int = Field(..., description="数据 update 时间戳（秒级）")
@@ -70,7 +97,9 @@ class SleepResult(BaseModel):
   sleep_arch_index: Optional[float] = Field(None, description="睡眠结构，包含快速动眼、核心、深度睡眠占比，单位%")
   night_var_index: Optional[float] = Field(None, description="夜间波动，包含觉醒次数、觉醒时长、心率波动等，单位%")
 
-  first_sleep_time: Optional[str] = Field(None, description="首次入睡时间, 00:00")
+  first_sleep_time: Optional[str] = Field(None, description="首次入睡时间（首次进入快速动眼期时间）, 00:00")
+  bed_time: Optional[str] = Field(None, description="开始卧床时间, 23:30")
+  wake_time: Optional[str] = Field(None, description="起床时间, 07:30")
   hr_before_sleep: Optional[float] = Field(None, description="入睡前心率，单位bpm")
   rr_before_sleep: Optional[float] = Field(None, description="入睡前呼吸频率，单位次/分钟")
 
@@ -81,9 +110,24 @@ class SleepResult(BaseModel):
   avg_respiratory: Optional[float] = Field(None, description="平均呼吸频率，单位次/分钟")
   avg_temperature: Optional[float] = Field(None, description="体温，单位摄氏度")
 
-  scene_preference: List[Tuple[str, float]] = Field(None, description="场景偏好，如喜欢的睡眠场景名称")
+  scene_preference: Optional[List[Tuple[str, float]]] = Field(None, description="场景偏好，如喜欢的睡眠场景名称")
+
+  # 用户输入：起床后睡眠自评（快速点选提交）
+  self_rating: Optional[int] = Field(None, description="睡眠自评分数，范围1-5")
+  self_rating_tags: List[str] = Field(default_factory=list, description="睡眠自评标签，如 醒来精神好/夜间易醒/做梦多")
+
+  # 环境均值（光感/声音监测的整晚概况）
+  avg_light_level: Optional[float] = Field(None, description="睡间平均环境光照，单位lux")
+  avg_noise_level: Optional[float] = Field(None, description="睡间平均环境噪音，单位分贝dB")
+
+  # 睡眠目标完成度（相对 sleep_plan 的本晚达成情况，范围0-100）
+  goal_achieved: Optional[float] = Field(None, description="本晚睡眠目标完成度，范围0-100")
+
   # the recent sleep status sequence, with start_time, duration and sleep_type, used for sleep analysis and advice generation
   sleep_status: List[SleepElement] = Field(default_factory=list, description="the seq for the sleep status, with start_time, duration and sleep_type")
+
+  # 无法归属到具体阶段的整晚事件（如卧床前的环境光、夜间离床等）
+  night_events: List[NightEvent] = Field(default_factory=list, description="整晚环境/设备事件（噪音、对话、屏幕、光感、干预、离床等）")
 
   @property
   def sequence_summaries(self):
@@ -142,8 +186,14 @@ def compute_recent_sleep_stats(profile: "UserProfile", days: int = 7) -> Dict[st
     "avg_hr_before_sleep": _avg([r.hr_before_sleep for r in recent]),
     "avg_rr_before_sleep": _avg([r.rr_before_sleep for r in recent]),
     "avg_heart_rate": _avg([r.avg_heart_rate for r in recent]),
+    "avg_respiratory": _avg([r.avg_respiratory for r in recent]),
+    "avg_temperature": _avg([r.avg_temperature for r in recent]),
     "avg_hrv": _avg([r.hrv for r in recent]),
+    "avg_self_rating": _avg([r.self_rating for r in recent]),
+    "avg_goal_achieved": _avg([r.goal_achieved for r in recent]),
     "typical_first_sleep_time": _most_common([r.first_sleep_time for r in recent if r.first_sleep_time]),
+    "typical_bed_time": _most_common([r.bed_time for r in recent if r.bed_time]),
+    "typical_wake_time": _most_common([r.wake_time for r in recent if r.wake_time]),
   }
 
   # Aggregate stage stats across the week.
@@ -222,11 +272,65 @@ class SleepScenario(BaseModel):
   scenario_name: Optional[str] = Field(None, description="方案展示名称")
   stages: List[SleepStage] = Field(default_factory=list, description="包含四个睡眠阶段")
 
+# -------------------------- 洞察页分析结果（对应 mindora_advice.md 模块0-5） --------------------------
+class InsightModule(BaseModel):
+  """单个洞察模块的 LLM 分析结果"""
+  module_id: int = Field(..., description="模块编号 0-5")
+  title: str = Field("", description="模块标题")
+  content: str = Field("", description="主体洞察文案（只解释发生了什么+可能的原因+Mindora做了什么）")
+  evidence: List[str] = Field(default_factory=list, description="证据句：基于哪些数据、什么条件得出结论")
+  action: str = Field("", description="可行动建议")
+  visible: bool = Field(True, description="是否展示（如模块3无觉醒/干预记录时不展示）")
+
+class SleepInsightReport(BaseModel):
+  """洞察页 6 模块分析结果，与 mindora_advice.md 的模块0-5一一对应"""
+  date: Optional[str] = Field(None, description="分析对应日期 yyyy-MM-dd")
+  language: str = Field("en", description="文案语言代码")
+  generated_at: Optional[int] = Field(None, description="生成时间戳（秒级）")
+  llm_used: bool = Field(True, description="False 代表 LLM 未参与/生成失败")
+  greeting: InsightModule = Field(
+    default_factory=lambda: InsightModule(module_id=0),
+    description="模块0｜顶部问候与洞察引导（Context & Trust）",
+  )
+  onset: InsightModule = Field(
+    default_factory=lambda: InsightModule(module_id=1),
+    description="模块1｜入睡洞察（Sleep Onset Insight）",
+  )
+  architecture: InsightModule = Field(
+    default_factory=lambda: InsightModule(module_id=2),
+    description="模块2｜睡眠结构洞察（Sleep Architecture Insight）",
+  )
+  intervention: InsightModule = Field(
+    default_factory=lambda: InsightModule(module_id=3),
+    description="模块3｜夜间波动 & Mindora 干预（Intervention Insight）",
+  )
+  scene_preference: InsightModule = Field(
+    default_factory=lambda: InsightModule(module_id=4),
+    description="模块4｜场景偏好与推荐（Preference & Recommendation）",
+  )
+  micro_education: InsightModule = Field(
+    default_factory=lambda: InsightModule(module_id=5),
+    description="模块5｜轻量睡眠知识提示（Micro Education，可选）",
+  )
+
+class SleepPlan(BaseModel):
+  """睡眠计划：设备端制定的睡眠目标（用于周/月数据的目标达成率）"""
+  target_bed_time: Optional[str] = Field(None, description="目标入睡/卧床时间, 23:30")
+  target_wake_time: Optional[str] = Field(None, description="目标起床时间, 07:30")
+  target_duration_min: Optional[float] = Field(None, description="目标睡眠时长，单位分钟")
+  updated_at: Optional[int] = Field(None, description="计划最近更新时间戳（秒级）")
+
 class UserProfile(BaseModel):
   """用户画像信息"""
   uid_emb: List[float] = Field(default_factory=list)
   basic_info: Optional[Dict[str, str]] = Field(default_factory=dict)
   long_term_profile: List[Tuple[str, float]] = Field(default_factory=list)
+
+  # 睡眠计划（设备端制定的睡眠目标，配合 SleepResult.goal_achieved 计算达成率）
+  sleep_plan: Optional[SleepPlan] = Field(None, description="用户的睡眠目标计划")
+
+  # 洞察页 6 模块 LLM 分析结果（mindora_advice.md 模块0-5）
+  sleep_insight: Optional[SleepInsightReport] = Field(None, description="洞察页6模块睡眠分析结果")
 
   # 新增：存储推荐的助眠候选方案
   sleep_scenarios_reco: Optional[List[SleepScenario]] = Field(default_factory=list, description="推荐的候选助眠流程列表")
@@ -282,8 +386,6 @@ class UserProfile(BaseModel):
       "most_used_scene": None,
       "most_used_scene_7d": None,
       "best_sleep_quality_scene_7d": None,
-      "sleep_advice": "",
-      "sleep_advice_structured": None,
       "analysis_cache": {},
     }
   )
@@ -310,7 +412,11 @@ class ProfileData(BaseModel):
   user_profile: Optional[UserProfile] = Field(None, description="user profile")
   skip_sleep_scenarios_reco_update: bool = Field(
     True,
-    description="When true, keep the existing sleep_scenarios_reco instead of regenerating it during update_profile",
+    description="只跳过助眠场景推荐(sleep_scenarios_reco)的重算，不影响睡眠分析(insight/analysis cache)",
+  )
+  skip_sleep_analysis_update: bool = Field(
+    True,
+    description="只跳过睡眠分析(sleep_insight + analysis cache)的生成，不影响场景推荐",
   )
 
 

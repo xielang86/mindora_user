@@ -9,6 +9,7 @@ import requests
 
 
 DEFAULT_BASE_URL = os.getenv("USER_SERVER_URL", "http://127.0.0.1:9001")
+DEFAULT_PORT = int(os.getenv("USER_SERVER_PORT", "9001"))
 DEFAULT_LANGUAGE = os.getenv("USER_SERVER_LANGUAGE", "zh-Hans")
 DEFAULT_TIMEZONE = os.getenv("USER_SERVER_TIMEZONE", "Asia/Shanghai")
 DEFAULT_DEBUG_UID = os.getenv("USER_SERVER_DEBUG_UID", "test_user")
@@ -274,6 +275,10 @@ def build_parser() -> argparse.ArgumentParser:
     ],
   )
   parser.add_argument("--base-url", default=DEFAULT_BASE_URL)
+  parser.add_argument("--host", default=None,
+                      help="user_server IP/hostname，如 192.168.1.207；传入后覆盖 --base-url")
+  parser.add_argument("--port", type=int, default=None,
+                      help=f"user_server 端口，默认 {DEFAULT_PORT}；仅随 --host 生效")
   parser.add_argument("--jwt-token", default=os.getenv("JWT_TOKEN", ""))
   parser.add_argument("--uid", default=DEFAULT_DEBUG_UID)
   parser.add_argument("--timeout", type=int, default=30)
@@ -290,8 +295,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main():
   args = build_parser().parse_args()
+  base_url = f"http://{args.host}:{args.port or DEFAULT_PORT}" if args.host else args.base_url
   client = UserServerClient(
-    base_url=args.base_url,
+    base_url=base_url,
     jwt_token=args.jwt_token,
     uid=args.uid,
     timeout=args.timeout,

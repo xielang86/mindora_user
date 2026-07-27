@@ -167,7 +167,6 @@ def _summarize_profile_for_prompt(profile: UserProfile) -> str:
         "sleep_trend_week": sleep_analysis.get("sleep_trend_week", ""),
         "sleep_trend_month": sleep_analysis.get("sleep_trend_month", ""),
         "scene": sleep_analysis.get("scene", {}),
-        "sleep_advice": sleep_analysis.get("sleep_advice", ""),
     }
 
     return json.dumps(data, ensure_ascii=False, indent=2)

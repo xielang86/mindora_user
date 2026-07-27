@@ -76,7 +76,6 @@ def extract_sleep_context(profile, data) -> dict:
     ctx["sleep_trend_month"] = sleep_analysis.get("sleep_trend_month", "")
     ctx["scene_title"]       = (sleep_analysis.get("scene") or {}).get("title", "")
     ctx["scene_text"]        = (sleep_analysis.get("scene") or {}).get("text", "")
-    ctx["profile_sleep_advice"] = sleep_analysis.get("sleep_advice", "")
 
     ctx["sleep_knowledge"] = _load_sleep_knowledge()
 
@@ -141,7 +140,6 @@ def _summarize_profile_for_prompt(profile) -> str:
         "sleep_trend_week": sleep_analysis.get("sleep_trend_week", ""),
         "sleep_trend_month": sleep_analysis.get("sleep_trend_month", ""),
         "scene": sleep_analysis.get("scene", {}),
-        "sleep_advice": sleep_analysis.get("sleep_advice", ""),
     }
 
     return json.dumps(data, ensure_ascii=False, indent=2)
@@ -331,7 +329,6 @@ Sleep analysis context from the user profile:
 - Weekly trend: {ctx.get('sleep_trend_week', '—')}
 - Monthly trend: {ctx.get('sleep_trend_month', '—')}
 - Scene insight: {ctx.get('scene_text', '—')}
-- Previous advice: {ctx.get('profile_sleep_advice', '—')}
 {focus_hint}
 {knowledge_block}
 Your task:
@@ -412,6 +409,90 @@ Last-night sleep analysis ({ctx.get('date')}):
 
 Return JSON with exactly these keys:
 {json.dumps(schema, indent=2, ensure_ascii=False)}"""
+
+
+def _prompt_sleep_insight(ctx: dict) -> str:
+    """Prompt for the 6-module insight page report (mindora_advice.md modules 0-5).
+
+    One LLM call produces all six modules at once so the stored
+    ``SleepInsightReport`` is internally consistent.  Each module returns
+    title / content / evidence / action; visibility rules (e.g. module 3
+    only shows when brief awakenings exist) are enforced server-side.
+    """
+    def _fmt(value, suffix=""):
+        if value is None:
+            return "—"
+        if isinstance(value, float):
+            return f"{value:g}{suffix}"
+        return f"{value}{suffix}"
+
+    return f"""{_lang_instruction(ctx.get('language', 'en'))}
+
+You are writing the Mindora insight page. Every sentence must answer:
+"Based on which data, under what conditions, did Mindora reach this possible understanding."
+
+Recent 7-day sleep statistics (aggregated locally):
+- Records used: {ctx.get('record_count', '—')}
+- Average sleep quality: {_fmt(ctx.get('avg_sleep_quality'))} / 100
+- Average sleep-onset latency: {_fmt(ctx.get('avg_onset_min'), ' min')}
+- Typical first sleep time: {ctx.get('typical_first_sleep_time', '—')}
+- Typical bed time: {ctx.get('typical_bed_time', '—')}   wake time: {ctx.get('typical_wake_time', '—')}
+- Average time in bed: {_fmt(ctx.get('avg_time_in_bed_min'), ' min')}
+- Deep sleep: {_fmt(ctx.get('avg_deep_min'), ' min')} ({_fmt(ctx.get('avg_deep_pct'), '%')})
+- REM sleep: {_fmt(ctx.get('avg_rem_min'), ' min')} ({_fmt(ctx.get('avg_rem_pct'), '%')})
+- Core sleep: {_fmt(ctx.get('avg_core_min'), ' min')} ({_fmt(ctx.get('avg_core_pct'), '%')})
+- Night awakenings: {_fmt(ctx.get('avg_awake_count'))} × {_fmt(ctx.get('avg_awake_min'), ' min')}
+- Pre-sleep HR: {_fmt(ctx.get('avg_hr_before_sleep'), ' bpm')}   RR: {_fmt(ctx.get('avg_rr_before_sleep'), ' brpm')}
+- Average HR: {_fmt(ctx.get('avg_heart_rate'), ' bpm')}   HRV: {_fmt(ctx.get('avg_hrv'))}
+- Most recently used scene: {ctx.get('recent_scene_title', '—')}
+- Weekly top scene: {ctx.get('weekly_top_scene_title', '—')} × {ctx.get('weekly_top_scene_count', 0)} times
+
+Writing rules (must follow):
+- Only explain "what happened + possible why + what Mindora did".
+- Compare the user only against their OWN baselines (last night vs 7-day average); never compare with other people.
+- Use hedged wording: "may / usually / tends to / often"; never causal claims, never diagnoses.
+- Forbidden words/claims: stress, anxiety, insomnia, treatment, guaranteed improvement.
+- Keep every field to 1–2 sentences, warm and encouraging in tone.
+
+Return ONLY a JSON object (no markdown, no explanation) with exactly these six modules:
+{{
+  "greeting": {{
+    "title": "<module 0: short greeting headline, ≤8 words>",
+    "content": "<1 sentence guiding the user into the insights>",
+    "evidence": ["<which data this page is based on>"],
+    "action": ""
+  }},
+  "onset": {{
+    "title": "<module 1: sleep onset insight headline>",
+    "content": "<1–2 sentences: last night onset vs own 7-day baseline, in minutes>",
+    "evidence": ["<e.g. 7-day avg onset vs last night>"],
+    "action": "<1 actionable sentence, e.g. keep using the top scene>"
+  }},
+  "architecture": {{
+    "title": "<module 2: sleep structure headline>",
+    "content": "<1–2 sentences: whether deep/REM/core proportions are stable vs own baseline>",
+    "evidence": ["<stage durations / percentages used>"],
+    "action": "<1 sentence to help maintain rhythm; empty if structure stable>"
+  }},
+  "intervention": {{
+    "title": "<module 3: night fluctuation & Mindora response headline>",
+    "content": "<1–2 sentences normalising brief awakenings and describing Mindora's companionship>",
+    "evidence": ["<awakening count / duration used>"],
+    "action": ""
+  }},
+  "scene_preference": {{
+    "title": "<module 4: scene preference headline>",
+    "content": "<1–2 sentences: most-used scene and the onset pattern when it is used>",
+    "evidence": ["<scene usage counts used>"],
+    "action": "<1 sentence recommending a similar soundscape or continued use>"
+  }},
+  "micro_education": {{
+    "title": "<module 5: one micro sleep-knowledge headline>",
+    "content": "<1–2 sentences of light sleep knowledge relevant to the data above>",
+    "evidence": [],
+    "action": ""
+  }}
+}}"""
 
 
 # ──────────────────────────────────────────────────────────────
@@ -521,6 +602,7 @@ class SleepAnalysisLLM:
             "analysis_sleep_month":    lambda: _prompt_sleep_month(ctx),
             "analysis_explore":        lambda: _prompt_explore(ctx, modules),
             "sleep_analysis_advice":   lambda: _prompt_sleep_advice(ctx),
+            "sleep_insight_report":    lambda: _prompt_sleep_insight(ctx),
         }.get(request_type)
 
         if prompt_fn is None:
@@ -554,6 +636,7 @@ class SleepAnalysisLLM:
             "analysis_sleep_month":    lambda: _prompt_sleep_month(ctx),
             "analysis_explore":        lambda: _prompt_explore(ctx, modules),
             "sleep_analysis_advice":   lambda: _prompt_sleep_advice(ctx),
+            "sleep_insight_report":    lambda: _prompt_sleep_insight(ctx),
         }.get(request_type)
 
         if prompt_fn is None:

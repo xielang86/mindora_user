@@ -19,6 +19,7 @@ from user_profile import (
   InvalidOrExpiredTokenResp, InvalidReqFormatResp, BaseResponse,
   AnalysisRequest, AnalysisResponse,
   SleepAdviceRequest, SleepAdviceResponse, SleepAdviceResult,
+  SleepInsightReport, compute_recent_sleep_stats,
 )
 from auth import AuthRequest
 from uid.uuid import get_or_create_uuid
@@ -417,20 +418,31 @@ class UserProfileServ:
     sop_reco = RecommendationEngine.generate_sop_reco(new_profile, candidates)
     return sop_reco
 
-  def calc_sleep_advice(self, uid: str, profile: UserProfile) -> dict:
-    """Generate sleep advice via LLM and return a structured dict for storage.
+  _INSIGHT_MODULE_KEYS = [
+    ("greeting", 0),
+    ("onset", 1),
+    ("architecture", 2),
+    ("intervention", 3),
+    ("scene_preference", 4),
+    ("micro_education", 5),
+  ]
 
-    If the stored advice is less than 7 days old, reuse it instead of calling
-    the LLM again.
+  def calc_sleep_insight(self, uid: str, profile: UserProfile) -> Optional[SleepInsightReport]:
+    """Generate the 6-module insight report (mindora_advice.md 模块0-5) via LLM
+    and return it for storage in ``profile.sleep_insight``.
+
+    If the stored report is less than 7 days old, reuse it instead of calling
+    the LLM again.  Returns None when there is nothing to store (LLM disabled
+    and no existing report).
     """
-    existing = profile.sleep_analysis.get("sleep_advice_structured") if profile.sleep_analysis else None
+    existing = profile.sleep_insight
     now = int(time.time())
-    if existing and existing.get("generated_at") and now - existing["generated_at"] < 7 * 86400:
-      logging.info(f"sleep_advice still fresh for uid={uid}, skipping LLM")
+    if existing and existing.generated_at and now - existing.generated_at < 7 * 86400:
+      logging.info(f"sleep_insight still fresh for uid={uid}, skipping LLM")
       return existing
 
     if not self.llm or not self.llm.enabled:
-      return {}
+      return existing
 
     class _FakeData:
       date = datetime.date.today().isoformat()
@@ -439,21 +451,37 @@ class UserProfileServ:
       language = "en"
 
     ctx = extract_sleep_context(profile, _FakeData())
-    ctx["focus"] = []
-
-    llm_result = self.llm.generate_sync("sleep_analysis_advice", ctx, "en", [])
+    llm_result = self.llm.generate_sync("sleep_insight_report", ctx, "en", [])
     if not llm_result:
-      return {}
+      return existing
 
-    return {
-      "analysis": llm_result.get("analysis", ""),
-      "advice": llm_result.get("advice", []),
-      "highlights": llm_result.get("highlights", {}),
+    report_data: dict[str, Any] = {
       "date": datetime.date.today().isoformat(),
       "language": "en",
+      "generated_at": now,
       "llm_used": True,
-      "generated_at": int(time.time()),
     }
+    for key, module_id in self._INSIGHT_MODULE_KEYS:
+      m = llm_result.get(key) or {}
+      report_data[key] = {
+        "module_id": module_id,
+        "title": m.get("title", "") or "",
+        "content": m.get("content", "") or "",
+        "evidence": m.get("evidence", []) or [],
+        "action": m.get("action", "") or "",
+      }
+
+    try:
+      report = SleepInsightReport(**report_data)
+    except ValidationError as e:
+      logging.error(f"invalid insight report from LLM for uid={uid}: {e}")
+      return existing
+
+    # 模块3 展示条件（mindora_advice.md）：近7日存在短暂觉醒才展示，否则前端隐藏
+    stats = compute_recent_sleep_stats(profile, days=7)
+    if not stats.get("avg_awake_count"):
+      report.intervention.visible = False
+    return report
 
   def calc_analysis_cache(self, uid: str, profile: UserProfile, language: str = "en") -> dict:
     """Pre-generate LLM text for default analysis views and return a cache dict.
@@ -543,17 +571,40 @@ class UserProfileServ:
     self._update_best_scene_by_sleep_quality(profile)
     return profile
 
-  def _apply_llm_update(self, uid: str, profile: UserProfile, old_profile: UserProfile) -> None:
-    """Apply LLM-generated fields to profile in place. Must be called while holding self.lock."""
-    profile.sleep_scenarios_reco = self.calc_sleep_reco(uid, profile, old_profile)
-    profile.standard_sop_reco = self.calc_standard_sop_reco(uid, profile, old_profile)
-    sleep_advice_structured = self.calc_sleep_advice(uid, profile)
-    if sleep_advice_structured:
-      profile.sleep_analysis["sleep_advice_structured"] = sleep_advice_structured
-      profile.sleep_analysis["sleep_advice"] = sleep_advice_structured.get("analysis", "")
-    profile.sleep_analysis["analysis_cache"] = self.calc_analysis_cache(uid, profile)
+  def _apply_llm_update(
+    self,
+    uid: str,
+    profile: UserProfile,
+    old_profile: UserProfile,
+    skip_sleep_scenarios_reco_update: bool = False,
+    skip_sleep_analysis_update: bool = False,
+  ) -> None:
+    """Apply LLM-generated fields to profile in place. Must be called while holding self.lock.
 
-  def update_profile(self, uid: str, new_profile: UserProfile, skip_sleep_scenarios_reco_update: bool = False) -> bool:
+    推荐（sleep_reco）与睡眠分析（insight/analysis cache）是两条独立逻辑，
+    由各自的 skip 开关单独控制，互不影响。
+    """
+    if not skip_sleep_scenarios_reco_update:
+      profile.sleep_scenarios_reco = self.calc_sleep_reco(uid, profile, old_profile)
+      profile.standard_sop_reco = self.calc_standard_sop_reco(uid, profile, old_profile)
+    elif not profile.standard_sop_reco:
+      # make sure we never leave standard_sop_reco empty just because the
+      # sleep-scenarios skip flag is set
+      profile.standard_sop_reco = self.calc_standard_sop_reco(uid, profile, old_profile)
+
+    if not skip_sleep_analysis_update:
+      sleep_insight = self.calc_sleep_insight(uid, profile)
+      if sleep_insight:
+        profile.sleep_insight = sleep_insight
+      profile.sleep_analysis["analysis_cache"] = self.calc_analysis_cache(uid, profile)
+
+  def update_profile(
+    self,
+    uid: str,
+    new_profile: UserProfile,
+    skip_sleep_scenarios_reco_update: bool = False,
+    skip_sleep_analysis_update: bool = False,
+  ) -> bool:
     """写入用户行为（仅更新单个用户数据）.
 
     Synchronous full-update path. Preserved for backward compatibility with
@@ -573,12 +624,11 @@ class UserProfileServ:
       if old_profile is None:
         old_profile = profile
 
-      if not skip_sleep_scenarios_reco_update:
-        self._apply_llm_update(uid, profile, old_profile)
-      elif not profile.standard_sop_reco:
-        # make sure we never leave standard_sop_reco empty just because the
-        # sleep-scenarios skip flag is set
-        profile.standard_sop_reco = self.calc_standard_sop_reco(uid, profile, old_profile)
+      self._apply_llm_update(
+        uid, profile, old_profile,
+        skip_sleep_scenarios_reco_update=skip_sleep_scenarios_reco_update,
+        skip_sleep_analysis_update=skip_sleep_analysis_update,
+      )
 
       # 仅保存当前用户的更新（而非全量数据）
       self.save_profile(uid, profile)
@@ -602,12 +652,17 @@ class UserProfileServ:
       logging.info("Profile basic updated uid=%s", uid)
       return True
 
-  def update_profile_llm(self, uid: str) -> bool:
+  def update_profile_llm(
+    self,
+    uid: str,
+    skip_sleep_scenarios_reco_update: bool = False,
+    skip_sleep_analysis_update: bool = False,
+  ) -> bool:
     """Run LLM work for an existing profile and persist results.
 
     Does not hold self.lock during LLM calls so concurrent basic updates are
     not blocked. Reloads the profile before saving to avoid overwriting
-    concurrent writes.
+    concurrent writes.  推荐与睡眠分析由各自的 skip 开关独立控制。
     """
     if uid is None or not isinstance(uid, str):
       logging.error(f"invalid uid {uid}")
@@ -621,22 +676,36 @@ class UserProfileServ:
       old_profile = profile.model_copy(deep=True)
       llm_profile = profile.model_copy(deep=True)
 
-    sleep_scenarios = self.calc_sleep_reco(uid, llm_profile, old_profile)
-    standard_sop = self.calc_standard_sop_reco(uid, llm_profile, old_profile)
-    sleep_advice_structured = self.calc_sleep_advice(uid, llm_profile)
-    analysis_cache = self.calc_analysis_cache(uid, llm_profile)
+    if skip_sleep_scenarios_reco_update:
+      sleep_scenarios = None
+      standard_sop = None
+    else:
+      sleep_scenarios = self.calc_sleep_reco(uid, llm_profile, old_profile)
+      standard_sop = self.calc_standard_sop_reco(uid, llm_profile, old_profile)
+
+    if skip_sleep_analysis_update:
+      sleep_insight = None
+      analysis_cache = None
+    else:
+      sleep_insight = self.calc_sleep_insight(uid, llm_profile)
+      analysis_cache = self.calc_analysis_cache(uid, llm_profile)
 
     with self.lock:
       profile = self.get_profile(uid)
       if profile is None:
         logging.warning(f"skip llm update: profile disappeared for uid={uid}")
         return False
-      profile.sleep_scenarios_reco = sleep_scenarios
-      profile.standard_sop_reco = standard_sop
-      if sleep_advice_structured:
-        profile.sleep_analysis["sleep_advice_structured"] = sleep_advice_structured
-        profile.sleep_analysis["sleep_advice"] = sleep_advice_structured.get("analysis", "")
-      profile.sleep_analysis["analysis_cache"] = analysis_cache
+      if sleep_scenarios is not None:
+        profile.sleep_scenarios_reco = sleep_scenarios
+      if standard_sop is not None:
+        profile.standard_sop_reco = standard_sop
+      elif not profile.standard_sop_reco:
+        # reco 被跳过时，兜底保证 standard_sop_reco 不为空
+        profile.standard_sop_reco = self.calc_standard_sop_reco(uid, profile, old_profile)
+      if sleep_insight:
+        profile.sleep_insight = sleep_insight
+      if analysis_cache is not None:
+        profile.sleep_analysis["analysis_cache"] = analysis_cache
       self.save_profile(uid, profile)
       logging.info("Profile llm updated uid=%s", uid)
       return True
@@ -799,12 +868,19 @@ class UserServer:
     if not succ:
       return ProfileResponse(code=500, msg=f"update profile failed", request_type=request.request_type, data=None)
 
-    if not request.data.skip_sleep_scenarios_reco_update:
-      await self._schedule_llm_update_if_needed(uid)
+    skip_reco = request.data.skip_sleep_scenarios_reco_update
+    skip_analysis = request.data.skip_sleep_analysis_update
+    if not (skip_reco and skip_analysis):
+      await self._schedule_llm_update_if_needed(uid, skip_reco, skip_analysis)
 
     return ProfileResponse(code=0, msg=f"update profile for '{request.timestamp}' succ", request_type=request.request_type, data=None)
 
-  async def _schedule_llm_update_if_needed(self, uid: str) -> None:
+  async def _schedule_llm_update_if_needed(
+    self,
+    uid: str,
+    skip_sleep_scenarios_reco_update: bool = False,
+    skip_sleep_analysis_update: bool = False,
+  ) -> None:
     """Schedule a background LLM update for uid unless one ran recently."""
     async with self._llm_tracker_lock:
       now = time.monotonic()
@@ -814,16 +890,31 @@ class UserServer:
         return
       self._llm_update_tracker[uid] = now
 
-    task = asyncio.create_task(self._run_llm_update(uid))
+    task = asyncio.create_task(
+      self._run_llm_update(uid, skip_sleep_scenarios_reco_update, skip_sleep_analysis_update)
+    )
     self._llm_tasks.add(task)
     task.add_done_callback(self._llm_tasks.discard)
 
-  async def _run_llm_update(self, uid: str) -> None:
+  async def _run_llm_update(
+    self,
+    uid: str,
+    skip_sleep_scenarios_reco_update: bool = False,
+    skip_sleep_analysis_update: bool = False,
+  ) -> None:
     """Run LLM work in a background task."""
-    logging.info("start background llm update for uid=%s", uid)
+    logging.info(
+      "start background llm update for uid=%s (skip_reco=%s skip_analysis=%s)",
+      uid, skip_sleep_scenarios_reco_update, skip_sleep_analysis_update,
+    )
     try:
       async with self._llm_semaphore:
-        await asyncio.to_thread(self.user_serv.update_profile_llm, uid)
+        await asyncio.to_thread(
+          self.user_serv.update_profile_llm,
+          uid,
+          skip_sleep_scenarios_reco_update,
+          skip_sleep_analysis_update,
+        )
       logging.info("background llm update done for uid=%s", uid)
     except asyncio.CancelledError:
       logging.info("background llm update cancelled for uid=%s", uid)
@@ -1045,7 +1136,12 @@ class UserServer:
   }
 
   async def handle_sleep_advice_http(self, request: web.Request) -> web.Response:
-    """POST /sleep_advice — return stored sleep advice from the user profile."""
+    """POST /sleep_advice — generate sleep advice on demand via LLM.
+
+    Advice is no longer persisted in the profile (sleep_analysis 只保留统计与缓存);
+    each request generates fresh text, falling back to static defaults when the
+    LLM is disabled or fails.
+    """
     try:
       body = await request.json()
       req = SleepAdviceRequest.model_validate(body)
@@ -1060,22 +1156,24 @@ class UserServer:
       date = req.data.date or datetime.date.today().isoformat()
       language = req.data.language or "en"
 
-      # --- read stored advice first --------------------------------------------
-      stored = None
-      if profile and profile.sleep_analysis:
-        stored = profile.sleep_analysis.get("sleep_advice_structured")
+      # --- on-demand LLM generation --------------------------------------------
+      result = None
+      if profile and self.llm.enabled:
+        ctx = extract_sleep_context(profile, req.data)
+        ctx["focus"] = req.data.focus
+        llm_result = await self.llm.generate("sleep_analysis_advice", ctx, language, req.data.focus)
+        if llm_result:
+          result = SleepAdviceResult(
+            analysis=llm_result.get("analysis", self._DEFAULT_ADVICE_ANALYSIS),
+            advice=llm_result.get("advice", list(self._DEFAULT_ADVICE_BULLETS)),
+            highlights=llm_result.get("highlights", dict(self._DEFAULT_ADVICE_HIGHLIGHTS)),
+            date=date,
+            language=language,
+            llm_used=True,
+          )
 
-      if stored:
-        result = SleepAdviceResult(
-          analysis=stored.get("analysis", self._DEFAULT_ADVICE_ANALYSIS),
-          advice=stored.get("advice", list(self._DEFAULT_ADVICE_BULLETS)),
-          highlights=stored.get("highlights", dict(self._DEFAULT_ADVICE_HIGHLIGHTS)),
-          date=stored.get("date", date),
-          language=stored.get("language", language),
-          llm_used=stored.get("llm_used", True),
-        )
-      else:
-        # Fallback: static defaults when no stored advice exists
+      if result is None:
+        # Fallback: static defaults when LLM is disabled or fails
         result = SleepAdviceResult(
           analysis=self._DEFAULT_ADVICE_ANALYSIS,
           advice=list(self._DEFAULT_ADVICE_BULLETS),
