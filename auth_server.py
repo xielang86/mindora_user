@@ -2,7 +2,7 @@ import datetime
 import hashlib
 import secrets
 import jwt
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from auth import AuthRequest, AuthResponse, AuthRequestType, JWTTokenData, AuthData
@@ -18,14 +18,14 @@ from dotenv import load_dotenv
 from pydantic import ValidationError
 from db.mysql_db import (
   insert_user, get_user_by_email_or_uid, insert_or_restore_user,
-  get_active_user_by_email_or_uid, soft_delete_user,
+  get_active_user_by_email_or_uid, soft_delete_user, get_user_contact,
   # web registration additions
   init_web_columns, register_user_with_password, get_user_password_hash,
   get_user_by_phone, register_phone_user, get_or_create_wechat_user,
   init_membership_schema, get_user_rights_info, redeem_redemption_code,
   create_redemption_codes,
 )
-from db.redis_db import get_verify_code, set_jwt_token, set_verify_code
+from db.redis_db import get_verify_code, set_jwt_token, set_verify_code, delete_verify_code
 from common.util import normalize_email
 from uid.uuid import generate_uid_and_salt
 import logger
@@ -65,6 +65,75 @@ JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY")
 JWT_EXPIRE_SECONDS = int(os.getenv("JWT_EXPIRE_SECONDS"))
 VERIFY_CODE_EXPIRE_SECONDS = int(os.getenv("VERIFY_CODE_EXPIRE_SECONDS"))
 REDEMPTION_ADMIN_SECRET = os.getenv("REDEMPTION_ADMIN_SECRET", "")
+
+# 邮件发件人配置
+MY_163_EMAIL = "mindora2026@163.com"
+MY_163_AUTH_CODE = "RZkiYNHsVxLGvVHG"  # deadline=20260412
+
+# 删除账号验证码使用的固定 device_id，避免与登录验证码冲突
+DELETE_VERIFY_CODE_DEVICE_ID = "delete"
+
+# 业务响应码：与 AuthResponse 的 code 字段语义保持一致（2 = JWT token 过期）
+JWT_EXPIRED_AUTH_CODE = 2
+
+# 删除账号流程专用业务码
+DELETE_VERIFY_SEND_FAILED_CODE = 409  # 注销验证码发送失败（邮件/SMS 通道异常）
+DELETE_DB_FAILED_CODE = 500           # 注销时 DB 软删除失败，统一为服务端内部错误
+
+
+def _auth_code_from_http_exc(exc: HTTPException) -> int:
+  """将 JWT/认证类 HTTPException 映射为业务响应码。"""
+  if exc.status_code == 401 and exc.detail == "Token expired":
+    return JWT_EXPIRED_AUTH_CODE
+  return exc.status_code
+
+
+def _normalize_mac(mac: str | None) -> str:
+  """统一 MAC 地址格式：去空、去分隔符、转小写。"""
+  if not mac:
+    return ""
+  return mac.strip().lower().replace(":", "").replace("-", "").replace(".", "")
+
+
+def _get_client_ip(request: Request) -> str:
+  """获取客户端真实 IP，优先读取 X-Forwarded-For / X-Real-IP。"""
+  forwarded = request.headers.get("X-Forwarded-For")
+  if forwarded:
+    return forwarded.split(",")[0].strip()
+  real_ip = request.headers.get("X-Real-IP")
+  if real_ip:
+    return real_ip.strip()
+  if request.client:
+    return request.client.host
+  return ""
+
+
+def _is_legacy_delete_allowed(request: Request) -> tuple[bool, str]:
+  """
+  校验旧版 DELETE_USER 接口是否允许当前请求调用。
+  返回 (allowed, reason)。
+  """
+  allowed_ips = Config.DELETE_USER_ALLOWED_IPS
+  allowed_macs = Config.DELETE_USER_ALLOWED_MACS
+
+  # 未配置任何白名单时默认拒绝，避免旧接口被意外开放
+  if not allowed_ips and not allowed_macs:
+    return False, "旧版删除接口未配置允许列表，已禁用"
+
+  client_ip = _get_client_ip(request).lower()
+  if allowed_ips and client_ip not in allowed_ips:
+    return False, f"当前 IP {client_ip} 不在允许列表中"
+
+  raw_mac = request.headers.get(Config.DELETE_USER_MAC_HEADER)
+  client_mac = _normalize_mac(raw_mac)
+  if allowed_macs:
+    if not client_mac:
+      return False, "请求缺少允许的 MAC 地址"
+    if client_mac not in allowed_macs:
+      return False, f"当前 MAC {raw_mac} 不在允许列表中"
+
+  return True, ""
+
 
 # ── Password helpers (PBKDF2-SHA256, no extra deps) ──────────────────────────
 
@@ -126,9 +195,6 @@ def _sms_code_key(phone: str, device_id: str) -> tuple[str, str]:
 # =============================================================================
 
 def send_verify_code_handler(data: AuthData):
-  MY_163_EMAIL = "mindora2026@163.com"
-  MY_163_AUTH_CODE = "RZkiYNHsVxLGvVHG"  # deadline=20260412
-
   # Generate 4-digit code
   verify_code = "1234"
   resp = AuthResponse(
@@ -288,20 +354,167 @@ def del_user(data: AuthData) -> AuthResponse:
   if Config.Mode == 1:
     return resp
 
-  payload = decode_access_token(data.jwt_token) 
+  try:
+    payload = decode_access_token(data.jwt_token)
+  except HTTPException as e:
+    resp.code = _auth_code_from_http_exc(e)
+    resp.msg = e.detail
+    return resp
+
   if payload is None:
     resp.code = 500
     resp.msg = "internal error"
-    raise HTTPException(status_code=500, detail=resp.msg)
+    return resp
 
   uid = payload.get("uid")
   result = soft_delete_user(uid=uid)
   code = result.get("code")
-  if code != 0 and result.get("code")!= 200:
+  if code != 0 and code != 200:
     resp.code = code
     resp.msg = result.get("msg")
 
   return resp
+
+
+def _resolve_delete_verify_contact(uid: str, jwt_email: str | None) -> tuple[str, bool]:
+  """
+  根据 uid 与 JWT 中的 email 决定验证码发送地址。
+  优先使用真实邮箱；否则尝试手机号发送 SMS。
+  返回 (contact: str, is_email: bool)
+  """
+  contact = ""
+  is_email = True
+
+  # 1. 优先使用 JWT 中的真实邮箱
+  if jwt_email and "@" in jwt_email and not jwt_email.endswith(("@phone.local", "@wechat.local")):
+    contact = jwt_email
+  else:
+    # 2. 从 DB 读取 email / phone
+    row = get_user_contact(uid) if Config.Mode != 1 else None
+    email = (row.get("email") or "").strip() if row else ""
+    phone = (row.get("phone") or "").strip() if row else ""
+
+    if email and "@" in email and not email.endswith(("@phone.local", "@wechat.local")):
+      contact = email
+    elif phone:
+      contact = phone
+      is_email = False
+
+  return contact, is_email
+
+
+def send_delete_verify_code_handler(data: AuthData) -> AuthResponse:
+  """登录后请求删除账号验证码"""
+  resp = AuthResponse(
+    request_type=AuthRequestType.SEND_DELETE_VERIFY_CODE,
+    code=0,
+    msg="验证码已发送",
+    data=None,
+  )
+
+  try:
+    payload = decode_access_token(data.jwt_token)
+  except HTTPException as e:
+    resp.code = _auth_code_from_http_exc(e)
+    resp.msg = e.detail
+    return resp
+
+  uid = payload.get("uid")
+  jwt_email = payload.get("email")
+
+  if Config.Mode == 1:
+    mock_db["verify_codes"][f"{uid}@{DELETE_VERIFY_CODE_DEVICE_ID}"] = "1234"
+    resp.msg = "验证码已发送 (Mock: 1234)"
+    return resp
+
+  user = get_active_user_by_email_or_uid(email=None, uid=uid)
+  if user is None:
+    raise HTTPException(status_code=401, detail="用户不存在或已被注销")
+
+  contact, is_email = _resolve_delete_verify_contact(uid, jwt_email)
+  if not contact:
+    raise HTTPException(status_code=400, detail="用户未绑定有效的邮箱或手机号")
+
+  verify_code = generate_verify_code(4)
+  set_verify_code(
+    email=contact,
+    device_id=DELETE_VERIFY_CODE_DEVICE_ID,
+    code=verify_code,
+    expire_seconds=VERIFY_CODE_EXPIRE_SECONDS,
+  )
+
+  if is_email:
+    status_data = send_verify_code_via_163(MY_163_EMAIL, MY_163_AUTH_CODE, contact, verify_code)
+    resp.code = status_data.get("code", 0)
+    resp.msg = status_data.get("msg", "邮件发送失败")
+  else:
+    status_data = send_verify_code_via_sms(contact, verify_code)
+    resp.code = status_data.get("code", 0)
+    resp.msg = status_data.get("msg", "短信发送失败")
+
+  # 发送通道失败统一使用 409，不暴露底层服务商的具体错误码
+  if resp.code != 0:
+    resp.code = DELETE_VERIFY_SEND_FAILED_CODE
+    logging.error("send_delete_verify_code failed for uid=%s contact=%s: %s", uid, contact, resp.msg)
+    # 发送失败时删除已写入的验证码，避免脏数据
+    delete_verify_code(contact, DELETE_VERIFY_CODE_DEVICE_ID)
+    raise HTTPException(status_code=500, detail=resp.msg)
+
+  logging.info(">>> [DELETE VERIFY CODE SENT] uid=%s contact=%s is_email=%s", uid, contact, is_email)
+  return resp
+
+
+def delete_user_with_code_handler(data: AuthData) -> AuthResponse:
+  """登录后提交验证码删除账号"""
+  resp = AuthResponse(
+    request_type=AuthRequestType.DELETE_USER_WITH_CODE,
+    code=0,
+    msg="账号已注销",
+    data=None,
+  )
+
+  try:
+    payload = decode_access_token(data.jwt_token)
+  except HTTPException as e:
+    resp.code = _auth_code_from_http_exc(e)
+    resp.msg = e.detail
+    return resp
+
+  uid = payload.get("uid")
+  jwt_email = payload.get("email")
+
+  if Config.Mode == 1:
+    stored = mock_db["verify_codes"].get(f"{uid}@{DELETE_VERIFY_CODE_DEVICE_ID}")
+    if stored != data.verify_code:
+      raise HTTPException(status_code=401, detail="验证码错误或已过期")
+    mock_db["verify_codes"].pop(f"{uid}@{DELETE_VERIFY_CODE_DEVICE_ID}", None)
+    return resp
+
+  user = get_active_user_by_email_or_uid(email=None, uid=uid)
+  if user is None:
+    raise HTTPException(status_code=401, detail="用户不存在或已被注销")
+
+  contact, _ = _resolve_delete_verify_contact(uid, jwt_email)
+  if not contact:
+    raise HTTPException(status_code=400, detail="用户未绑定有效的邮箱或手机号")
+
+  stored_code = get_verify_code(contact, DELETE_VERIFY_CODE_DEVICE_ID)
+  if not stored_code or stored_code != data.verify_code:
+    raise HTTPException(status_code=401, detail="验证码错误或已过期")
+
+  # 消费验证码，防止重放
+  delete_verify_code(contact, DELETE_VERIFY_CODE_DEVICE_ID)
+
+  result = soft_delete_user(uid=uid)
+  code = result.get("code")
+  if code != 0 and code != 200:
+    # DB 层错误统一映射为服务端内部错误，不暴露底层 DB 细节
+    resp.code = DELETE_DB_FAILED_CODE
+    resp.msg = result.get("msg", "账号注销失败")
+    raise HTTPException(status_code=500, detail=resp.msg)
+
+  return resp
+
 
 # =============================================================================
 # Web site handlers
@@ -552,10 +765,22 @@ def generate_redemption_codes_handler(data: AuthData) -> AuthResponse:
 
 # --- Handlers ---
 @app.post("/auth", response_model=AuthResponse)
-async def handle_auth(request: AuthRequest):
+async def handle_auth(request: AuthRequest, raw_request: Request):
   logging.info(f"request {request}")
   req_type = request.request_type
   data = request.data
+
+  # 旧版 DELETE_USER 接口：先校验 IP/MAC 白名单
+  if req_type == AuthRequestType.DELETE_USER:
+    allowed, reason = _is_legacy_delete_allowed(raw_request)
+    if not allowed:
+      logging.warning("[DELETE_USER] rejected: %s", reason)
+      return AuthResponse(
+        request_type=AuthRequestType.DELETE_USER,
+        code=403,
+        msg=reason,
+        data=None,
+      )
 
   # 1. SEND EMAIL VERIFY CODE
   if req_type == AuthRequestType.SEND_VERIFY_CODE:
@@ -573,6 +798,14 @@ async def handle_auth(request: AuthRequest):
   # 4. DELETE USER
   elif req_type == AuthRequestType.DELETE_USER:
     return del_user(data)
+
+  # 4.1 登录后请求删除账号验证码
+  elif req_type == AuthRequestType.SEND_DELETE_VERIFY_CODE:
+    return send_delete_verify_code_handler(data)
+
+  # 4.2 登录后提交验证码删除账号
+  elif req_type == AuthRequestType.DELETE_USER_WITH_CODE:
+    return delete_user_with_code_handler(data)
 
   # ── Web site flows ────────────────────────────────────────────────────────
   # 5. REGISTER: email + verify code + password

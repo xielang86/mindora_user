@@ -36,12 +36,13 @@ REMOTE_SYNC_HEADER = "X-Mindora-Remote-Sync"
 # all bloking sync api
 class UserProfileServ:
   MAX_BEHAVIOR_LEN = 100
-  def __init__(self):
+  def __init__(self, llm: Optional[SleepAnalysisLLM] = None):
     self.lock = threading.RLock()
     self.storage_mode = (Config.USER_PROFILE_STORAGE_MODE or "leveldb").strip().lower()
     self.db = None
     self.json_path = Path(run_dir) / Config.USER_PROFILE_JSON_PATH
     self.text_profiles: dict[str, Any] = {}
+    self.llm = llm or SleepAnalysisLLM()
 
     if self.storage_mode == "leveldb":
       if plyvel is None:
@@ -132,8 +133,13 @@ class UserProfileServ:
       self._behavior_counts(new_behaviors),
     )
     for behavior_type, values in new_behaviors.items():
+      if not isinstance(values, list) or not values:
+        # Skip empty updates to avoid wiping existing data (e.g. from remote sync
+        # or compact query_profile responses). If a caller truly wants to clear a
+        # behavior list, it should explicitly send a deletion marker instead.
+        continue
       values.sort(key=lambda x:x[0])
-      if behavior_type in old_behaviors and isinstance(values, list):
+      if behavior_type in old_behaviors:
         old_behaviors[behavior_type].sort(key=lambda x:x[0])
         old_behaviors[behavior_type]= util.merge_two_sorted_dedup(old_behaviors[behavior_type], values)
       else:
@@ -167,24 +173,232 @@ class UserProfileServ:
     return events
 
   def _update_mindora_record(self, profile: UserProfile, new_profile: UserProfile):
-    """Move SOP play counts from behaviors.plays into mindora_record."""
+    """Move SOP play counts from behaviors.plays into mindora_record.
+
+    Stores lightweight (timestamp, duration) tuples instead of full event dicts
+    to keep storage and logs small.
+    """
     plays = new_profile.behaviors.get("plays", [])
     for cmd, ts, event in self._extract_sop_start_events(plays):
+      duration = event.get("duration") if isinstance(event, dict) else None
       record = profile.mindora_record.setdefault(cmd, [])
-      record.append((ts, event))
+      record.append((ts, duration))
       # keep the list sorted by timestamp and cap the length
       record.sort(key=lambda x: x[0])
       if len(record) > UserProfileServ.MAX_BEHAVIOR_LEN:
         record[:] = record[-UserProfileServ.MAX_BEHAVIOR_LEN:]
 
   @staticmethod
+  def _calc_scene_stats(mindora_record: dict, days: int | None = None) -> dict:
+    """Compute usage counts and total duration per scene from mindora_record.
+
+    If ``days`` is given, only entries whose timestamp is within the last
+    ``days`` days are counted.
+    """
+    cutoff_ts = int(time.time()) - days * 86400 if days else 0
+    stats: dict[str, dict] = {}
+    for scene_id, records in (mindora_record or {}).items():
+      if not isinstance(records, list) or not records:
+        continue
+      total_duration = 0
+      count = 0
+      for entry in records:
+        if isinstance(entry, (list, tuple)) and len(entry) >= 1:
+          try:
+            ts = int(entry[0])
+          except (TypeError, ValueError):
+            continue
+          if ts < cutoff_ts:
+            continue
+          count += 1
+          if len(entry) >= 2 and entry[1] is not None:
+            try:
+              total_duration += float(entry[1])
+            except (TypeError, ValueError):
+              pass
+      if count > 0:
+        stats[scene_id] = {"count": count, "total_duration": round(total_duration, 1)}
+    return stats
+
+  @staticmethod
+  def _pick_most_used_scene(mindora_record: dict, days: int | None = None) -> Optional[tuple[str, dict]]:
+    """Return (scene_id, stats) for the scene with the highest usage count."""
+    stats = UserProfileServ._calc_scene_stats(mindora_record, days=days)
+    if not stats:
+      return None
+    best_id = max(stats.items(), key=lambda x: x[1]["count"])[0]
+    return best_id, stats[best_id]
+
+  def _update_scene_stats(self, profile: UserProfile):
+    """Pre-compute most-used scene (all-time and last 7 days) and persist them in sleep_analysis."""
+    now = int(time.time())
+
+    # All-time most used scene
+    most_used = self._pick_most_used_scene(profile.mindora_record)
+    if most_used is None:
+      profile.sleep_analysis.pop("most_used_scene", None)
+    else:
+      scene_id, scene_stats = most_used
+      short_id = scene_id.replace("sleep.scene.", "")
+      profile.sleep_analysis["most_used_scene"] = {
+        "scene_id": short_id,
+        "scene_name": short_id.replace("_", " ").title(),
+        "count": scene_stats["count"],
+        "total_duration": scene_stats["total_duration"],
+        "updated_at": now,
+      }
+
+    # Most used scene in the last 7 days
+    most_used_7d = self._pick_most_used_scene(profile.mindora_record, days=7)
+    if most_used_7d is None:
+      profile.sleep_analysis.pop("most_used_scene_7d", None)
+    else:
+      scene_id, scene_stats = most_used_7d
+      short_id = scene_id.replace("sleep.scene.", "")
+      profile.sleep_analysis["most_used_scene_7d"] = {
+        "scene_id": short_id,
+        "scene_name": short_id.replace("_", " ").title(),
+        "count": scene_stats["count"],
+        "total_duration": scene_stats["total_duration"],
+        "updated_at": now,
+      }
+
+  @staticmethod
+  def _pick_best_sleep_quality_scene(profile: UserProfile, days: int = 7) -> Optional[dict]:
+    """Return the scene whose usage before sleep onset produced the highest avg sleep_quality.
+
+    For each sleep night in the last ``days`` days:
+      - Compute sleep onset datetime from sleep_data.timestamp + first_sleep_time.
+      - Look at scene usages in the 4-hour wind-down window before onset.
+      - Pick the scene usage closest to onset as the "effective" scene for that night.
+      - Attribute that night's sleep_quality to that scene.
+
+    The returned dict contains the scene with the highest average sleep_quality.
+    """
+    if not profile or not profile.sleep_data or not profile.mindora_record:
+      return None
+
+    now_ts = int(time.time())
+    cutoff_ts = now_ts - days * 86400
+
+    # Collect all scene usages with metadata.
+    usages: list[dict] = []
+    for scene_id, records in profile.mindora_record.items():
+      if not isinstance(records, list) or not records:
+        continue
+      short_id = scene_id.replace("sleep.scene.", "")
+      scene_name = short_id.replace("_", " ").title()
+      for entry in records:
+        if isinstance(entry, (list, tuple)) and len(entry) >= 1:
+          try:
+            ts = int(entry[0])
+          except (TypeError, ValueError):
+            continue
+          if ts < cutoff_ts:
+            continue
+          usages.append({
+            "scene_id": short_id,
+            "scene_name": scene_name,
+            "timestamp": ts,
+          })
+
+    if not usages:
+      return None
+
+    # Attribute sleep_quality to the effective scene per night.
+    scene_qualities: dict[str, list[float]] = {}
+    for record in profile.sleep_data[-days:]:
+      if record.timestamp < cutoff_ts:
+        continue
+      if record.sleep_quality is None or not record.first_sleep_time:
+        continue
+
+      try:
+        sleep_dt = datetime.datetime.fromtimestamp(record.timestamp)
+        hour, minute = record.first_sleep_time.split(":")
+        onset_dt = sleep_dt.replace(hour=int(hour), minute=int(minute), second=0, microsecond=0)
+        if onset_dt > sleep_dt:
+          onset_dt -= datetime.timedelta(days=1)
+      except Exception:
+        continue
+
+      onset_ts = int(onset_dt.timestamp())
+      window_start_ts = onset_ts - 4 * 3600  # 4-hour wind-down window
+
+      # Pick the scene usage closest to onset but not after it.
+      best_usage = None
+      best_delta = None
+      for usage in usages:
+        ts = usage["timestamp"]
+        if ts < window_start_ts or ts > onset_ts:
+          continue
+        delta = onset_ts - ts
+        if best_delta is None or delta < best_delta:
+          best_delta = delta
+          best_usage = usage
+
+      if best_usage is None:
+        continue
+
+      scene_qualities.setdefault(best_usage["scene_id"], []).append(record.sleep_quality)
+
+    if not scene_qualities:
+      return None
+
+    best_scene_id = max(
+      scene_qualities.items(),
+      key=lambda item: sum(item[1]) / len(item[1]),
+    )[0]
+    qualities = scene_qualities[best_scene_id]
+    avg_quality = round(sum(qualities) / len(qualities), 1)
+
+    # Find a human-readable name for the best scene.
+    scene_name = best_scene_id.replace("_", " ").title()
+    for usage in usages:
+      if usage["scene_id"] == best_scene_id:
+        scene_name = usage["scene_name"]
+        break
+
+    return {
+      "scene_id": best_scene_id,
+      "scene_name": scene_name,
+      "avg_sleep_quality": avg_quality,
+      "nights": len(qualities),
+      "updated_at": now_ts,
+    }
+
+  def _update_best_scene_by_sleep_quality(self, profile: UserProfile):
+    """Persist the scene with the highest avg sleep_quality in the last 7 days."""
+    best = self._pick_best_sleep_quality_scene(profile, days=7)
+    if best is None:
+      profile.sleep_analysis.pop("best_sleep_quality_scene_7d", None)
+      return
+    profile.sleep_analysis["best_sleep_quality_scene_7d"] = best
+
+  @staticmethod
   def _profile_for_log(profile: UserProfile) -> dict:
-    """Return a compact dict for logging (behaviors are replaced by counts)."""
+    """Return a compact dict for logging (large fields are summarized)."""
     data = profile.model_dump(mode="json", exclude_none=True)
     if isinstance(data.get("behaviors"), dict):
       data["behaviors"] = {
         k: len(v) if isinstance(v, list) else v for k, v in data["behaviors"].items()
       }
+    if isinstance(data.get("sleep_scenarios_reco"), list):
+      data["sleep_scenarios_reco"] = [
+        {"scenario_id": s.get("scenario_id"), "scenario_name": s.get("scenario_name")}
+        for s in data["sleep_scenarios_reco"]
+      ]
+    if isinstance(data.get("standard_sop_reco"), list):
+      data["standard_sop_reco"] = [
+        {"scenario_id": s.get("scenario_id"), "scenario_name": s.get("scenario_name")}
+        for s in data["standard_sop_reco"]
+      ]
+    if isinstance(data.get("mindora_record"), dict):
+      data["mindora_record"] = {
+        k: len(v) if isinstance(v, list) else v for k, v in data["mindora_record"].items()
+      }
+    if isinstance(data.get("sleep_data"), list):
+      data["sleep_data"] = len(data["sleep_data"])
     return data
 
   def calc_sleep_reco(self, uid: str, new_profile: UserProfile, old_profile: UserProfile) -> List[SleepScenario]:
@@ -203,8 +417,148 @@ class UserProfileServ:
     sop_reco = RecommendationEngine.generate_sop_reco(new_profile, candidates)
     return sop_reco
 
+  def calc_sleep_advice(self, uid: str, profile: UserProfile) -> dict:
+    """Generate sleep advice via LLM and return a structured dict for storage.
+
+    If the stored advice is less than 7 days old, reuse it instead of calling
+    the LLM again.
+    """
+    existing = profile.sleep_analysis.get("sleep_advice_structured") if profile.sleep_analysis else None
+    now = int(time.time())
+    if existing and existing.get("generated_at") and now - existing["generated_at"] < 7 * 86400:
+      logging.info(f"sleep_advice still fresh for uid={uid}, skipping LLM")
+      return existing
+
+    if not self.llm or not self.llm.enabled:
+      return {}
+
+    class _FakeData:
+      date = datetime.date.today().isoformat()
+      start_date = None
+      end_date = None
+      language = "en"
+
+    ctx = extract_sleep_context(profile, _FakeData())
+    ctx["focus"] = []
+
+    llm_result = self.llm.generate_sync("sleep_analysis_advice", ctx, "en", [])
+    if not llm_result:
+      return {}
+
+    return {
+      "analysis": llm_result.get("analysis", ""),
+      "advice": llm_result.get("advice", []),
+      "highlights": llm_result.get("highlights", {}),
+      "date": datetime.date.today().isoformat(),
+      "language": "en",
+      "llm_used": True,
+      "generated_at": int(time.time()),
+    }
+
+  def calc_analysis_cache(self, uid: str, profile: UserProfile, language: str = "en") -> dict:
+    """Pre-generate LLM text for default analysis views and return a cache dict.
+
+    Only default date ranges are cached (today for day/overview/explore,
+    last 7 days for week, last 30 days for month). If a cached entry is still
+    fresh (< 7 days) it is reused instead of calling the LLM again.
+    """
+    if not self.llm or not self.llm.enabled:
+      return profile.sleep_analysis.get("analysis_cache", {}) if profile.sleep_analysis else {}
+
+    today = datetime.date.today()
+    today_str = today.isoformat()
+    week_start = (today - datetime.timedelta(days=6)).isoformat()
+    month_start = (today - datetime.timedelta(days=29)).isoformat()
+
+    analysis_specs = [
+      ("analysis_overview", today_str, None, today_str, []),
+      ("analysis_sleep_day", today_str, None, today_str, []),
+      ("analysis_sleep_week", week_start, today_str, today_str, []),
+      ("analysis_sleep_month", month_start, today_str, today_str, []),
+      ("analysis_explore", today_str, None, today_str, [
+        "header_summary", "score_summary", "onset_efficiency",
+        "sleep_structure", "night_fluctuation", "scene_preference", "sleep_advice",
+      ]),
+    ]
+
+    cache = (profile.sleep_analysis.get("analysis_cache") or {}).copy()
+    now = int(time.time())
+
+    for request_type, start_date, end_date, date, modules in analysis_specs:
+      cache_key = f"{request_type}:{date}:{language}"
+      cached = cache.get(cache_key)
+      if cached and cached.get("generated_at") and now - cached["generated_at"] < 7 * 86400:
+        continue
+
+      class _FakeData:
+        pass
+
+      fake = _FakeData()
+      fake.date = date
+      fake.start_date = start_date
+      fake.end_date = end_date
+      fake.language = language
+      fake.modules = modules
+
+      ctx = extract_sleep_context(profile, fake)
+      try:
+        llm_result = self.llm.generate_sync(request_type, ctx, language, modules)
+      except Exception as e:
+        logging.error(f"analysis cache generation failed for {request_type}: {e}")
+        continue
+
+      if llm_result:
+        cache[cache_key] = {
+          "data": llm_result,
+          "date": date,
+          "start_date": start_date,
+          "end_date": end_date,
+          "language": language,
+          "modules": modules,
+          "generated_at": now,
+        }
+
+    return cache
+
+  def _apply_basic_update(self, uid: str, new_profile: UserProfile, profile: Optional[UserProfile]) -> UserProfile:
+    """Apply non-LLM profile updates. Must be called while holding self.lock.
+
+    Returns the profile object that should be saved.
+    """
+    if profile is None:
+      self._update_scene_stats(new_profile)
+      self._update_best_scene_by_sleep_quality(new_profile)
+      return new_profile
+
+    # just replace, if need
+    if len(new_profile.uid_emb) > 16 or profile.uid_emb is None or len(profile.uid_emb) == 0:
+      profile.uid_emb = new_profile.uid_emb
+
+    profile.long_term_profile = self._merge_profile(profile.long_term_profile, new_profile.long_term_profile)
+    profile.behaviors = self._merge_behavior(profile.behaviors, new_profile.behaviors)
+
+    # aggregate SOP play events into mindora_record so we can keep behaviors small
+    self._update_mindora_record(profile, new_profile)
+    self._update_scene_stats(profile)
+    self._update_best_scene_by_sleep_quality(profile)
+    return profile
+
+  def _apply_llm_update(self, uid: str, profile: UserProfile, old_profile: UserProfile) -> None:
+    """Apply LLM-generated fields to profile in place. Must be called while holding self.lock."""
+    profile.sleep_scenarios_reco = self.calc_sleep_reco(uid, profile, old_profile)
+    profile.standard_sop_reco = self.calc_standard_sop_reco(uid, profile, old_profile)
+    sleep_advice_structured = self.calc_sleep_advice(uid, profile)
+    if sleep_advice_structured:
+      profile.sleep_analysis["sleep_advice_structured"] = sleep_advice_structured
+      profile.sleep_analysis["sleep_advice"] = sleep_advice_structured.get("analysis", "")
+    profile.sleep_analysis["analysis_cache"] = self.calc_analysis_cache(uid, profile)
+
   def update_profile(self, uid: str, new_profile: UserProfile, skip_sleep_scenarios_reco_update: bool = False) -> bool:
-    """写入用户行为（仅更新单个用户数据）"""
+    """写入用户行为（仅更新单个用户数据）.
+
+    Synchronous full-update path. Preserved for backward compatibility with
+    fetch_profile_from_remote and direct callers/tests.
+    """
     if new_profile is None or uid is None or not isinstance(uid, str):
       logging.error(f"invalid new profile {new_profile} or uid {uid}")
       return False
@@ -213,34 +567,19 @@ class UserProfileServ:
       # 读取或创建用户画像（仅操作单个用户，避免全量加载）
       profile = self.get_profile(uid)
       old_profile = profile
-      if profile is None:
-        if not skip_sleep_scenarios_reco_update:
-          new_profile.sleep_scenarios_reco = RecommendationEngine.generate(new_profile)
-          new_profile.standard_sop_reco = RecommendationEngine.generate_sop_reco(
-            new_profile,
-            [key for key in new_profile.mindora_record.keys() if "sleep.scene." in key],
-        )
-        self.save_profile(uid, new_profile)
-        return True
-
-      # just replace, if need
-      if len(new_profile.uid_emb) > 16 or profile.uid_emb is None or len(profile.uid_emb) == 0:
-        profile.uid_emb = new_profile.uid_emb
-
-      profile.long_term_profile = self._merge_profile(profile.long_term_profile, new_profile.long_term_profile)
-
-      profile.behaviors = self._merge_behavior(profile.behaviors, new_profile.behaviors)
-
-      # aggregate SOP play events into mindora_record so we can keep behaviors small
-      self._update_mindora_record(profile, new_profile)
+      profile = self._apply_basic_update(uid, new_profile, profile)
+      # For newly created profiles there is no old profile; use the new profile
+      # object as the old-profile reference so calc_* helpers can read defaults.
+      if old_profile is None:
+        old_profile = profile
 
       if not skip_sleep_scenarios_reco_update:
-        profile.sleep_scenarios_reco = self.calc_sleep_reco(uid, profile, old_profile)
-        profile.standard_sop_reco = self.calc_standard_sop_reco(uid, profile, old_profile)
+        self._apply_llm_update(uid, profile, old_profile)
       elif not profile.standard_sop_reco:
         # make sure we never leave standard_sop_reco empty just because the
         # sleep-scenarios skip flag is set
         profile.standard_sop_reco = self.calc_standard_sop_reco(uid, profile, old_profile)
+
       # 仅保存当前用户的更新（而非全量数据）
       self.save_profile(uid, profile)
       logging.info(
@@ -249,7 +588,59 @@ class UserProfileServ:
         self._profile_for_log(profile),
       )
       return True
-  
+
+  def update_profile_basic(self, uid: str, new_profile: UserProfile) -> bool:
+    """Persist basic profile changes without LLM work. Fast path for HTTP update_profile."""
+    if new_profile is None or uid is None or not isinstance(uid, str):
+      logging.error(f"invalid new profile {new_profile} or uid {uid}")
+      return False
+
+    with self.lock:
+      profile = self.get_profile(uid)
+      profile = self._apply_basic_update(uid, new_profile, profile)
+      self.save_profile(uid, profile)
+      logging.info("Profile basic updated uid=%s", uid)
+      return True
+
+  def update_profile_llm(self, uid: str) -> bool:
+    """Run LLM work for an existing profile and persist results.
+
+    Does not hold self.lock during LLM calls so concurrent basic updates are
+    not blocked. Reloads the profile before saving to avoid overwriting
+    concurrent writes.
+    """
+    if uid is None or not isinstance(uid, str):
+      logging.error(f"invalid uid {uid}")
+      return False
+
+    with self.lock:
+      profile = self.get_profile(uid)
+      if profile is None:
+        logging.warning(f"skip llm update: profile not found for uid={uid}")
+        return False
+      old_profile = profile.model_copy(deep=True)
+      llm_profile = profile.model_copy(deep=True)
+
+    sleep_scenarios = self.calc_sleep_reco(uid, llm_profile, old_profile)
+    standard_sop = self.calc_standard_sop_reco(uid, llm_profile, old_profile)
+    sleep_advice_structured = self.calc_sleep_advice(uid, llm_profile)
+    analysis_cache = self.calc_analysis_cache(uid, llm_profile)
+
+    with self.lock:
+      profile = self.get_profile(uid)
+      if profile is None:
+        logging.warning(f"skip llm update: profile disappeared for uid={uid}")
+        return False
+      profile.sleep_scenarios_reco = sleep_scenarios
+      profile.standard_sop_reco = standard_sop
+      if sleep_advice_structured:
+        profile.sleep_analysis["sleep_advice_structured"] = sleep_advice_structured
+        profile.sleep_analysis["sleep_advice"] = sleep_advice_structured.get("analysis", "")
+      profile.sleep_analysis["analysis_cache"] = analysis_cache
+      self.save_profile(uid, profile)
+      logging.info("Profile llm updated uid=%s", uid)
+      return True
+
   def close(self):
     if self.db is not None:
       self.db.close()
@@ -305,19 +696,28 @@ class UserServer:
     self.server_semaphore = asyncio.Semaphore(Config.MaxServerConcurrent)
     self.host = Config.HOST
     self.port = Config.PORT
-    self.user_serv = UserProfileServ()
+    self.llm = SleepAnalysisLLM()
+    self.user_serv = UserProfileServ(llm=self.llm)
     self.update_task = None
     self.app = web.Application()
     self.active_uid = ""
     self.system_uid = get_or_create_uuid()
     self.debug_uid_set = {"mindora_test_uid1", "mindora_test_uid2", "mindora_test_uid3", "test_debug_user_001"}
-    self.llm = SleepAnalysisLLM()
+    # Per-user LLM background-update rate limiting and task tracking.
+    self._llm_tracker_lock = asyncio.Lock()
+    self._llm_update_tracker: dict[str, float] = {}
+    self._llm_tasks: set[asyncio.Task] = set()
+    self._llm_semaphore = asyncio.Semaphore(Config.MAX_LLM_BACKGROUND_TASKS)
     self.setup_routes()
 
   def close(self):
     self.user_serv.close()
     if self.update_task:
       self.update_task.cancel()
+    # Cancel pending LLM background tasks.
+    for task in list(self._llm_tasks):
+      task.cancel()
+    self._llm_tasks.clear()
 
   def setup_routes(self):
     """设置HTTP路由"""
@@ -392,15 +792,44 @@ class UserServer:
 
     async with self.server_semaphore:
       succ = await asyncio.to_thread(
-        self.user_serv.update_profile,
+        self.user_serv.update_profile_basic,
         uid,
         request.data.user_profile,
-        request.data.skip_sleep_scenarios_reco_update,
       )
-    if succ:
-      return ProfileResponse(code=0, msg=f"update profile for '{request.timestamp}' succ", request_type=request.request_type, data=None)
-    else:
+    if not succ:
       return ProfileResponse(code=500, msg=f"update profile failed", request_type=request.request_type, data=None)
+
+    if not request.data.skip_sleep_scenarios_reco_update:
+      await self._schedule_llm_update_if_needed(uid)
+
+    return ProfileResponse(code=0, msg=f"update profile for '{request.timestamp}' succ", request_type=request.request_type, data=None)
+
+  async def _schedule_llm_update_if_needed(self, uid: str) -> None:
+    """Schedule a background LLM update for uid unless one ran recently."""
+    async with self._llm_tracker_lock:
+      now = time.monotonic()
+      last = self._llm_update_tracker.get(uid)
+      if last is not None and now - last < Config.LLM_UPDATE_COOLDOWN_SECONDS:
+        logging.info("skip background llm update for uid=%s (last %.1fs ago)", uid, now - last)
+        return
+      self._llm_update_tracker[uid] = now
+
+    task = asyncio.create_task(self._run_llm_update(uid))
+    self._llm_tasks.add(task)
+    task.add_done_callback(self._llm_tasks.discard)
+
+  async def _run_llm_update(self, uid: str) -> None:
+    """Run LLM work in a background task."""
+    logging.info("start background llm update for uid=%s", uid)
+    try:
+      async with self._llm_semaphore:
+        await asyncio.to_thread(self.user_serv.update_profile_llm, uid)
+      logging.info("background llm update done for uid=%s", uid)
+    except asyncio.CancelledError:
+      logging.info("background llm update cancelled for uid=%s", uid)
+      raise
+    except Exception as e:
+      logging.error("background llm update failed for uid=%s: %s", uid, e)
 
   async def sync_profile_to_remote(self, uid: str, request: ProfileRequest) -> bool:
     if not Config.RemoteHost or len(Config.RemoteHost) < 10:
@@ -491,9 +920,8 @@ class UserServer:
   async def handle_profile_request_http(self, request: web.Request) -> web.Response:
     try:
       data = await request.json()
-      logging.info("req %s", self._request_for_log(data))
       req = ProfileRequest.model_validate(data)
-      logging.info("request %s", self._request_for_log(req))
+      # logging.info("request %s", self._request_for_log(req))
 
       if req.request_type == "query_profile":
         response_obj = self.handle_query_profile(req)
@@ -571,10 +999,21 @@ class UserServer:
       response_data = self._build_analysis_data(req, profile)
 
       if self.llm.enabled:
-        ctx = extract_sleep_context(profile, req.data)
-        llm_text = await self.llm.generate(req.request_type, ctx, req.data.language, req.data.modules)
-        if llm_text:
-          deep_merge(response_data, llm_text)
+        d = req.data
+        today_str = datetime.date.today().isoformat()
+        anchor_date = d.end_date or d.date or today_str
+        cache_key = f"{req.request_type}:{anchor_date}:{d.language or 'en'}"
+        cached = (profile.sleep_analysis or {}).get("analysis_cache", {}).get(cache_key) if profile else None
+        now = int(time.time())
+
+        if cached and cached.get("generated_at") and now - cached["generated_at"] < 7 * 86400:
+          logging.info(f"analysis cache hit for uid={uid} key={cache_key}")
+          deep_merge(response_data, cached["data"])
+        else:
+          ctx = extract_sleep_context(profile, req.data)
+          llm_text = await self.llm.generate(req.request_type, ctx, req.data.language, req.data.modules)
+          if llm_text:
+            deep_merge(response_data, llm_text)
 
       resp = AnalysisResponse(code=0, msg="success", request_type=req.request_type, data=response_data)
       return web.json_response(resp.model_dump())
@@ -606,7 +1045,7 @@ class UserServer:
   }
 
   async def handle_sleep_advice_http(self, request: web.Request) -> web.Response:
-    """POST /sleep_advice — LLM-powered sleep analysis + actionable advice."""
+    """POST /sleep_advice — return stored sleep advice from the user profile."""
     try:
       body = await request.json()
       req = SleepAdviceRequest.model_validate(body)
@@ -621,27 +1060,22 @@ class UserServer:
       date = req.data.date or datetime.date.today().isoformat()
       language = req.data.language or "en"
 
-      # --- try LLM generation -------------------------------------------------
-      llm_result = None
-      if self.llm.enabled and profile:
-        ctx = extract_sleep_context(profile, req.data)
-        ctx["focus"] = req.data.focus
-        llm_result = await self.llm.generate(
-          "sleep_analysis_advice", ctx, language, [],
-        )
+      # --- read stored advice first --------------------------------------------
+      stored = None
+      if profile and profile.sleep_analysis:
+        stored = profile.sleep_analysis.get("sleep_advice_structured")
 
-      # --- assemble response ---------------------------------------------------
-      if llm_result:
+      if stored:
         result = SleepAdviceResult(
-          analysis=llm_result.get("analysis", self._DEFAULT_ADVICE_ANALYSIS),
-          advice=llm_result.get("advice", self._DEFAULT_ADVICE_BULLETS),
-          highlights=llm_result.get("highlights", self._DEFAULT_ADVICE_HIGHLIGHTS),
-          date=date,
-          language=language,
-          llm_used=True,
+          analysis=stored.get("analysis", self._DEFAULT_ADVICE_ANALYSIS),
+          advice=stored.get("advice", list(self._DEFAULT_ADVICE_BULLETS)),
+          highlights=stored.get("highlights", dict(self._DEFAULT_ADVICE_HIGHLIGHTS)),
+          date=stored.get("date", date),
+          language=stored.get("language", language),
+          llm_used=stored.get("llm_used", True),
         )
       else:
-        # Fallback: static defaults when LLM is disabled or fails
+        # Fallback: static defaults when no stored advice exists
         result = SleepAdviceResult(
           analysis=self._DEFAULT_ADVICE_ANALYSIS,
           advice=list(self._DEFAULT_ADVICE_BULLETS),
@@ -692,16 +1126,15 @@ class UserServer:
       score = 82
 
     weekly_best = None
-    if profile and profile.mindora_record:
-      best = max(profile.mindora_record.items(), key=lambda x: len(x[1]), default=None)
-      if best and best[1]:
-        weekly_best = {
-          "audio_name": best[0].replace("sleep.scene.", "").replace("_", " ").title(),
-          "used_times": len(best[1]),
-          "score": int(score),
-          "start_date": (datetime.date.fromisoformat(date) - datetime.timedelta(days=6)).isoformat(),
-          "end_date": date,
-        }
+    most_used = (profile.sleep_analysis or {}).get("most_used_scene") if profile else None
+    if most_used:
+      weekly_best = {
+        "audio_name": most_used["scene_name"],
+        "used_times": most_used["count"],
+        "score": int(score),
+        "start_date": (datetime.date.fromisoformat(date) - datetime.timedelta(days=6)).isoformat(),
+        "end_date": date,
+      }
     if weekly_best is None:
       weekly_best = {
         "audio_name": "Sedona Red Rocks",
@@ -839,11 +1272,10 @@ class UserServer:
 
     scene_id   = "cocos_island_moonlight"
     scene_name = "Cocos Island Moonlight"
-    if profile and profile.mindora_record:
-      best = max(profile.mindora_record.items(), key=lambda x: len(x[1]), default=None)
-      if best and best[1]:
-        scene_id   = best[0].replace("sleep.scene.", "")
-        scene_name = scene_id.replace("_", " ").title()
+    most_used = (profile.sleep_analysis or {}).get("most_used_scene") if profile else None
+    if most_used:
+      scene_id   = most_used["scene_id"]
+      scene_name = most_used["scene_name"]
 
     awake_count = summaries.get("night_awake_count", 2)
     result = {
@@ -926,7 +1358,10 @@ class UserServer:
     return web.json_response(status=get_http_status(response_obj), data=response_obj.model_dump())
   
   async def fetch_profile_from_remote(self, url):
-    # check jwt_token util expire and the time(maybe 10h is enough)
+    """Periodically pull the active user's profile from the remote server.
+
+    Runs in a background task so it must not block the asyncio event loop.
+    """
     start_min = int(time.time()) / 60
     logging.info(f"begin to loop update for activeuid : {self.active_uid}")
     while True:
@@ -938,12 +1373,30 @@ class UserServer:
       await asyncio.sleep(60)
 
       resp = await query_profile(self.jwt_token, Config.RemoteHost)
-      if resp is None:
-        logging.warning(f"none resp from remote server: {Config.RemoteHost}")
+      if resp is None or resp.code != 0 or resp.data is None:
+        logging.warning(f"none or invalid resp from remote server: {Config.RemoteHost}")
+        continue
 
-      succ = self.user_serv.update_profile(resp.profile)
+      profile_data = resp.data.get("user_profile")
+      if profile_data is None:
+        logging.warning(f"remote resp missing user_profile for activeuid={self.active_uid}")
+        continue
+
+      try:
+        new_profile = UserProfile.model_validate(profile_data)
+      except ValidationError as e:
+        logging.error(f"remote profile validation failed: {e}")
+        continue
+
+      # Offload the synchronous update_profile (which may call LLMs) to a
+      # thread so the event loop stays responsive for local HTTP requests.
+      succ = await asyncio.to_thread(
+        self.user_serv.update_profile,
+        self.active_uid,
+        new_profile,
+      )
       if not succ:
-        logging.warning(f"erro in update profile for {resp.profile}")
+        logging.warning(f"erro in update profile for {self.active_uid}")
       else:
         logging.info(f"succ update profile for {self.active_uid}")
 

@@ -37,7 +37,9 @@ class AuthRequestType(StrEnum):
   SEND_VERIFY_CODE = "send_verify_code"                          # 发送邮箱验证码
   LOGIN_WITH_EMAIL_VERIFY_CODE = "login_with_email_verify_code"  # email+验证码登录/注册
   LOGIN_WITH_JWT = "login_with_jwt"                              # JWT令牌登录
-  DELETE_USER = "delete_user"
+  DELETE_USER = "delete_user"                                    # 旧：JWT直接删除（保留兼容）
+  SEND_DELETE_VERIFY_CODE = "send_delete_verify_code"            # 登录后请求删除账号验证码
+  DELETE_USER_WITH_CODE = "delete_user_with_code"                # 登录后提交验证码删除账号
   # ── Web site registration & login ─────────────────────────────────────────
   REGISTER_WITH_EMAIL_PASSWORD = "register_with_email_password"  # email+验证码+密码 注册
   LOGIN_WITH_EMAIL_PASSWORD = "login_with_email_password"        # email+密码 登录
@@ -211,7 +213,29 @@ class AuthRequest(BaseModel):
         )
 
     # 场景3：JWT登录（login_with_jwt）
-    elif req_type == AuthRequestType.LOGIN_WITH_JWT or req_type == AuthRequestType.DELETE_USER:
+    elif req_type == AuthRequestType.LOGIN_WITH_JWT:
+      if data.jwt_token is None:
+        raise ValueError(
+          f"request_type={req_type}时，data.jwt_token必填"
+        )
+
+    # 场景3.1：登录后请求删除账号验证码
+    elif req_type == AuthRequestType.SEND_DELETE_VERIFY_CODE:
+      if data.jwt_token is None:
+        raise ValueError(
+          f"request_type={req_type}时，data.jwt_token必填"
+        )
+
+    # 场景3.2：登录后提交验证码删除账号
+    elif req_type == AuthRequestType.DELETE_USER_WITH_CODE:
+      missing = [f for f in ["jwt_token", "verify_code"] if getattr(data, f) is None]
+      if missing:
+        raise ValueError(
+          f"request_type={req_type}时，data中以下字段必填：{missing}"
+        )
+
+    # 场景3.3：旧版JWT直接删除（保留兼容）
+    elif req_type == AuthRequestType.DELETE_USER:
       if data.jwt_token is None:
         raise ValueError(
           f"request_type={req_type}时，data.jwt_token必填"
