@@ -1,36 +1,29 @@
-from typing import Any, Optional
+"""auth.py — 嵌入式设备精简版：仅保留 user_server /login 所需的数据结构。
+
+相对完整版的裁剪：
+  - 删除 UserData（MySQL 映射）、JWTTokenData、AuthResponse、UUIDEncoder、测试函数
+    —— 以上只被 auth_server 使用，设备端不部署 auth_server
+  - EmailStr → str：去掉 email-validator 这个 pip 依赖
+  - normalize_user_level → 内联等级集合：去掉 common/user_rights.py 依赖
+  - 删除被覆盖的第一个 model_config（死配置，pydantic 只生效最后一个）
+
+协议保持与完整版一致：App 端发来的请求格式无需任何改动。
+"""
+from typing import Optional
 from pydantic import (
     BaseModel,
     Field,
-    EmailStr,
     model_validator,
     field_validator,
     ConfigDict,
-    ValidationError
 )
 from uuid import UUID
-from enum import Enum,StrEnum
+from enum import StrEnum
 from datetime import datetime
-import json
-from common.user_rights import normalize_user_level
 
-class UserData(BaseModel):
-  # 核心字段：与MySQL字段名一致，指定类型
-  uid: str
-  email: str
-  salt: str
-  # 可选字段：MySQL中允许为空/有默认值的字段
-  status: Optional[int] = Field(default=1)  # 默认值匹配MySQL的DEFAULT 1
-  device_list: str
-  # 时间字段：自动将MySQL返回的字符串/ datetime 对象转为 datetime 类型
-  register_time: datetime
-  update_time: Optional[datetime] = None
+# 用户等级合法值（与 common/user_rights.py 的等级保持一致）
+VALID_USER_LEVELS = {"free", "pro", "premium"}
 
-  # 【可选】字段名映射（若MySQL是下划线，想返回驼峰JSON）
-  model_config = {
-      "alias_generator": lambda x: x.replace("_", " ").title().replace(" ", ""),  # 下划线转驼峰
-      "populate_by_name": True  # 允许通过原字段名（如register_time）赋值
-  }
 
 # 定义请求类型枚举（区分不同操作）
 class AuthRequestType(StrEnum):
@@ -54,10 +47,11 @@ class AuthRequestType(StrEnum):
   def __str__(self):
     return self.value
 
+
 class AuthData(BaseModel):
   """autho data model（merge send verify_code /login with email verify code/JWT login）- Pydantic v2"""
   # 可选字段（根据请求类型动态校验必填）
-  email: EmailStr | None = Field(None, description="用户邮箱，send_verify code/login_with_email_verify_code 必填")
+  email: str | None = Field(None, description="用户邮箱，send_verify code/login_with_email_verify_code 必填")
   device_id: UUID | None = Field(None, description="设备唯一标识（UUID格式），send_verify_code/login_with_email_verify_code 必填")
   verify_code: str | None = Field(None, description="4-6位数字验证码")
   jwt_token: str | None = Field(None, description="JWT登录令牌，login_with_jwt 必填")
@@ -116,8 +110,8 @@ class AuthData(BaseModel):
   def check_target_level(cls, v):
     if v is None:
       return v
-    normalized = normalize_user_level(v)
-    if normalized != v.strip().lower():
+    normalized = v.strip().lower()
+    if normalized not in VALID_USER_LEVELS:
       raise ValueError("target_level must be one of: free, pro, premium")
     return normalized
 
@@ -127,45 +121,14 @@ class AuthData(BaseModel):
       raise ValueError("must be greater than 0")
     return v
 
-  model_config = ConfigDict(
-    use_enum_values=True,
-    json_schema_extra = {
-      "examples": {
-        "send_verify_code": {
-          "email": "user@example.com",
-          "device_id": "1b9d6bcd-bbfd-4b2d-9b5d-ab8dfbbd4bed",
-        },
-        "login_with_email_verify_code": {
-          "email": "user@example.com",
-          "device_id": "1b9d6bcd-bbfd-4b2d-9b5d-ab8dfbbd4bed",
-          "verify_code": "1234"
-        },
-        "login_with_jwt": {
-          "jwt_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
-        },
-
-        "delete_user": {
-          "jwt_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
-        }
-      }
-    }
-  )
-
-# 自定义JSON编码器：处理UUID类型
-class UUIDEncoder(json.JSONEncoder):
-  def default(self, obj):
-    if isinstance(obj, uuid.UUID):
-      # 将UUID对象转为字符串
-      return str(obj)
-    # 其他类型按默认逻辑处理
-    return super().default(obj)
+  model_config = ConfigDict(use_enum_values=True)
 
 
 class AuthRequest(BaseModel):
   """auth request model（merge send verify_code /email login/JWT login）- Pydantic v2"""
   # 核心：请求类型，用于区分不同操作
   request_type: AuthRequestType = Field(..., description="认证请求类型：send_verify_code/login_with_email_verify_code/login_with_jwt")
-  
+
   timestamp : int = Field(..., description="请求发送时间戳（秒级），必填")
   version : str = Field("1.0", description="version, needed, such as 1.0")
   data: AuthData = Field(..., description="AuthData, needed")
@@ -292,261 +255,6 @@ class AuthRequest(BaseModel):
         raise ValueError(f"timestamp eror; currrent timestamp：{current_ts} and v = {v}）")
     return v
 
-  model_config = ConfigDict(
-    strict=True,        # 严格类型检查（如int不能自动转str）
-    extra="forbid",     # 禁止传入模型未定义的字段
-    use_enum_values=False # 保留枚举对象，而非字符串值（便于判断）
-  )
-
-  model_config = ConfigDict(
-    use_enum_values=True,
-    json_schema_extra = {
-      "examples": {
-        "send_verify_code": {
-          "request_type": "send_verify_code",
-          "version": "1.0",
-          "timestamp": 1735689600,
-          "data": {
-            "email": "user@example.com",
-            "device_id": "1b9d6bcd-bbfd-4b2d-9b5d-ab8dfbbd4bed",
-          }
-        },
-
-        "login_with_email_verify_code": {
-          "request_type": "login_with_email_verify_code",
-          "version": "1.0",
-          "timestamp": 1735689600,
-          "data": {
-            "email": "user@example.com",
-            "device_id": "1b9d6bcd-bbfd-4b2d-9b5d-ab8dfbbd4bed",
-            "verify_code": "1234"
-          }
-        },
-
-        "login_with_jwt": {
-          "request_type": "login_with_jwt",
-          "version": "1.0",
-          "timestamp": 1735689600,
-          "data" : {
-            "jwt_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
-          }
-        }
-      }
-    }
-  )
-
-class JWTTokenData(BaseModel):
-  uid: str = Field(..., description="用户唯一ID，必填，非空字符串")
-  email: EmailStr = Field(..., description="用户邮箱，必填，符合邮箱格式，非空")
-  token: str = Field(..., description="JWT Token，必填，非空字符串")
-  expire_days: int = Field(..., description="Token过期天数，必填，必须大于0")
-  user_level: str = Field("free", description="数据库中记录的当前用户等级")
-  effective_user_level: str = Field("free", description="当前生效的用户等级，过期后回退到free")
-  level_end_at: datetime | None = Field(None, description="等级结束时间")
-  rights: dict[str, Any] | None = Field(None, description="返回给App的权益内容")
-
-  @field_validator("uid", "token")
-  def validate_non_empty_string(cls, v):
-    """验证uid/token为非空字符串"""
-    # 先判断是否是字符串（防止传入非字符串类型）
-    if not isinstance(v, str):
-      raise ValueError(f"必须是字符串类型，当前类型：{type(v)}")
-    # 去除首尾空格后判断是否为空（避免全空格的无效值）
-    if not v.strip():
-      raise ValueError("不能为空字符串（也不能全是空格）")
-    return v.strip()  # 可选：返回去空格后的值，保证数据整洁
-
-  @field_validator("expire_days")
-  def validate_expire_days_positive(cls, v):
-    # 先判断是否是数值类型
-    if not isinstance(v, (int)):
-      raise ValueError(f"必须是整数，当前类型：{type(v)}")
-    # 验证大于0
-    if v <= 0:
-      raise ValueError(f"过期天数必须大于0，当前值：{v}")
-    return v
-
-  # 模型配置：开启枚举值、关闭额外字段等（通用最佳实践）
-  model_config = ConfigDict(
-    strict=True,  # 严格类型检查（比如不允许int自动转str）
-    extra="forbid"  # 禁止传入模型未定义的字段，避免脏数据
-  )
-  
-class AuthResponse(BaseModel):
-  """auth request model（merge send verify_code /email login/JWT login）- Pydantic v2"""
-  # 核心：请求类型，用于区分不同操作
-  # request_type: AuthRequestType = Field(..., description="认证请求类型：send_verify_code/login_with_email_verify_code/login_with_jwt")
-  request_type: str = Field(..., description="认证请求类型：send_verify_code/login_with_email_verify_code/login_with_jwt")
-  code: int = Field(0, description="响应状态码：0=成功，1： 验证码错误/过期,2： jwt token 过期,3 : 请求发送过于频繁")
-  # 响应提示信息（默认空字符串）
-  msg: str = Field("", description="响应提示信息")
-  data: Optional[Any] = Field(None, description="响应数据")
-
-  @model_validator(mode='after')
-  def validate_data_when_email_login(self):
-    return self
-
-  model_config = ConfigDict(
-    strict=True,        # 严格类型检查（如int不能自动转str）
-    extra="forbid",     # 禁止传入模型未定义的字段
-    use_enum_values=True# 保留枚举对象，而非字符串值（便于判断）
-  )
-
-def test_request(): 
-  ts = int(datetime.now().timestamp())
-  # 测试1：合法场景 - send_verify_code（email+device_id必填）
-  valid_send_code = {
-    "request_type": "send_verify_code",
-    "data": {
-      "email": "user@example.com",
-      "device_id": "1b9d6bcd-bbfd-4b2d-9b5d-ab8dfbbd4bed"
-    },
-    "timestamp": ts
-  }
-  try:
-    req1 = AuthRequest(** valid_send_code)
-    print("✅ 测试1（send_verify_code）通过：", req1.model_dump())
-  except ValidationError as e:
-    print("❌ 测试1失败：", e)
-
-  # 测试2：合法场景 - login_with_email_verify_code（email+device_id+verify_code必填）
-  valid_email_login = {
-    "request_type": "login_with_email_verify_code",
-    "data": {
-      "email": "user@example.com",
-      "device_id": "1b9d6bcd-bbfd-4b2d-9b5d-ab8dfbbd4bed",
-      "verify_code": "1234"
-    },
-    "timestamp": ts
-  }
-  try:
-    req2 = AuthRequest(** valid_email_login)
-    print("\n✅ 测试2（login_with_email_verify_code）通过：", req2.model_dump())
-  except ValidationError as e:
-    print("❌ 测试2失败：", e)
-
-  # 测试3：合法场景 - login_with_jwt（jwt_token必填）
-  valid_jwt_login = {
-    "request_type": "login_with_jwt",
-    "data": {
-      "jwt_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
-    },
-    "timestamp": ts
-  }
-  try:
-    req3 = AuthRequest(** valid_jwt_login)
-    print("\n✅ 测试3（login_with_jwt）通过：", req3.model_dump())
-  except ValidationError as e:
-    print("❌ 测试3失败：", e)
-
-  # 测试4：非法场景 - send_verify_code缺少device_id
-  invalid_send_code = {
-    "request_type": "send_verify_code",
-    "data": {
-      "email": "user@example.com"
-      # 缺少device_id
-    },
-    "timestamp": ts
-  }
-  try:
-    req4 = AuthRequest(** invalid_send_code)
-  except ValidationError as e:
-    print("\n❌ 测试4（send_verify_code缺device_id）失败（符合预期）：", e.errors()[0]["msg"])
-
-  # 测试5：非法场景 - login_with_email_verify_code验证码非4位
-  invalid_verify_code = {
-    "request_type": "login_with_email_verify_code",
-    "data": {
-      "email": "user@example.com",
-      "device_id": "1b9d6bcd-bbfd-4b2d-9b5d-ab8dfbbd4bed",
-      "verify_code": "12345"  # 5位数字
-    },
-    "timestamp": ts
-  }
-  try:
-    req5 = AuthRequest(** invalid_verify_code)
-  except ValidationError as e:
-    print("\n❌ 测试5（验证码非4位）失败（符合预期）：", e.errors()[0]["msg"])
-
-  # 测试6：非法场景 - login_with_jwt传入email
-  invalid_jwt_login = {
-    "request_type": "login_with_jwt",
-    "data": {
-      "jwt_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
-      "email": "user@example.com"  # 该场景不允许传email
-    },
-    "timestamp": ts
-  }
-  try:
-    req6 = AuthRequest(** invalid_jwt_login)
-  except ValidationError as e:
-    print("\n❌ 测试6（jwt登录传email）失败（符合预期）：", e.errors()[0]["msg"])
-
-
-def test_response():
-  # response 测试1：合法场景 - login_with_email_verfiy_code 且 data 非空（通过）
-  valid_email_login = {
-    "request_type": AuthRequestType.LOGIN_WITH_EMAIL_VERIFY_CODE,
-    "code": 0,
-    "msg": "登录成功",
-    "data": {
-        "uid": "123456",
-        "email": "user@example.com",
-        "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
-        "expire_days": 7
-    }
-  }
-  try:
-    resp1 = AuthResponse(** valid_email_login)
-    print("✅ response 测试1（email_login+data非空）：验证通过")
-    print("响应数据：", resp1.model_dump())
-  except ValidationError as e:
-    print("❌ response 测试1失败：", e)
-
-  # response 测试2：非法场景 - email_login 但 data=None（失败）
-  invalid_email_login = {
-    "request_type": AuthRequestType.LOGIN_WITH_EMAIL_VERIFY_CODE,
-    "code": 0,
-    "msg": "登录成功",
-    "data": None
-  }
-  try:
-    resp2 = AuthResponse(** invalid_email_login)
-  except ValidationError as e:
-    print("\n❌ response 测试2（email_login+data=None）：验证失败（符合预期）")
-    print("错误信息：", e.errors()[0]["msg"])
-
-  # response 测试3：合法场景 - send_verify_code 且 data=None（通过）
-  valid_send_code = {
-    "request_type": AuthRequestType.SEND_VERIFY_CODE,
-    "code": 0,
-    "msg": "验证码发送成功",
-    "data": None
-  }
-  try:
-    resp3 = AuthResponse(** valid_send_code)
-    print("\n✅ response 测试3（send_verify_code+data=None）：验证通过")
-  except ValidationError as e:
-    print("❌ response 测试3失败：", e)
-
-  # response 测试4：非法场景 - email_login 但 data.token 为空（失败）
-  invalid_email_login_token = {
-    "request_type": AuthRequestType.LOGIN_WITH_EMAIL_VERIFY_CODE,
-    "code": 0,
-    "msg": "登录成功",
-    "data": {
-      "uid": "123456",
-      "email": "user@example.com",
-      "token": "",  # 空token
-      "expire_days": 7
-    }
-  }
-  try:
-    resp4 = AuthResponse(** invalid_email_login_token)
-  except ValidationError as e:
-    print("\n❌ response 测试4（email_login+data.token为空）：验证失败（符合预期）")
-    print("错误信息：", e.errors()[0]["msg"])
-
-if __name__ == "__main__":
-  test_request()
-  test_response()
+  # 注意：完整版这里有两段 model_config，pydantic 只生效最后一段，
+  # 本精简版直接保留生效的那份（非 strict、允许额外字段、枚举存值）。
+  model_config = ConfigDict(use_enum_values=True)

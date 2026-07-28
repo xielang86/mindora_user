@@ -81,7 +81,7 @@ class SleepResult(BaseModel):
   avg_respiratory: Optional[float] = Field(None, description="平均呼吸频率，单位次/分钟")
   avg_temperature: Optional[float] = Field(None, description="体温，单位摄氏度")
 
-  scene_preference: List[Tuple[str, float]] = Field(None, description="场景偏好，如喜欢的睡眠场景名称")
+  scene_preference: Optional[List[Tuple[str, float]]] = Field(None, description="场景偏好，如喜欢的睡眠场景名称")
   # the recent sleep status sequence, with start_time, duration and sleep_type, used for sleep analysis and advice generation
   sleep_status: List[SleepElement] = Field(default_factory=list, description="the seq for the sleep status, with start_time, duration and sleep_type")
 
