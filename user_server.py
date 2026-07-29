@@ -4,9 +4,8 @@ from pathlib import Path
 from dotenv import load_dotenv
 import jwt
 from pydantic import BaseModel, ValidationError
-import websockets
 from aiohttp import ClientResponseError, ClientSession, web
-# 边缘端轻量化：LLM 与推荐引擎作为可选依赖
+# 边缘端轻量化：推荐引擎作为可选依赖（本分支无 LLM，llm_service 已移除）
 try:
   from sleep_reco import RecommendationEngine
   _HAS_RECO = True
@@ -31,15 +30,6 @@ from user_profile import (
 from auth import AuthRequest
 from uid.uuid import get_or_create_uuid
 
-try:
-  from llm_service import SleepAnalysisLLM, extract_sleep_context, deep_merge
-  _HAS_LLM = True
-except ImportError:
-  SleepAnalysisLLM = None
-  extract_sleep_context = None
-  deep_merge = None
-  _HAS_LLM = False
-
 import logger
 import copy
 
@@ -53,16 +43,12 @@ REMOTE_SYNC_HEADER = "X-Mindora-Remote-Sync"
 # all bloking sync api
 class UserProfileServ:
   MAX_BEHAVIOR_LEN = 100
-  def __init__(self, llm: Optional[Any] = None):
+  def __init__(self):
     self.lock = threading.RLock()
     self.storage_mode = (Config.USER_PROFILE_STORAGE_MODE or "leveldb").strip().lower()
     self.db = None
     self.json_path = Path(run_dir) / Config.USER_PROFILE_JSON_PATH
     self.text_profiles: dict[str, Any] = {}
-    # 边缘端可配置关闭 LLM，避免 import/实例化
-    self.llm = llm
-    if self.llm is None and Config.ENABLE_LLM and _HAS_LLM:
-      self.llm = SleepAnalysisLLM()
 
     if self.storage_mode == "leveldb":
       if plyvel is None:
@@ -442,109 +428,6 @@ class UserProfileServ:
     sop_reco = RecommendationEngine.generate_sop_reco(new_profile, candidates)
     return sop_reco
 
-  def calc_sleep_advice(self, uid: str, profile: UserProfile) -> dict:
-    """Generate sleep advice via LLM and return a structured dict for storage.
-
-    If the stored advice is less than 7 days old, reuse it instead of calling
-    the LLM again.
-    """
-    existing = profile.sleep_analysis.get("sleep_advice_structured") if profile.sleep_analysis else None
-    now = int(time.time())
-    if existing and existing.get("generated_at") and now - existing["generated_at"] < 7 * 86400:
-      logging.info(f"sleep_advice still fresh for uid={uid}, skipping LLM")
-      return existing
-
-    if not self.llm or not self.llm.enabled:
-      return {}
-
-    class _FakeData:
-      date = datetime.date.today().isoformat()
-      start_date = None
-      end_date = None
-      language = "en"
-
-    ctx = extract_sleep_context(profile, _FakeData())
-    ctx["focus"] = []
-
-    llm_result = self.llm.generate_sync("sleep_analysis_advice", ctx, "en", [])
-    if not llm_result:
-      return {}
-
-    return {
-      "analysis": llm_result.get("analysis", ""),
-      "advice": llm_result.get("advice", []),
-      "highlights": llm_result.get("highlights", {}),
-      "date": datetime.date.today().isoformat(),
-      "language": "en",
-      "llm_used": True,
-      "generated_at": int(time.time()),
-    }
-
-  def calc_analysis_cache(self, uid: str, profile: UserProfile, language: str = "en") -> dict:
-    """Pre-generate LLM text for default analysis views and return a cache dict.
-
-    Only default date ranges are cached (today for day/overview/explore,
-    last 7 days for week, last 30 days for month). If a cached entry is still
-    fresh (< 7 days) it is reused instead of calling the LLM again.
-    """
-    if not self.llm or not self.llm.enabled:
-      return profile.sleep_analysis.get("analysis_cache", {}) if profile.sleep_analysis else {}
-
-    today = datetime.date.today()
-    today_str = today.isoformat()
-    week_start = (today - datetime.timedelta(days=6)).isoformat()
-    month_start = (today - datetime.timedelta(days=29)).isoformat()
-
-    analysis_specs = [
-      ("analysis_overview", today_str, None, today_str, []),
-      ("analysis_sleep_day", today_str, None, today_str, []),
-      ("analysis_sleep_week", week_start, today_str, today_str, []),
-      ("analysis_sleep_month", month_start, today_str, today_str, []),
-      ("analysis_explore", today_str, None, today_str, [
-        "header_summary", "score_summary", "onset_efficiency",
-        "sleep_structure", "night_fluctuation", "scene_preference", "sleep_advice",
-      ]),
-    ]
-
-    cache = (profile.sleep_analysis.get("analysis_cache") or {}).copy()
-    now = int(time.time())
-
-    for request_type, start_date, end_date, date, modules in analysis_specs:
-      cache_key = f"{request_type}:{date}:{language}"
-      cached = cache.get(cache_key)
-      if cached and cached.get("generated_at") and now - cached["generated_at"] < 7 * 86400:
-        continue
-
-      class _FakeData:
-        pass
-
-      fake = _FakeData()
-      fake.date = date
-      fake.start_date = start_date
-      fake.end_date = end_date
-      fake.language = language
-      fake.modules = modules
-
-      ctx = extract_sleep_context(profile, fake)
-      try:
-        llm_result = self.llm.generate_sync(request_type, ctx, language, modules)
-      except Exception as e:
-        logging.error(f"analysis cache generation failed for {request_type}: {e}")
-        continue
-
-      if llm_result:
-        cache[cache_key] = {
-          "data": llm_result,
-          "date": date,
-          "start_date": start_date,
-          "end_date": end_date,
-          "language": language,
-          "modules": modules,
-          "generated_at": now,
-        }
-
-    return cache
-
   def update_profile(self, uid: str, new_profile: UserProfile, skip_sleep_scenarios_reco_update: bool = False) -> bool:
     """写入用户行为（仅更新单个用户数据）"""
     if new_profile is None or uid is None or not isinstance(uid, str):
@@ -564,11 +447,6 @@ class UserProfileServ:
             new_profile,
             [key for key in new_profile.mindora_record.keys() if "sleep.scene." in key],
           )
-          sleep_advice_structured = self.calc_sleep_advice(uid, new_profile)
-          if sleep_advice_structured:
-            new_profile.sleep_analysis["sleep_advice_structured"] = sleep_advice_structured
-            new_profile.sleep_analysis["sleep_advice"] = sleep_advice_structured.get("analysis", "")
-          new_profile.sleep_analysis["analysis_cache"] = self.calc_analysis_cache(uid, new_profile)
         self.save_profile(uid, new_profile)
         return True
 
@@ -588,11 +466,6 @@ class UserProfileServ:
       if not skip_sleep_scenarios_reco_update and _HAS_RECO and Config.ENABLE_SLEEP_RECO:
         profile.sleep_scenarios_reco = self.calc_sleep_reco(uid, profile, old_profile)
         profile.standard_sop_reco = self.calc_standard_sop_reco(uid, profile, old_profile)
-        sleep_advice_structured = self.calc_sleep_advice(uid, profile)
-        if sleep_advice_structured:
-          profile.sleep_analysis["sleep_advice_structured"] = sleep_advice_structured
-          profile.sleep_analysis["sleep_advice"] = sleep_advice_structured.get("analysis", "")
-        profile.sleep_analysis["analysis_cache"] = self.calc_analysis_cache(uid, profile)
       elif not profile.standard_sop_reco:
         # make sure we never leave standard_sop_reco empty just because the
         # sleep-scenarios skip flag is set
@@ -661,9 +534,8 @@ class UserServer:
     self.server_semaphore = asyncio.Semaphore(Config.MaxServerConcurrent)
     self.host = Config.HOST
     self.port = Config.PORT
-    # 边缘端可配置关闭 LLM，避免 import/实例化
-    self.llm = SleepAnalysisLLM() if Config.ENABLE_LLM and _HAS_LLM else None
-    self.user_serv = UserProfileServ(llm=self.llm)
+    # 本分支（嵌入式轻量部署）无 LLM 需求，不实例化任何 LLM 组件
+    self.user_serv = UserProfileServ()
     self.update_task = None
     self.app = web.Application()
     self.active_uid = ""
@@ -815,28 +687,6 @@ class UserServer:
     self.jwt_token = request.data.jwt_token
     return BaseResponse(code=0, msg="user ativated successufully")
 
-  async def handle_profile_request(self, websocket, path=None):
-    try:
-      async for msg in websocket:
-        response_obj: BaseResponse
-        try:
-          data = json.loads(msg)
-          req = ProfileRequest.model_validate(data)
-          if req.request_type == "query_profile":
-            response_obj = self.handle_query_profile(req)
-          elif req.request_type == "update_profile":
-            response_obj = await self.handle_update_profile(req)
-          else:
-            response_obj = BaseResponse(code=400, msg="Invalid request type")
-
-        except (json.JSONDecodeError, TypeError, KeyError, ValidationError) as e:
-          response_obj = BaseResponse(code=400, msg=f"Invalid request format: {e}")
-        
-        await websocket.send(json.dumps(response_obj.model_dump()))
-    except websockets.exceptions.ConnectionClosed:
-      logging.error("Connection closed.")
-
-
   def get_overall_score(self, profile: UserProfile) -> Optional[float]:
     """计算用户最近7天的平均睡眠质量得分（0-100）"""
     if not profile.sleep_data:
@@ -926,23 +776,6 @@ class UserServer:
 
       profile = self.user_serv.get_profile(uid)
       response_data = self._build_analysis_data(req, profile)
-
-      if self.llm is not None and self.llm.enabled:
-        d = req.data
-        today_str = datetime.date.today().isoformat()
-        anchor_date = d.end_date or d.date or today_str
-        cache_key = f"{req.request_type}:{anchor_date}:{d.language or 'en'}"
-        cached = (profile.sleep_analysis or {}).get("analysis_cache", {}).get(cache_key) if profile else None
-        now = int(time.time())
-
-        if cached and cached.get("generated_at") and now - cached["generated_at"] < 7 * 86400:
-          logging.info(f"analysis cache hit for uid={uid} key={cache_key}")
-          deep_merge(response_data, cached["data"])
-        else:
-          ctx = extract_sleep_context(profile, req.data)
-          llm_text = await self.llm.generate(req.request_type, ctx, req.data.language, req.data.modules)
-          if llm_text:
-            deep_merge(response_data, llm_text)
 
       resp = AnalysisResponse(code=0, msg="success", request_type=req.request_type, data=response_data)
       return web.json_response(resp.model_dump())
@@ -1274,8 +1107,8 @@ class UserServer:
       data = await request.json()
       request = AuthRequest.model_validate(data)
       response_obj = self.handle_login(request)
-    except (json.JSONDecodeError, TypeError, KeyError) as e:
-      logging.error(f"login error: {e}, request={request}")
+    except (json.JSONDecodeError, TypeError, KeyError, ValidationError) as e:
+      logging.error(f"login error: {e}")
       response_obj = InvalidReqFormatResp()
 
     logging.info(f"login resp: {response_obj}")
@@ -1317,8 +1150,8 @@ class UserServer:
         logging.error(f"remote profile validation failed: {e}")
         continue
 
-      # Offload the synchronous update_profile (which may call LLMs) to a
-      # thread so the event loop stays responsive for local HTTP requests.
+      # Offload the synchronous update_profile to a thread so the event loop
+      # stays responsive for local HTTP requests.
       succ = await asyncio.to_thread(
         self.user_serv.update_profile,
         self.active_uid,
@@ -1339,16 +1172,10 @@ class UserServer:
     # 保持服务运行
     await asyncio.Event().wait()
 
-  async def start(self):
-    async with websockets.serve(self.handle_profile_request, self.host, self.port):
-      logging.info(f"UserServer started on ws://{self.host}:{self.port}")
-      await asyncio.Future()  # 持续运行
-
 
 if __name__ == "__main__":
   server = UserServer()
   try:
-    # asyncio.run(server.start())
     asyncio.run(server.start_http())
   except KeyboardInterrupt:
     logging.warning("Shutting down UserServer.")

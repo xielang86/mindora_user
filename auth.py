@@ -245,14 +245,13 @@ class AuthRequest(BaseModel):
     return self
 
   # mode='after'：所有字段基础校验完成后，再执行该校验（对应原 skip_on_failure=True）
+  # 注意：本分支（嵌入式本地部署）已移除 timestamp ±120s 新鲜度校验——
+  # 设备时钟可能不准（无 RTC / NTP 未同步），本地局域网低频请求也无重放风险。
   @field_validator("timestamp")
   def check_timestamp_valid(cls, v):
     if v is not None:
       if not isinstance(v, int) or v <= 0:
         raise ValueError("timestamp must be positive number in secs")
-      current_ts = int(datetime.now().timestamp())
-      if v > current_ts + 120 or v < current_ts - 120:
-        raise ValueError(f"timestamp eror; currrent timestamp：{current_ts} and v = {v}）")
     return v
 
   # 注意：完整版这里有两段 model_config，pydantic 只生效最后一段，
