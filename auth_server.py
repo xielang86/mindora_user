@@ -13,7 +13,7 @@ from common import wechat as wechat_svc
 from config import Config
 import os
 import jwt
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 from pydantic import ValidationError
 from db.mysql_db import (
@@ -27,6 +27,7 @@ from db.mysql_db import (
 )
 from db.redis_db import get_verify_code, set_jwt_token, set_verify_code, delete_verify_code
 from common.util import normalize_email
+from common.jwt_keys import sign_token, verify_token
 from uid.uuid import generate_uid_and_salt
 import logger
 
@@ -60,8 +61,8 @@ mock_db = {
   "users": {}          # {email: {"uid": "uuid", "created_at": "..."}}
 }
 
-# 加载配置
-JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY")
+# 加载配置（JWT 签名密钥改为 RS256 私钥文件，见 common/jwt_keys.py；
+# JWT_SECRET_KEY 仅作为旧 HS256 token 的验签回退，不再用于签发）
 JWT_EXPIRE_SECONDS = int(os.getenv("JWT_EXPIRE_SECONDS"))
 VERIFY_CODE_EXPIRE_SECONDS = int(os.getenv("VERIFY_CODE_EXPIRE_SECONDS"))
 REDEMPTION_ADMIN_SECRET = os.getenv("REDEMPTION_ADMIN_SECRET", "")
@@ -148,12 +149,8 @@ def _verify_password(password: str, stored_hash: str, salt: str) -> bool:
 
 def _make_jwt(uid: str, email: str | None) -> tuple[str, int]:
   """Return (jwt_token, expire_days)."""
-  expire_time = datetime.now() + timedelta(seconds=JWT_EXPIRE_SECONDS)
-  token = jwt.encode(
-    {"uid": uid, "email": email or "", "exp": expire_time},
-    JWT_SECRET_KEY,
-    algorithm=Config.ALGORITHM,
-  )
+  expire_time = datetime.now(timezone.utc) + timedelta(seconds=JWT_EXPIRE_SECONDS)
+  token = sign_token({"uid": uid, "email": email or "", "exp": expire_time})
   return token, max(1, int(JWT_EXPIRE_SECONDS / 86400))
 
 
@@ -276,16 +273,12 @@ def auth_by_verify_code(data: AuthData) -> AuthResponse:
       uid = user.uid
     
     # 步骤4：生成JWT Token
-    expire_time = datetime.now() + timedelta(seconds=JWT_EXPIRE_SECONDS)
-    jwt_token = jwt.encode(
-      {
-        "uid": uid,
-        "email": normalized_email,
-        "exp": expire_time
-      },
-      JWT_SECRET_KEY,
-      algorithm=Config.ALGORITHM
-    )
+    expire_time = datetime.now(timezone.utc) + timedelta(seconds=JWT_EXPIRE_SECONDS)
+    jwt_token = sign_token({
+      "uid": uid,
+      "email": normalized_email,
+      "exp": expire_time,
+    })
     
     # 步骤5：存储JWT Token到Redis（和JWT过期时间一致）
     set_jwt_token(uid, device_id, jwt_token, JWT_EXPIRE_SECONDS)
@@ -311,7 +304,7 @@ def auth_by_verify_code(data: AuthData) -> AuthResponse:
 def decode_access_token(token: str):
   """Decodes and validates the JWT token."""
   try:
-    payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=[Config.ALGORITHM])
+    payload = verify_token(token)
     return payload
   except jwt.ExpiredSignatureError:
     raise HTTPException(status_code=401, detail="Token expired")

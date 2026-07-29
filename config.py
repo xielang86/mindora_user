@@ -20,7 +20,13 @@ class Config:
   Mode = 0
   RemoteHost="http://121.43.54.25:9001"
   # RemoteHost="http://localhost:9001"
-  ALGORITHM="HS256"
+  ALGORITHM="RS256"
+  # 验签兼容：旧的 HS256 token（JWT_SECRET_KEY 环境变量）在过期前仍可验
+  LEGACY_ALGORITHM="HS256"
+  # JWT 密钥文件默认路径（可用 JWT_PRIVATE_KEY_PATH/JWT_PUBLIC_KEY_PATH 环境变量覆盖，
+  # 或直接用 JWT_PRIVATE_KEY/JWT_PUBLIC_KEY inline PEM 环境变量）
+  JWT_PRIVATE_KEY_PATH = "jwt_private.pem"
+  JWT_PUBLIC_KEY_PATH = "jwt_public.pem"
   # 边缘端轻量化开关：关闭后 user_server 不会 import/实例化 LLM 与推荐引擎
   ENABLE_LLM = True
   ENABLE_SLEEP_RECO = True

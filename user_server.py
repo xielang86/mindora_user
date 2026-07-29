@@ -14,6 +14,7 @@ except ImportError:
 from user_profile import UserProfile, SleepScenario
 from config import Config
 from common import util
+from common.jwt_keys import verify_token
 from user_profile import (
   UserProfile, ProfileRequest, ProfileResponse, ProfileData,
   InvalidOrExpiredTokenResp, InvalidReqFormatResp, BaseResponse,
@@ -30,7 +31,7 @@ import copy
 load_dotenv()
 run_dir = os.getenv("RUN_DIR")
 logger.init_log(f"{run_dir}/user_server_logs")
-JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY")
+# JWT 验签改用 RS256 公钥（见 common/jwt_keys.py），不再需要本地保存签名密钥
 REMOTE_SYNC_HEADER = "X-Mindora-Remote-Sync"
 
 
@@ -796,9 +797,8 @@ class UserServer:
     self.app.router.add_post('/sleep_advice', self.handle_sleep_advice_http)
 
   def _check_token(self, jwt_token: str)-> dict | None:
-    logging.info(f"in login: {jwt_token}")
     try:
-      payload = jwt.decode(jwt_token, JWT_SECRET_KEY, algorithms=[Config.ALGORITHM])
+      payload = verify_token(jwt_token)
     except jwt.ExpiredSignatureError:
       logging.error("login token expired")
       return None
