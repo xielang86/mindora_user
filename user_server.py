@@ -13,11 +13,6 @@ except ImportError:
   RecommendationEngine = None
   _HAS_RECO = False
 
-try:
-  import plyvel
-except ImportError:
-  plyvel = None
-
 from user_profile import UserProfile, SleepScenario
 from config import Config
 from common import util
@@ -45,23 +40,10 @@ class UserProfileServ:
   MAX_BEHAVIOR_LEN = 100
   def __init__(self):
     self.lock = threading.RLock()
-    self.storage_mode = (Config.USER_PROFILE_STORAGE_MODE or "leveldb").strip().lower()
-    self.db = None
+    # 本分支（嵌入式轻量部署）仅用明文 JSON 文件存储，无 LevelDB 依赖
     self.json_path = Path(run_dir) / Config.USER_PROFILE_JSON_PATH
-    self.text_profiles: dict[str, Any] = {}
-
-    if self.storage_mode == "leveldb":
-      if plyvel is None:
-        raise ImportError("plyvel is required when USER_PROFILE_STORAGE_MODE=leveldb")
-      # 初始化LevelDB（若路径不存在则自动创建）
-      self.db = plyvel.DB(f"{run_dir}/{Config.DB_PATH}", create_if_missing=True)
-    elif self.storage_mode not in {"txt_json", "json_txt", "json"}:
-      raise ValueError(f"unsupported USER_PROFILE_STORAGE_MODE: {self.storage_mode}")
-    else:
-      self.text_profiles = self._load_profiles_from_text_unlocked()
-      logging.info(f"preloaded {len(self.text_profiles)} user profiles from {self.json_path}")
-
-    logging.info(f"user profile storage mode={self.storage_mode}")
+    self.text_profiles: dict[str, Any] = self._load_profiles_from_text_unlocked()
+    logging.info(f"preloaded {len(self.text_profiles)} user profiles from {self.json_path}")
 
   def _profile_to_json_data(self, profile: UserProfile) -> dict:
     return profile.model_dump(mode="json")
@@ -98,14 +80,6 @@ class UserProfileServ:
       return None
 
     with self.lock:
-      if self.storage_mode == "leveldb":
-        data = self.db.get(uid.encode('utf-8'))  # LevelDB键值为bytes类型
-        if data:
-          logging.info("get from leveldb uid=%s size=%d bytes", uid, len(data))
-          return UserProfile.model_validate(json.loads(data.decode('utf-8')))
-        logging.info("get from leveldb uid=%s not found", uid)
-        return None
-
       data = self.text_profiles.get(uid)
       logging.info("get from json txt uid=%s found=%s size=%d", uid, data is not None, len(json.dumps(data)) if data else 0)
       if data is not None:
@@ -115,11 +89,6 @@ class UserProfileServ:
   def save_profile(self, uid: str, profile: UserProfile):
     """将单个用户的画像写入持久化存储"""
     with self.lock:
-      if self.storage_mode == "leveldb":
-        data = json.dumps(self._profile_to_json_data(profile)).encode('utf-8')
-        self.db.put(uid.encode('utf-8'), data)
-        return
-
       self.text_profiles[uid] = self._profile_to_json_data(profile)
       self._flush_text_profiles_unlocked()
 
@@ -478,10 +447,10 @@ class UserProfileServ:
         self._profile_for_log(profile),
       )
       return True
-  
+
   def close(self):
-    if self.db is not None:
-      self.db.close()
+    # 纯 JSON 文件存储，无外部资源需要关闭
+    pass
 
 def get_http_status(resp: BaseResponse):
   status = 200
@@ -584,7 +553,7 @@ class UserServer:
 
   def handle_query_profile(self, request: ProfileRequest) -> BaseResponse:
     logging.info("handle query_profile request=%s", self._request_for_log(request))
-    """查询用户画像（从LevelDB按需读取）"""
+    """查询用户画像（从 JSON 文件存储按需读取）"""
     if request.data is None:
       logging.error("query request without any data")
       return InvalidOrExpiredTokenResp()
@@ -1168,7 +1137,7 @@ class UserServer:
     await runner.setup()
     site = web.TCPSite(runner, self.host, self.port)
     await site.start()
-    logging.info(f"UserServer (LevelDB) started on http://{self.host}:{self.port}")
+    logging.info(f"UserServer (JSON storage) started on http://{self.host}:{self.port}")
     # 保持服务运行
     await asyncio.Event().wait()
 
@@ -1179,4 +1148,4 @@ if __name__ == "__main__":
     asyncio.run(server.start_http())
   except KeyboardInterrupt:
     logging.warning("Shutting down UserServer.")
-    server.close()  # 关闭LevelDB连接
+    server.close()  # 关闭存储资源
