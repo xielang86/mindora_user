@@ -48,6 +48,8 @@ class Profile(BaseModel):
   avatar_base64: Optional[str] = Field("", description="头像的 Base64 内容")
   avatar_mime_type: Optional[str] = Field("image/jpeg", description="头像 MIME 类型")
   weight: Optional[float] = Field(None, description="体重，单位 kg")
+  height: Optional[float] = Field(None, description="身高，单位 cm")
+  language: str = Field("zh-CN", description="语言")
 
 
 # 建议新增：环境与敏感度
@@ -349,6 +351,64 @@ class SleepPlan(BaseModel):
   target_duration_min: Optional[float] = Field(None, description="目标睡眠时长，单位分钟")
   updated_at: Optional[int] = Field(None, description="计划最近更新时间戳（秒级）")
 
+# -------------------------- 首页弹窗 / 站内消息（tanchuang_suvey.md 第一部分） --------------------------
+class PopupState(BaseModel):
+  """单个弹窗在该用户侧的服务端状态（频控 + 埋点统计），按 popup_id 存储"""
+  show_count: int = Field(0, description="曝光次数（report_popup impression 累计）")
+  click_count: int = Field(0, description="点击次数（report_popup click 累计）")
+  last_impression_at: Optional[int] = Field(None, description="最近一次曝光秒级时间戳（用于冷却判断）")
+  dismissed: bool = Field(False, description="用户是否手动关闭过（display_rule.dismiss_stops=true 时不再下发）")
+
+class InboxMessage(BaseModel):
+  """站内消息：popup push_message=true（survey 类恒落）时落地一条，按 popup_id 去重"""
+  message_id: str = Field(..., description="消息唯一 ID")
+  popup_id: str = Field(..., description="来源弹窗 ID（去重键）")
+  title: str = Field(..., description="消息标题")
+  subtitle: str = Field("", description="消息副标题")
+  action_type: str = Field("dismiss", description="点击跳转动作：survey/url/route/dismiss")
+  action_payload: Dict[str, Any] = Field(default_factory=dict, description="跳转参数，与弹窗 action_payload 一致")
+  created_at: int = Field(..., description="落地时间戳（秒级）")
+  read: bool = Field(False, description="是否已读")
+
+# -------------------------- 调查问卷（tanchuang_suvey.md 第二部分） --------------------------
+class SurveyAnswer(BaseModel):
+  """单题作答；未作答的非必答题以空值占位（选择题 option_ids=[]，文本题 text=\"\"）"""
+  question_id: str = Field(..., description="对应题目 ID")
+  type: str = Field(..., description="single_choice/multi_choice/text，与题目 type 一致")
+  option_ids: List[str] = Field(default_factory=list, description="所选选项 ID（单选长度1，多选可多个）")
+  text: str = Field("", description="文本题填写内容")
+
+class GiftDelivery(BaseModel):
+  """问卷礼品收货信息（问卷带 reward.gift_type=physical/virtual 时 submit_survey 必填）"""
+  type: str = Field(..., description="physical（实体寄地址）/ virtual（发邮箱）")
+  address_id: Optional[str] = Field(None, description="客户端本地地址簿 ID，服务端不认识，仅作日志参考")
+  name: Optional[str] = Field(None, description="收件人姓名（physical）")
+  phone: Optional[str] = Field(None, description="收件人电话（physical）")
+  region: Optional[str] = Field(None, description="省市区，可能为空串（physical）")
+  detail: Optional[str] = Field(None, description="详细地址（physical）")
+  email: Optional[str] = Field(None, description="接收邮箱（virtual）")
+
+class SurveySubmission(BaseModel):
+  """一次问卷提交记录；同一 uid+survey_id 幂等，存于 UserProfile.survey_submissions"""
+  submission_id: str = Field(..., description="提交记录 ID")
+  survey_id: str = Field(..., description="问卷 ID")
+  submitted_at: int = Field(..., description="提交时刻秒级时间戳")
+  duration_seconds: Optional[int] = Field(None, description="填写总耗时（秒）")
+  answers: List[SurveyAnswer] = Field(default_factory=list, description="全部题目的作答（与 questions[] 一一对应）")
+  gift_delivery: Optional[GiftDelivery] = Field(None, description="礼品收货信息")
+  reward_granted: bool = Field(True, description="是否已发放奖励（重复提交时为 False）")
+
+# -------------------------- 陪伴足迹（peibanzuji.md） --------------------------
+class FootprintDay(BaseModel):
+  """陪伴足迹单日记录；同一 uid+date 多次上报由服务端幂等合并（布尔取 OR、计数取大、首活跃取小）"""
+  date: str = Field(..., description="自然日 yyyy-MM-dd（按客户端 timezone 归属）")
+  app_active: bool = Field(False, description="当天是否打开过 App")
+  sleep_companion: bool = Field(False, description="当天设备与 App 是否同时有效使用")
+  plan_completed: bool = Field(False, description="当天是否完成睡眠计划节点（里程碑判定用）")
+  app_open_count: int = Field(0, description="当天打开次数（客户端报当天累计值，合并取大）")
+  companion_minutes: int = Field(0, description="当天助眠陪伴分钟数（累计值，合并取大）")
+  first_active_at: Optional[int] = Field(None, description="当天首次活跃秒级时间戳（合并取小）")
+
 class UserProfile(BaseModel):
   """用户画像信息"""
   uid_emb: List[float] = Field(default_factory=list)
@@ -439,6 +499,24 @@ class UserProfile(BaseModel):
 
   profile: Optional[Profile] = None
 
+  # 首页弹窗 / 站内消息 / 调查问卷 / 陪伴足迹（tanchuang_suvey.md, peibanzuji.md）
+  popup_states: Dict[str, PopupState] = Field(
+    default_factory=dict,
+    description="弹窗服务端状态（频控+埋点），按 popup_id",
+  )
+  inbox_messages: List[InboxMessage] = Field(
+    default_factory=list,
+    description="站内消息（弹窗 push_message 落地，按 popup_id 去重）",
+  )
+  survey_submissions: Dict[str, SurveySubmission] = Field(
+    default_factory=dict,
+    description="问卷提交记录，按 survey_id（同一 uid+survey_id 幂等）",
+  )
+  footprint_days: Dict[str, FootprintDay] = Field(
+    default_factory=dict,
+    description="陪伴足迹日记录，按 yyyy-MM-dd",
+  )
+
 
 class ProfileData(BaseModel):
   uid: Optional[str] = Field(None, description="uid, just for debug")
@@ -513,6 +591,105 @@ class AnalysisRequest(BaseModel):
 class AnalysisResponse(BaseResponse):
   request_type: str
   data: Optional[Dict[str, Any]] = None
+
+
+# -------------------------- /popup 请求模型（tanchuang_suvey.md） --------------------------
+class PopupData(BaseModel):
+  uid: Optional[str] = Field(None, description="用户标识（debug 用）")
+  jwt_token: Optional[str] = Field(None, description="当前登录态 JWT")
+  language: str = Field("zh-Hans", description="当前 App 语言，如 zh-Hans / en")
+  timezone: Optional[str] = Field(None, description="IANA 时区标识，供统计/按地区投放参考")
+  app_version: Optional[str] = Field(None, description="客户端版本，用于灰度投放")
+  platform: Optional[str] = Field(None, description="ios / android")
+  placement: str = Field("home", description="展示位，当前固定 home")
+  # report_popup 字段
+  popup_id: Optional[str] = Field(None, description="report_popup 必填，对应下发的弹窗 ID")
+  event: Optional[str] = Field(None, description="report_popup 必填：impression/click/dismiss")
+  event_at: Optional[int] = Field(None, description="事件秒级时间戳，缺省用 timestamp")
+
+class PopupRequest(BaseModel):
+  request_type: str = Field(..., description="query_popups | report_popup")
+  timestamp: int = Field(..., description="请求发送时间戳（秒级）")
+  version: str = Field("1.0")
+  data: PopupData
+
+  @model_validator(mode='after')
+  def validate_data_by_request_type(self):
+    if self.data.jwt_token is None and self.data.uid is None:
+      raise ValueError("uid or jwt_token must be provided")
+    if self.request_type == "report_popup":
+      if not self.data.popup_id:
+        raise ValueError("report_popup 时 data.popup_id 必填")
+      if self.data.event not in ("impression", "click", "dismiss"):
+        raise ValueError("report_popup 时 data.event 必须是 impression/click/dismiss")
+    elif self.request_type != "query_popups":
+      raise ValueError(f"unknown request_type: {self.request_type}")
+    return self
+
+# -------------------------- /survey 请求模型（tanchuang_suvey.md） --------------------------
+class SurveyData(BaseModel):
+  uid: Optional[str] = Field(None, description="用户标识（debug 用）")
+  jwt_token: Optional[str] = Field(None, description="当前登录态 JWT")
+  language: str = Field("zh-Hans", description="当前 App 语言")
+  survey_id: Optional[str] = Field(None, description="问卷 ID，query_survey/submit_survey 必填")
+  answers: List[SurveyAnswer] = Field(default_factory=list, description="submit_survey 必填，须覆盖问卷全部题目")
+  submitted_at: Optional[int] = Field(None, description="提交时刻秒级时间戳，缺省用 timestamp")
+  duration_seconds: Optional[int] = Field(None, description="填写总耗时（秒）")
+  gift_delivery: Optional[GiftDelivery] = Field(None, description="问卷有礼品时必填")
+
+class SurveyRequest(BaseModel):
+  request_type: str = Field(..., description="query_survey | submit_survey")
+  timestamp: int = Field(..., description="请求发送时间戳（秒级）")
+  version: str = Field("1.0")
+  data: SurveyData
+
+  @model_validator(mode='after')
+  def validate_data_by_request_type(self):
+    if self.data.jwt_token is None and self.data.uid is None:
+      raise ValueError("uid or jwt_token must be provided")
+    if not self.data.survey_id:
+      raise ValueError("data.survey_id 必填")
+    if self.request_type == "submit_survey" and not self.data.answers:
+      raise ValueError("submit_survey 时 data.answers 必填且须覆盖全部题目")
+    elif self.request_type not in ("query_survey", "submit_survey"):
+      raise ValueError(f"unknown request_type: {self.request_type}")
+    return self
+
+# -------------------------- /companion_footprint 请求模型（peibanzuji.md） --------------------------
+class FootprintData(BaseModel):
+  uid: Optional[str] = Field(None, description="用户标识（debug 用）")
+  jwt_token: Optional[str] = Field(None, description="当前登录态 JWT")
+  timezone: str = Field("UTC", description="IANA 时区标识；自然日归属以该时区计算")
+  # upload_footprint 字段
+  days: List[FootprintDay] = Field(default_factory=list, description="upload_footprint 必填，可按自然日批量补传")
+  # query_footprint 字段
+  scope: Optional[str] = Field(None, description="query_footprint 必填：month（单月）/ year（全年）")
+  year: Optional[int] = Field(None, description="query_footprint 必填，目标年份")
+  month: Optional[int] = Field(None, description="scope=month 必填，目标月份 1-12")
+
+class FootprintRequest(BaseModel):
+  request_type: str = Field(..., description="upload_footprint | query_footprint")
+  timestamp: int = Field(..., description="请求发送时间戳（秒级）")
+  version: str = Field("1.0")
+  data: FootprintData
+
+  @model_validator(mode='after')
+  def validate_data_by_request_type(self):
+    if self.data.jwt_token is None and self.data.uid is None:
+      raise ValueError("uid or jwt_token must be provided")
+    if self.request_type == "upload_footprint":
+      if not self.data.days:
+        raise ValueError("upload_footprint 时 data.days 必填且非空")
+    elif self.request_type == "query_footprint":
+      if self.data.scope not in ("month", "year"):
+        raise ValueError("query_footprint 时 data.scope 必须是 month/year")
+      if self.data.year is None:
+        raise ValueError("query_footprint 时 data.year 必填")
+      if self.data.scope == "month" and not (1 <= (self.data.month or 0) <= 12):
+        raise ValueError("scope=month 时 data.month 必填且为 1-12")
+    else:
+      raise ValueError(f"unknown request_type: {self.request_type}")
+    return self
 
 
 if __name__ == "__main__":

@@ -16,6 +16,9 @@ class Config:
   DB_PATH = "data/userprofile_level_db"
   USER_PROFILE_STORAGE_MODE = "leveldb"  # "leveldb" | "txt_json"
   USER_PROFILE_JSON_PATH = "data/user_profiles.txt"
+  # 弹窗/问卷运营配置（JSON，运营后台线上写入；user_server 按 mtime 检查更新，
+  # 可用 POPUP_SURVEY_CONFIG_PATH 环境变量覆盖为绝对路径）
+  POPUP_SURVEY_CONFIG_PATH = "data/popup_survey_config.json"
   MaxServerConcurrent = 32
   Mode = 0
   RemoteHost="http://121.43.54.25:9001"
