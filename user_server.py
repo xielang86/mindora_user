@@ -19,8 +19,9 @@ from user_profile import (
   UserProfile, ProfileRequest, ProfileResponse, ProfileData,
   InvalidOrExpiredTokenResp, InvalidReqFormatResp, BaseResponse,
   AnalysisRequest, AnalysisResponse,
-  SleepAdviceRequest, SleepAdviceResponse, SleepAdviceResult,
-  SleepInsightReport, compute_recent_sleep_stats,
+  SleepInsightReport, AnalysisTextReport,
+  ANALYSIS_REPORT_KEYS, ANALYSIS_REPORT_RETENTION,
+  compute_recent_sleep_stats,
 )
 from auth import AuthRequest
 from uid.uuid import get_or_create_uuid
@@ -484,39 +485,63 @@ class UserProfileServ:
       report.intervention.visible = False
     return report
 
-  def calc_analysis_cache(self, uid: str, profile: UserProfile, language: str = "en") -> dict:
-    """Pre-generate LLM text for default analysis views and return a cache dict.
+  @staticmethod
+  def _analysis_specs_for_today() -> list:
+    """5 个分析能力的当前周期定义：(request_type, start_date, end_date, date, modules)。
 
-    Only default date ranges are cached (today for day/overview/explore,
-    last 7 days for week, last 30 days for month). If a cached entry is still
-    fresh (< 7 days) it is reused instead of calling the LLM again.
+    日级能力 start_date/end_date 为 None、date=今日；周/月带起止日期。
     """
-    if not self.llm or not self.llm.enabled:
-      return profile.sleep_analysis.get("analysis_cache", {}) if profile.sleep_analysis else {}
-
     today = datetime.date.today()
     today_str = today.isoformat()
     week_start = (today - datetime.timedelta(days=6)).isoformat()
     month_start = (today - datetime.timedelta(days=29)).isoformat()
-
-    analysis_specs = [
-      ("analysis_overview", today_str, None, today_str, []),
-      ("analysis_sleep_day", today_str, None, today_str, []),
-      ("analysis_sleep_week", week_start, today_str, today_str, []),
-      ("analysis_sleep_month", month_start, today_str, today_str, []),
-      ("analysis_explore", today_str, None, today_str, [
+    return [
+      ("analysis_overview", None, None, today_str, []),
+      ("analysis_sleep_day", None, None, today_str, []),
+      ("analysis_explore", None, None, today_str, [
         "header_summary", "score_summary", "onset_efficiency",
         "sleep_structure", "night_fluctuation", "scene_preference", "sleep_advice",
       ]),
+      ("analysis_sleep_week", week_start, today_str, today_str, []),
+      ("analysis_sleep_month", month_start, today_str, today_str, []),
     ]
 
-    cache = (profile.sleep_analysis.get("analysis_cache") or {}).copy()
-    now = int(time.time())
+  @staticmethod
+  def _upsert_analysis_report(reports: list, report: AnalysisTextReport, retention: int) -> list:
+    """按周期 upsert（同周期替换），按日期排序并裁剪到保留条数。"""
+    def same_period(r: AnalysisTextReport) -> bool:
+      if report.start_date is not None:
+        return r.start_date == report.start_date and r.end_date == report.end_date
+      return r.date == report.date and r.start_date is None
 
-    for request_type, start_date, end_date, date, modules in analysis_specs:
-      cache_key = f"{request_type}:{date}:{language}"
-      cached = cache.get(cache_key)
-      if cached and cached.get("generated_at") and now - cached["generated_at"] < 7 * 86400:
+    kept = [r for r in reports if not same_period(r)]
+    kept.append(report)
+    kept.sort(key=lambda r: (r.end_date or r.date, r.generated_at))
+    return kept[-retention:]
+
+  def calc_analysis_reports(self, uid: str, profile: UserProfile, language: str = "en") -> Optional[dict]:
+    """异步生成 5 个分析能力的当前周期文案报告，返回更新后的 analysis_reports。
+
+    在 update_profile 的后台 LLM 更新中调用；/analysis 请求时只读库。
+    当前周期已有报告则复用（每周期每能力至多一次 LLM 调用）。
+    LLM 不可用或全部失败时返回 None（调用方保留旧数据）。
+    """
+    if not self.llm or not self.llm.enabled:
+      return None
+
+    existing = profile.analysis_reports or {}
+    reports: dict = {key: list(existing.get(key) or []) for key in ANALYSIS_REPORT_KEYS}
+    now = int(time.time())
+    changed = False
+
+    for request_type, start_date, end_date, date, modules in self._analysis_specs_for_today():
+      # 当前周期已有报告 → 复用，不重复调 LLM
+      def _is_current(r: AnalysisTextReport) -> bool:
+        if start_date is not None:
+          return r.start_date == start_date and r.end_date == end_date
+        return r.date == date and r.start_date is None
+
+      if any(_is_current(r) for r in reports[request_type]):
         continue
 
       class _FakeData:
@@ -533,21 +558,75 @@ class UserProfileServ:
       try:
         llm_result = self.llm.generate_sync(request_type, ctx, language, modules)
       except Exception as e:
-        logging.error(f"analysis cache generation failed for {request_type}: {e}")
+        logging.error(f"analysis report generation failed for {request_type}: {e}")
         continue
 
-      if llm_result:
-        cache[cache_key] = {
-          "data": llm_result,
-          "date": date,
-          "start_date": start_date,
-          "end_date": end_date,
-          "language": language,
-          "modules": modules,
-          "generated_at": now,
-        }
+      if not llm_result:
+        continue
 
-    return cache
+      report = AnalysisTextReport(
+        request_type=request_type,
+        date=date,
+        start_date=start_date,
+        end_date=end_date,
+        language=language,
+        generated_at=now,
+        llm_used=True,
+        modules=llm_result,
+      )
+      reports[request_type] = self._upsert_analysis_report(
+        reports[request_type], report, ANALYSIS_REPORT_RETENTION[request_type],
+      )
+      changed = True
+
+    return reports if changed else None
+
+  @staticmethod
+  def _find_analysis_report(
+    profile: Optional[UserProfile],
+    request_type: str,
+    date: Optional[str],
+    start_date: Optional[str],
+    end_date: Optional[str],
+  ) -> Optional[AnalysisTextReport]:
+    """按周期精确查找库存报告；未命中时，若最新一条仍属当前周期则回退到它。"""
+    if not profile or not profile.analysis_reports:
+      return None
+    reports = profile.analysis_reports.get(request_type) or []
+    if not reports:
+      return None
+
+    for r in reversed(reports):
+      if start_date is not None or end_date is not None:
+        if r.start_date == start_date and r.end_date == end_date:
+          return r
+      elif date is not None and r.date == date and r.start_date is None:
+        return r
+
+    # 回退：请求的是当前周期（与生成时口径一致），直接用最新一条
+    current = {rt: (s, e, d) for rt, s, e, d, _m in UserProfileServ._analysis_specs_for_today()}
+    if request_type in current:
+      c_start, c_end, c_date = current[request_type]
+      is_current_period = (
+        (start_date is not None and start_date == c_start and end_date == c_end)
+        or (start_date is None and end_date is None and (date is None or date == c_date))
+      )
+      if is_current_period:
+        return reports[-1]
+    return None
+
+  @staticmethod
+  def _visible_insight_dict(profile: Optional[UserProfile]) -> Optional[dict]:
+    """返回过滤掉 visible=False 模块后的 6 模块洞察报告 dict；无报告返回 None。"""
+    report = profile.sleep_insight if profile else None
+    if report is None:
+      return None
+    data = report.model_dump(mode="json")
+    for key, _mid in UserProfileServ._INSIGHT_MODULE_KEYS:
+      module = data.get(key)
+      if isinstance(module, dict) and module.get("visible") is False:
+        data.pop(key)
+    return data
 
   def _apply_basic_update(self, uid: str, new_profile: UserProfile, profile: Optional[UserProfile]) -> UserProfile:
     """Apply non-LLM profile updates. Must be called while holding self.lock.
@@ -597,7 +676,9 @@ class UserProfileServ:
       sleep_insight = self.calc_sleep_insight(uid, profile)
       if sleep_insight:
         profile.sleep_insight = sleep_insight
-      profile.sleep_analysis["analysis_cache"] = self.calc_analysis_cache(uid, profile)
+      analysis_reports = self.calc_analysis_reports(uid, profile)
+      if analysis_reports is not None:
+        profile.analysis_reports = analysis_reports
 
   def update_profile(
     self,
@@ -686,10 +767,10 @@ class UserProfileServ:
 
     if skip_sleep_analysis_update:
       sleep_insight = None
-      analysis_cache = None
+      analysis_reports = None
     else:
       sleep_insight = self.calc_sleep_insight(uid, llm_profile)
-      analysis_cache = self.calc_analysis_cache(uid, llm_profile)
+      analysis_reports = self.calc_analysis_reports(uid, llm_profile)
 
     with self.lock:
       profile = self.get_profile(uid)
@@ -705,8 +786,8 @@ class UserProfileServ:
         profile.standard_sop_reco = self.calc_standard_sop_reco(uid, profile, old_profile)
       if sleep_insight:
         profile.sleep_insight = sleep_insight
-      if analysis_cache is not None:
-        profile.sleep_analysis["analysis_cache"] = analysis_cache
+      if analysis_reports is not None:
+        profile.analysis_reports = analysis_reports
       self.save_profile(uid, profile)
       logging.info("Profile llm updated uid=%s", uid)
       return True
@@ -794,7 +875,6 @@ class UserServer:
     self.app.router.add_post('/user_profile', self.handle_profile_request_http)
     self.app.router.add_post('/login', self.handle_login_http)
     self.app.router.add_post('/analysis', self.handle_analysis_http)
-    self.app.router.add_post('/sleep_advice', self.handle_sleep_advice_http)
 
   def _check_token(self, jwt_token: str)-> dict | None:
     try:
@@ -1032,38 +1112,8 @@ class UserServer:
               response_obj.msg = f"{response_obj.msg}, remote sync failed"
         return web.json_response(response_obj.model_dump(), status=get_http_status(response_obj))
 
-      elif req.request_type in ["analysis_overview", "insight", "daily_report", "weekly_report", "month_report"]:
-        uid = self._parse_for_uid(req.data)
-        if not uid:
-          return web.json_response(InvalidOrExpiredTokenResp().model_dump(), status=401)
-
-        profile = self.user_serv.get_profile(uid)
-        if not profile:
-          return web.json_response(ProfileResponse(code=404, msg="Profile not found").model_dump(), status=404)
-
-        # Handle different request types
-        response_data = {}
-        if req.request_type == "analysis_overview":
-          response_data = {
-            "overall_score": self.get_overall_score(profile),
-            "weekly_best": profile.sleep_analysis.get("weekly_best"),
-            "sleep_insight": profile.sleep_analysis.get("sleep_insight")
-          }
-        elif req.request_type == "insight":
-          response_data = {"insight": profile.long_term_profile}
-        elif req.request_type == "daily_report":
-          response_data = {"daily": profile.sleep_data[-1] if profile.sleep_data else None}
-        elif req.request_type == "weekly_report":
-          response_data = {"weekly": profile.sleep_data[-7:]}
-        elif req.request_type == "month_report":
-          response_data = {"monthly": profile.sleep_data[-30:]}
-
-        # Filter response based on modules
-        if req.modules:
-          response_data = {key: value for key, value in response_data.items() if key in req.modules}
-
-        return web.json_response(ProfileResponse(code=0, msg="success", request_type=req.request_type, data=response_data).model_dump())
-
+      # client_request.md：/user_profile 只承载 query_profile / update_profile，
+      # 分析类请求统一走 /analysis，洞察报告由 analysis_explore 出口
       else:
         return web.json_response(InvalidReqFormatResp().model_dump(), status=400)
 
@@ -1089,22 +1139,17 @@ class UserServer:
       profile = self.user_serv.get_profile(uid)
       response_data = self._build_analysis_data(req, profile)
 
-      if self.llm.enabled:
-        d = req.data
-        today_str = datetime.date.today().isoformat()
-        anchor_date = d.end_date or d.date or today_str
-        cache_key = f"{req.request_type}:{anchor_date}:{d.language or 'en'}"
-        cached = (profile.sleep_analysis or {}).get("analysis_cache", {}).get(cache_key) if profile else None
-        now = int(time.time())
-
-        if cached and cached.get("generated_at") and now - cached["generated_at"] < 7 * 86400:
-          logging.info(f"analysis cache hit for uid={uid} key={cache_key}")
-          deep_merge(response_data, cached["data"])
-        else:
-          ctx = extract_sleep_context(profile, req.data)
-          llm_text = await self.llm.generate(req.request_type, ctx, req.data.language, req.data.modules)
-          if llm_text:
-            deep_merge(response_data, llm_text)
+      # LLM 文案全部来自 update_profile 时异步生成、按日/周/月序列存储的报告，
+      # 请求时纯查库，不再同步调用 LLM；未命中则只回数值骨架（文案为空/默认）
+      report = UserProfileServ._find_analysis_report(
+        profile, req.request_type, req.data.date, req.data.start_date, req.data.end_date,
+      )
+      if report:
+        # 只合并客户端请求的模块，保持 modules 分字段查询语义不被库存报告击穿
+        updates = report.modules
+        if req.data.modules:
+          updates = {k: v for k, v in updates.items() if k in req.data.modules}
+        deep_merge(response_data, updates)
 
       resp = AnalysisResponse(code=0, msg="success", request_type=req.request_type, data=response_data)
       return web.json_response(resp.model_dump())
@@ -1115,89 +1160,6 @@ class UserServer:
     except Exception as e:
       logging.error(f"analysis error: {e}")
       return web.json_response(BaseResponse(code=500, msg="Internal server error").model_dump(), status=500)
-
-  # -------------------- /sleep_advice endpoint --------------------
-
-  _DEFAULT_ADVICE_ANALYSIS = (
-    "Your sleep data shows a balanced pattern overall. "
-    "Deep sleep and REM stages are within a healthy range, "
-    "supporting physical recovery and cognitive function."
-  )
-  _DEFAULT_ADVICE_BULLETS = [
-    "Try to maintain a consistent bedtime to reinforce your circadian rhythm.",
-    "Limit screen exposure at least 30 minutes before bed.",
-    "Consider a light breathing exercise or Mindora scene before sleeping.",
-  ]
-  _DEFAULT_ADVICE_HIGHLIGHTS = {
-    "onset": "Sleep onset appears normal.",
-    "deep": "Deep sleep ratio is within the healthy range.",
-    "rem": "REM activity supports memory consolidation.",
-    "rhythm": "Sleep continuity is stable.",
-  }
-
-  async def handle_sleep_advice_http(self, request: web.Request) -> web.Response:
-    """POST /sleep_advice — generate sleep advice on demand via LLM.
-
-    Advice is no longer persisted in the profile (sleep_analysis 只保留统计与缓存);
-    each request generates fresh text, falling back to static defaults when the
-    LLM is disabled or fails.
-    """
-    try:
-      body = await request.json()
-      req = SleepAdviceRequest.model_validate(body)
-
-      uid = self._parse_for_uid(req.data)
-      if uid is None:
-        return web.json_response(InvalidOrExpiredTokenResp().model_dump(), status=401)
-      if isinstance(uid, BaseResponse):
-        return web.json_response(uid.model_dump(), status=uid.code)
-
-      profile = self.user_serv.get_profile(uid)
-      date = req.data.date or datetime.date.today().isoformat()
-      language = req.data.language or "en"
-
-      # --- on-demand LLM generation --------------------------------------------
-      result = None
-      if profile and self.llm.enabled:
-        ctx = extract_sleep_context(profile, req.data)
-        ctx["focus"] = req.data.focus
-        llm_result = await self.llm.generate("sleep_analysis_advice", ctx, language, req.data.focus)
-        if llm_result:
-          result = SleepAdviceResult(
-            analysis=llm_result.get("analysis", self._DEFAULT_ADVICE_ANALYSIS),
-            advice=llm_result.get("advice", list(self._DEFAULT_ADVICE_BULLETS)),
-            highlights=llm_result.get("highlights", dict(self._DEFAULT_ADVICE_HIGHLIGHTS)),
-            date=date,
-            language=language,
-            llm_used=True,
-          )
-
-      if result is None:
-        # Fallback: static defaults when LLM is disabled or fails
-        result = SleepAdviceResult(
-          analysis=self._DEFAULT_ADVICE_ANALYSIS,
-          advice=list(self._DEFAULT_ADVICE_BULLETS),
-          highlights=dict(self._DEFAULT_ADVICE_HIGHLIGHTS),
-          date=date,
-          language=language,
-          llm_used=False,
-        )
-
-      resp = SleepAdviceResponse(
-        code=0, msg="success",
-        request_type="sleep_analysis_advice",
-        data=result,
-      )
-      return web.json_response(resp.model_dump())
-
-    except ValidationError as e:
-      logging.error(f"sleep_advice validation error: {e}")
-      return web.json_response(InvalidReqFormatResp().model_dump(), status=400)
-    except Exception as e:
-      logging.error(f"sleep_advice error: {e}")
-      return web.json_response(
-        BaseResponse(code=500, msg="Internal server error").model_dump(), status=500
-      )
 
   def _build_analysis_data(self, req: AnalysisRequest, profile: Optional[UserProfile]) -> dict:
     d = req.data
@@ -1435,6 +1397,9 @@ class UserServer:
         "description": "Keep your current bedtime and continue using the same wind-down scene for the next few nights.",
         "date": date,
       },
+      # 洞察页 6 模块报告（mindora_advice.md 模块0-5，update_profile 时异步生成，
+      # 已过滤 visible=False 模块；无报告则为 None）。/analysis 是其唯一客户端出口。
+      "insight": UserProfileServ._visible_insight_dict(profile),
     }
     return self._filter_modules(result, d.modules)
 
@@ -1443,8 +1408,8 @@ class UserServer:
       data = await request.json()
       request = AuthRequest.model_validate(data)
       response_obj = self.handle_login(request)
-    except (json.JSONDecodeError, TypeError, KeyError) as e:
-      logging.error(f"login error: {e}, request={request}")
+    except (json.JSONDecodeError, TypeError, KeyError, ValidationError) as e:
+      logging.error(f"login error: {e}")
       response_obj = InvalidReqFormatResp()
 
     logging.info(f"login resp: {response_obj}")

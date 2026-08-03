@@ -36,11 +36,6 @@ from user_profile import compute_recent_sleep_stats
 
 
 _PROFILE_JSON_MAX_CHARS = 12000
-_KNOWLEDGE_BASE_PATH = os.path.join(
-    os.path.dirname(__file__),
-    "db",
-    "knowledge_base.md",
-)
 
 
 # ──────────────────────────────────────────────────────────────
@@ -77,7 +72,6 @@ def extract_sleep_context(profile, data) -> dict:
     ctx["scene_title"]       = (sleep_analysis.get("scene") or {}).get("title", "")
     ctx["scene_text"]        = (sleep_analysis.get("scene") or {}).get("text", "")
 
-    ctx["sleep_knowledge"] = _load_sleep_knowledge()
 
     return ctx
 
@@ -143,17 +137,6 @@ def _summarize_profile_for_prompt(profile) -> str:
     }
 
     return json.dumps(data, ensure_ascii=False, indent=2)
-
-
-@lru_cache(maxsize=1)
-def _load_sleep_knowledge() -> str:
-    try:
-        with open(_KNOWLEDGE_BASE_PATH, "r", encoding="utf-8") as f:
-            text = f.read().strip()
-            return _truncate_text(text, 5000)
-    except Exception as e:
-        logging.warning("failed to load sleep knowledge base: %s", e)
-        return ""
 
 
 def deep_merge(base: dict, updates: dict) -> None:
@@ -282,75 +265,6 @@ Return JSON with exactly these keys:
   }},
   "onset_efficiency": {{
     "description": "<1 sentence about the best-performing scene(s)>"
-  }}
-}}"""
-
-
-def _prompt_sleep_advice(ctx: dict) -> str:
-    """Prompt for the /sleep_advice endpoint.
-
-    Uses locally aggregated sleep statistics plus the ``sleep_analysis`` fields
-    stored in the user profile.  Raw sleep sequences and behavior history are
-    intentionally omitted; only the most recently used Mindora scene title is
-    included.
-    """
-    focus = ctx.get("focus") or []
-    focus_hint = ""
-    if focus:
-        focus_hint = f"\nFocus especially on: {', '.join(focus)}."
-
-    knowledge = ctx.get("sleep_knowledge", "")
-    knowledge_block = f"\nMindora sleep recommendation knowledge base:\n{knowledge}\n" if knowledge else ""
-
-    def _fmt(value, suffix=""):
-        if value is None:
-            return "—"
-        if isinstance(value, float):
-            return f"{value:g}{suffix}"
-        return f"{value}{suffix}"
-
-    return f"""{_lang_instruction(ctx.get('language', 'en'))}
-
-Recent 7-day sleep statistics (aggregated locally):
-- Records used: {ctx.get('record_count', '—')}
-- Average sleep quality: {_fmt(ctx.get('avg_sleep_quality'))} / 100
-- Average sleep-onset latency: {_fmt(ctx.get('avg_onset_min'), ' min')}
-- Typical first sleep time: {ctx.get('typical_first_sleep_time', '—')}
-- Average time in bed: {_fmt(ctx.get('avg_time_in_bed_min'), ' min')}
-- Deep sleep: {_fmt(ctx.get('avg_deep_min'), ' min')} ({_fmt(ctx.get('avg_deep_pct'), '%')})
-- REM sleep: {_fmt(ctx.get('avg_rem_min'), ' min')} ({_fmt(ctx.get('avg_rem_pct'), '%')})
-- Core sleep: {_fmt(ctx.get('avg_core_min'), ' min')} ({_fmt(ctx.get('avg_core_pct'), '%')})
-- Night awakenings: {_fmt(ctx.get('avg_awake_count'))} × {_fmt(ctx.get('avg_awake_min'), ' min')}
-- Pre-sleep HR: {_fmt(ctx.get('avg_hr_before_sleep'), ' bpm')}   RR: {_fmt(ctx.get('avg_rr_before_sleep'), ' brpm')}
-- Average HR: {_fmt(ctx.get('avg_heart_rate'), ' bpm')}   HRV: {_fmt(ctx.get('avg_hrv'))}
-- Most recently used scene: {ctx.get('recent_scene_title', '—')}
-
-Sleep analysis context from the user profile:
-- Weekly trend: {ctx.get('sleep_trend_week', '—')}
-- Monthly trend: {ctx.get('sleep_trend_month', '—')}
-- Scene insight: {ctx.get('scene_text', '—')}
-{focus_hint}
-{knowledge_block}
-Your task:
-1. Use the 7-day sleep statistics and the profile sleep-analysis context to infer the user's likely sleep issues and preferences.
-2. Ground your recommendations in the Mindora sleep recommendation knowledge base when relevant.
-3. Write a brief sleep analysis (2–4 sentences), warm, concrete, and personalized.
-4. Provide 2–4 personalised, actionable advice bullets based on the data.
-5. For each relevant pillar, give a one-line highlight.
-6. Do not mention missing fields, raw sequences, or that you used a knowledge base.
-
-Return ONLY a JSON object (no markdown, no explanation):
-{{
-  "analysis": "<2–4 sentence analysis paragraph>",
-  "advice": [
-    "<actionable bullet 1>",
-    "<actionable bullet 2>"
-  ],
-  "highlights": {{
-    "onset": "<one-liner about onset quality>",
-    "deep": "<one-liner about deep sleep>",
-    "rem": "<one-liner about REM sleep>",
-    "rhythm": "<one-liner about sleep regularity / awakenings>"
   }}
 }}"""
 
@@ -601,7 +515,6 @@ class SleepAnalysisLLM:
             "analysis_sleep_week":     lambda: _prompt_sleep_week(ctx),
             "analysis_sleep_month":    lambda: _prompt_sleep_month(ctx),
             "analysis_explore":        lambda: _prompt_explore(ctx, modules),
-            "sleep_analysis_advice":   lambda: _prompt_sleep_advice(ctx),
             "sleep_insight_report":    lambda: _prompt_sleep_insight(ctx),
         }.get(request_type)
 
@@ -635,7 +548,6 @@ class SleepAnalysisLLM:
             "analysis_sleep_week":     lambda: _prompt_sleep_week(ctx),
             "analysis_sleep_month":    lambda: _prompt_sleep_month(ctx),
             "analysis_explore":        lambda: _prompt_explore(ctx, modules),
-            "sleep_analysis_advice":   lambda: _prompt_sleep_advice(ctx),
             "sleep_insight_report":    lambda: _prompt_sleep_insight(ctx),
         }.get(request_type)
 

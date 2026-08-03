@@ -313,6 +313,35 @@ class SleepInsightReport(BaseModel):
     description="模块5｜轻量睡眠知识提示（Micro Education，可选）",
   )
 
+# -------------------------- /analysis 文案报告（LLM 异步生成，按周期序列存储） --------------------------
+class AnalysisTextReport(BaseModel):
+  """单个周期（日/周/月）的 /analysis 文案报告。
+
+  只在 update_profile 的后台 LLM 更新中生成；/analysis 请求时纯查库，
+  不再同步调用 LLM。modules 结构与《服务端分析接口.md》响应一致。
+  """
+  request_type: str = Field(..., description="analysis_overview/analysis_sleep_day/analysis_explore/analysis_sleep_week/analysis_sleep_month")
+  date: str = Field(..., description="日级: 当日 yyyy-MM-dd；周/月: end_date")
+  start_date: Optional[str] = Field(None, description="周/月统计起始日期")
+  end_date: Optional[str] = Field(None, description="周/月统计结束日期")
+  language: str = Field("en", description="文案语言代码")
+  generated_at: int = Field(..., description="生成时间戳（秒级）")
+  llm_used: bool = Field(True, description="False 代表 LLM 未参与/生成失败")
+  modules: Dict[str, Any] = Field(default_factory=dict, description="接口文档响应结构的模块字典")
+
+# 各类报告的保留条数：日级 30（与 sleep_data 同序列长度）、周 10、月 12
+ANALYSIS_REPORT_KEYS = (
+  "analysis_overview", "analysis_sleep_day", "analysis_explore",
+  "analysis_sleep_week", "analysis_sleep_month",
+)
+ANALYSIS_REPORT_RETENTION = {
+  "analysis_overview": 30,
+  "analysis_sleep_day": 30,
+  "analysis_explore": 30,
+  "analysis_sleep_week": 10,
+  "analysis_sleep_month": 12,
+}
+
 class SleepPlan(BaseModel):
   """睡眠计划：设备端制定的睡眠目标（用于周/月数据的目标达成率）"""
   target_bed_time: Optional[str] = Field(None, description="目标入睡/卧床时间, 23:30")
@@ -331,6 +360,12 @@ class UserProfile(BaseModel):
 
   # 洞察页 6 模块 LLM 分析结果（mindora_advice.md 模块0-5）
   sleep_insight: Optional[SleepInsightReport] = Field(None, description="洞察页6模块睡眠分析结果")
+
+  # /analysis 文案报告序列（LLM 异步生成；日级保留30、周10、月12，见 ANALYSIS_REPORT_RETENTION）
+  analysis_reports: Dict[str, List[AnalysisTextReport]] = Field(
+    default_factory=lambda: {key: [] for key in ANALYSIS_REPORT_KEYS},
+    description="按 request_type 分组的分析文案报告序列",
+  )
 
   # 新增：存储推荐的助眠候选方案
   sleep_scenarios_reco: Optional[List[SleepScenario]] = Field(default_factory=list, description="推荐的候选助眠流程列表")
@@ -386,7 +421,6 @@ class UserProfile(BaseModel):
       "most_used_scene": None,
       "most_used_scene_7d": None,
       "best_sleep_quality_scene_7d": None,
-      "analysis_cache": {},
     }
   )
 
@@ -421,11 +455,10 @@ class ProfileData(BaseModel):
 
 
 class ProfileRequest(BaseModel):
-  request_type: str = Field("query_profile", description="query| update| analysis_overview| insight| daily_report| weekly_report| month_report")
+  request_type: str = Field("query_profile", description="query_profile | update_profile（client_request.md 契约）")
   timestamp: int = Field(..., description="请求发送时间戳（秒级），必填")
   version: str = Field("1.0", description="version, needed, such as 1.0")
   data: ProfileData
-  modules: Optional[List[str]] = Field(default_factory=list, description="Modules to include in the response")
 
   @model_validator(mode='after')
   def validate_data_by_request_type(self):
@@ -442,8 +475,8 @@ class ProfileRequest(BaseModel):
 
 # --- 响应类 ---
 class ProfileResponse(BaseResponse):
-  request_type: str = Field("query_profile", description="query| update| analysis_overview| insight| daily_report| weekly_report| month_report")
-  data: Optional[Dict[str, Any]] = Field(None, description="Response data based on modules")
+  request_type: str = Field("query_profile", description="query_profile | update_profile（client_request.md 契约）")
+  data: Optional[Dict[str, Any]] = Field(None, description="Response data")
 
 
 class InvalidOrExpiredTokenResp(BaseResponse):
@@ -480,62 +513,6 @@ class AnalysisRequest(BaseModel):
 class AnalysisResponse(BaseResponse):
   request_type: str
   data: Optional[Dict[str, Any]] = None
-
-
-# -------------------------- 睡眠分析与建议接口 --------------------------
-class SleepAdviceData(BaseModel):
-  """Payload for /sleep_advice requests."""
-  uid: Optional[str] = Field(None, description="用户ID（debug/内网使用）")
-  jwt_token: Optional[str] = Field(None, description="JWT token")
-  language: str = Field("en", description="返回语言, e.g. zh-Hans / en / ja")
-  date: Optional[str] = Field(None, description="目标日期 yyyy-MM-dd，默认最近一晚")
-  timezone: str = Field("UTC", description="时区 ID, 如 Asia/Shanghai")
-  # Optional thematic focus, e.g. ["deep_sleep", "onset"]; empty = full
-  focus: List[str] = Field(default_factory=list, description="希望重点关注的维度")
-
-
-class SleepAdviceRequest(BaseModel):
-  """Request wrapper for the sleep-analysis-and-advice endpoint.
-
-  The server uses the user's recent sleep_data + mindora_record to produce:
-    * a free-form analysis paragraph (2-4 sentences)
-    * a short list of personalised, actionable advice bullets
-    * optional structured highlights (one-liner per pillar)
-  """
-  request_type: str = Field("sleep_analysis_advice",
-                            description="必须为 sleep_analysis_advice")
-  version: str = Field("1.0")
-  timestamp: int = Field(..., description="请求时间戳（秒级）")
-  data: SleepAdviceData
-
-  @model_validator(mode='after')
-  def validate_auth(self):
-    if self.data.jwt_token is None and self.data.uid is None:
-      raise ValueError("uid or jwt_token must be provided")
-    if self.request_type != "sleep_analysis_advice":
-      raise ValueError(
-        f"request_type must be 'sleep_analysis_advice', got '{self.request_type}'"
-      )
-    return self
-
-
-class SleepAdviceResult(BaseModel):
-  """Structured LLM output for sleep analysis + advice."""
-  analysis: str = Field("", description="LLM 生成的整体睡眠分析段落")
-  advice: List[str] = Field(default_factory=list,
-                            description="个性化、可执行的建议要点")
-  highlights: Dict[str, str] = Field(
-    default_factory=dict,
-    description="按维度给出的一句话亮点, e.g. {'onset': '...', 'deep': '...'}"
-  )
-  date: Optional[str] = Field(None, description="分析对应的日期 yyyy-MM-dd")
-  language: str = Field("en", description="回显请求的语言代码")
-  llm_used: bool = Field(True, description="False 代表回退到默认文案")
-
-
-class SleepAdviceResponse(BaseResponse):
-  request_type: str = Field("sleep_analysis_advice")
-  data: Optional[SleepAdviceResult] = None
 
 
 if __name__ == "__main__":

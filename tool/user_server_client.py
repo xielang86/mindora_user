@@ -159,26 +159,6 @@ class UserServerClient:
       },
     )
 
-  def sleep_advice(
-    self,
-    date: str | None = None,
-    focus: list[str] | None = None,
-    language: str | None = None,
-  ) -> dict[str, Any]:
-    payload = {
-      "request_type": "sleep_analysis_advice",
-      "timestamp": int(time.time()),
-      "version": "1.0",
-      "data": {
-        **self._auth_data(),
-        "date": date or self.today(),
-        "language": language or self.language,
-        "timezone": self.timezone,
-        "focus": focus or [],
-      },
-    }
-    return self._post("/sleep_advice", payload)
-
   def run_all(self) -> dict[str, dict[str, Any]]:
     results: dict[str, dict[str, Any]] = {}
     if self.jwt_token:
@@ -191,7 +171,6 @@ class UserServerClient:
     results["analysis_sleep_week"] = self.analysis_sleep_week()
     results["analysis_sleep_month"] = self.analysis_sleep_month()
     results["analysis_explore"] = self.analysis_explore()
-    results["sleep_analysis_advice"] = self.sleep_advice()
     return results
 
   def _analysis_request(self, request_type: str, extra_data: dict[str, Any]) -> dict[str, Any]:
@@ -271,7 +250,6 @@ def build_parser() -> argparse.ArgumentParser:
       "analysis_sleep_week",
       "analysis_sleep_month",
       "analysis_explore",
-      "sleep_advice",
     ],
   )
   parser.add_argument("--base-url", default=DEFAULT_BASE_URL)
@@ -323,8 +301,6 @@ def main():
     result = client.analysis_sleep_month(start_date=args.start_date, end_date=args.end_date, modules=args.modules)
   elif args.action == "analysis_explore":
     result = client.analysis_explore(date=args.date, modules=args.modules)
-  else:
-    result = client.sleep_advice(date=args.date, focus=args.focus, language=args.language)
 
   print_result(args.action, result)
 

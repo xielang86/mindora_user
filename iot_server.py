@@ -161,13 +161,11 @@ def build_user_server_info():
                 "login": f"{base_url}/login",
                 "user_profile": f"{base_url}/user_profile",
                 "analysis": f"{base_url}/analysis",
-                "sleep_advice": f"{base_url}/sleep_advice",
             },
             "local_routes": {
                 "login": f"{local_base_url}/login",
                 "user_profile": f"{local_base_url}/user_profile",
                 "analysis": f"{local_base_url}/analysis",
-                "sleep_advice": f"{local_base_url}/sleep_advice",
             },
         },
     }
@@ -489,7 +487,6 @@ def register_mdns_sync():
             b"user_server_port": str(USER_SERVER_PORT).encode("utf-8"),
             b"user_profile_path": b"/user_profile",
             b"analysis_path": b"/analysis",
-            b"sleep_advice_path": b"/sleep_advice",
         },
     )
 
