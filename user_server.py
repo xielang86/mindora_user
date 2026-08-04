@@ -20,8 +20,6 @@ from common.jwt_keys import verify_token
 from user_profile import (
   UserProfile, ProfileRequest, ProfileResponse, ProfileData,
   InvalidOrExpiredTokenResp, InvalidReqFormatResp, BaseResponse,
-  AnalysisRequest, AnalysisResponse,
-  SleepAdviceRequest, SleepAdviceResponse, SleepAdviceResult,
 )
 from auth import AuthRequest
 from uid.uuid import get_or_create_uuid
@@ -377,26 +375,6 @@ class UserProfileServ:
       data["sleep_data"] = len(data["sleep_data"])
     return data
 
-  def calc_sleep_reco(self, uid: str, new_profile: UserProfile, old_profile: UserProfile) -> List[SleepScenario]:
-    # 边缘端关闭推荐引擎时直接复用旧数据
-    if not _HAS_RECO or not Config.ENABLE_SLEEP_RECO:
-      return old_profile.sleep_scenarios_reco or []
-    # 1. 触发推荐引擎逻辑
-    sleep_scenarios = old_profile.sleep_scenarios_reco
-    # if RecommendationEngine.should_rerun_recommendation(old_profile, new_profile):
-    logging.info(f"Rerunning sleep scenario recommendation for {uid}")
-    sleep_scenarios = RecommendationEngine.generate(new_profile)
-
-    return sleep_scenarios
-
-  def calc_standard_sop_reco(self, uid: str, new_profile: UserProfile, old_profile: UserProfile) -> List[SleepScenario]:
-    if not _HAS_RECO or not Config.ENABLE_SLEEP_RECO:
-      return old_profile.standard_sop_reco or []
-    sop_reco = old_profile.standard_sop_reco
-    candidates = []
-    logging.info(f"Rerunning standard SOP recommendation for {uid} with candidates={candidates}")
-    sop_reco = RecommendationEngine.generate_sop_reco(new_profile, candidates)
-    return sop_reco
 
   def update_profile(self, uid: str, new_profile: UserProfile, skip_sleep_scenarios_reco_update: bool = False) -> bool:
     """写入用户行为（仅更新单个用户数据）"""
@@ -433,13 +411,6 @@ class UserProfileServ:
       self._update_scene_stats(profile)
       self._update_best_scene_by_sleep_quality(profile)
 
-      if not skip_sleep_scenarios_reco_update and _HAS_RECO and Config.ENABLE_SLEEP_RECO:
-        profile.sleep_scenarios_reco = self.calc_sleep_reco(uid, profile, old_profile)
-        profile.standard_sop_reco = self.calc_standard_sop_reco(uid, profile, old_profile)
-      elif not profile.standard_sop_reco:
-        # make sure we never leave standard_sop_reco empty just because the
-        # sleep-scenarios skip flag is set
-        profile.standard_sop_reco = self.calc_standard_sop_reco(uid, profile, old_profile)
       # 仅保存当前用户的更新（而非全量数据）
       self.save_profile(uid, profile)
       logging.info(
@@ -522,8 +493,6 @@ class UserServer:
     """设置HTTP路由"""
     self.app.router.add_post('/user_profile', self.handle_profile_request_http)
     self.app.router.add_post('/login', self.handle_login_http)
-    self.app.router.add_post('/analysis', self.handle_analysis_http)
-    self.app.router.add_post('/sleep_advice', self.handle_sleep_advice_http)
 
   def _check_token(self, jwt_token: str)-> dict | None:
     try:
@@ -546,6 +515,11 @@ class UserServer:
       if payload is None:
         return None
       uid = payload.get("uid")
+    elif data.uid == "active_uid" and self.active_uid:
+      # "active_uid" 别名：直接解析为最近通过 /login 鉴权的真实 uid。
+      # 不是调试后门——只有在有用户完成 JWT 登录后才可解析，独立于 debug 白名单。
+      # 统一在这里映射，保证 query/update/remote-sync 各路径行为一致。
+      uid = self.active_uid
     elif Config.IS_DEBUG and data.uid is not None and len(data.uid) > 3 and data.uid in self.debug_uid_set:
       uid = data.uid
 
@@ -656,14 +630,6 @@ class UserServer:
     self.jwt_token = request.data.jwt_token
     return BaseResponse(code=0, msg="user ativated successufully")
 
-  def get_overall_score(self, profile: UserProfile) -> Optional[float]:
-    """计算用户最近7天的平均睡眠质量得分（0-100）"""
-    if not profile.sleep_data:
-      return None
-    recent = profile.sleep_data[-7:]
-    scores = [s.sleep_quality for s in recent if s.sleep_quality is not None]
-    return round(sum(scores) / len(scores), 2) if scores else None
-
   async def handle_profile_request_http(self, request: web.Request) -> web.Response:
     try:
       data = await request.json()
@@ -689,38 +655,6 @@ class UserServer:
               response_obj.msg = f"{response_obj.msg}, remote sync failed"
         return web.json_response(response_obj.model_dump(), status=get_http_status(response_obj))
 
-      elif req.request_type in ["analysis_overview", "insight", "daily_report", "weekly_report", "month_report"]:
-        uid = self._parse_for_uid(req.data)
-        if not uid:
-          return web.json_response(InvalidOrExpiredTokenResp().model_dump(), status=401)
-
-        profile = self.user_serv.get_profile(uid)
-        if not profile:
-          return web.json_response(ProfileResponse(code=404, msg="Profile not found").model_dump(), status=404)
-
-        # Handle different request types
-        response_data = {}
-        if req.request_type == "analysis_overview":
-          response_data = {
-            "overall_score": self.get_overall_score(profile),
-            "weekly_best": profile.sleep_analysis.get("weekly_best"),
-            "sleep_insight": profile.sleep_analysis.get("sleep_insight")
-          }
-        elif req.request_type == "insight":
-          response_data = {"insight": profile.long_term_profile}
-        elif req.request_type == "daily_report":
-          response_data = {"daily": profile.sleep_data[-1] if profile.sleep_data else None}
-        elif req.request_type == "weekly_report":
-          response_data = {"weekly": profile.sleep_data[-7:]}
-        elif req.request_type == "month_report":
-          response_data = {"monthly": profile.sleep_data[-30:]}
-
-        # Filter response based on modules
-        if req.modules:
-          response_data = {key: value for key, value in response_data.items() if key in req.modules}
-
-        return web.json_response(ProfileResponse(code=0, msg="success", request_type=req.request_type, data=response_data).model_dump())
-
       else:
         return web.json_response(InvalidReqFormatResp().model_dump(), status=400)
 
@@ -731,346 +665,6 @@ class UserServer:
         logging.exception("Unexpected error: %s", e)
         return web.json_response(BaseResponse(code=500, msg="Internal server error").model_dump(), status=500)
       
-  # -------------------- /analysis endpoint --------------------
-
-  async def handle_analysis_http(self, request: web.Request) -> web.Response:
-    try:
-      body = await request.json()
-      req = AnalysisRequest.model_validate(body)
-      uid = self._parse_for_uid(req.data)
-      if uid is None:
-        return web.json_response(InvalidOrExpiredTokenResp().model_dump(), status=401)
-      if isinstance(uid, BaseResponse):
-        return web.json_response(uid.model_dump(), status=uid.code)
-
-      profile = self.user_serv.get_profile(uid)
-      response_data = self._build_analysis_data(req, profile)
-
-      resp = AnalysisResponse(code=0, msg="success", request_type=req.request_type, data=response_data)
-      return web.json_response(resp.model_dump())
-
-    except ValidationError as e:
-      logging.error(f"analysis validation error: {e}")
-      return web.json_response(InvalidReqFormatResp().model_dump(), status=400)
-    except Exception as e:
-      logging.error(f"analysis error: {e}")
-      return web.json_response(BaseResponse(code=500, msg="Internal server error").model_dump(), status=500)
-
-  # -------------------- /sleep_advice endpoint --------------------
-
-  _DEFAULT_ADVICE_ANALYSIS = (
-    "Your sleep data shows a balanced pattern overall. "
-    "Deep sleep and REM stages are within a healthy range, "
-    "supporting physical recovery and cognitive function."
-  )
-  _DEFAULT_ADVICE_BULLETS = [
-    "Try to maintain a consistent bedtime to reinforce your circadian rhythm.",
-    "Limit screen exposure at least 30 minutes before bed.",
-    "Consider a light breathing exercise or Mindora scene before sleeping.",
-  ]
-  _DEFAULT_ADVICE_HIGHLIGHTS = {
-    "onset": "Sleep onset appears normal.",
-    "deep": "Deep sleep ratio is within the healthy range.",
-    "rem": "REM activity supports memory consolidation.",
-    "rhythm": "Sleep continuity is stable.",
-  }
-
-  async def handle_sleep_advice_http(self, request: web.Request) -> web.Response:
-    """POST /sleep_advice — return stored sleep advice from the user profile."""
-    try:
-      body = await request.json()
-      req = SleepAdviceRequest.model_validate(body)
-
-      uid = self._parse_for_uid(req.data)
-      if uid is None:
-        return web.json_response(InvalidOrExpiredTokenResp().model_dump(), status=401)
-      if isinstance(uid, BaseResponse):
-        return web.json_response(uid.model_dump(), status=uid.code)
-
-      profile = self.user_serv.get_profile(uid)
-      date = req.data.date or datetime.date.today().isoformat()
-      language = req.data.language or "en"
-
-      # --- read stored advice first --------------------------------------------
-      stored = None
-      if profile and profile.sleep_analysis:
-        stored = profile.sleep_analysis.get("sleep_advice_structured")
-
-      if stored:
-        result = SleepAdviceResult(
-          analysis=stored.get("analysis", self._DEFAULT_ADVICE_ANALYSIS),
-          advice=stored.get("advice", list(self._DEFAULT_ADVICE_BULLETS)),
-          highlights=stored.get("highlights", dict(self._DEFAULT_ADVICE_HIGHLIGHTS)),
-          date=stored.get("date", date),
-          language=stored.get("language", language),
-          llm_used=stored.get("llm_used", True),
-        )
-      else:
-        # Fallback: static defaults when no stored advice exists
-        result = SleepAdviceResult(
-          analysis=self._DEFAULT_ADVICE_ANALYSIS,
-          advice=list(self._DEFAULT_ADVICE_BULLETS),
-          highlights=dict(self._DEFAULT_ADVICE_HIGHLIGHTS),
-          date=date,
-          language=language,
-          llm_used=False,
-        )
-
-      resp = SleepAdviceResponse(
-        code=0, msg="success",
-        request_type="sleep_analysis_advice",
-        data=result,
-      )
-      return web.json_response(resp.model_dump())
-
-    except ValidationError as e:
-      logging.error(f"sleep_advice validation error: {e}")
-      return web.json_response(InvalidReqFormatResp().model_dump(), status=400)
-    except Exception as e:
-      logging.error(f"sleep_advice error: {e}")
-      return web.json_response(
-        BaseResponse(code=500, msg="Internal server error").model_dump(), status=500
-      )
-
-  def _build_analysis_data(self, req: AnalysisRequest, profile: Optional[UserProfile]) -> dict:
-    d = req.data
-    rt = req.request_type
-    if rt == "analysis_overview":
-      return self._build_overview(d, profile)
-    elif rt == "analysis_sleep_day":
-      return self._build_sleep_day(d, profile)
-    elif rt == "analysis_sleep_week":
-      return self._build_sleep_week(d, profile)
-    elif rt == "analysis_sleep_month":
-      return self._build_sleep_month(d, profile)
-    elif rt == "analysis_explore":
-      return self._build_explore(d, profile)
-    raise ValueError(f"Unknown request_type: {rt}")
-
-  def _filter_modules(self, data: dict, modules: list) -> dict:
-    return {k: v for k, v in data.items() if k in modules} if modules else data
-
-  def _build_overview(self, d, profile: Optional[UserProfile]) -> dict:
-    date = d.date or datetime.date.today().isoformat()
-    score = self.get_overall_score(profile) if profile else None
-    if score is None:
-      score = 82
-
-    weekly_best = None
-    most_used = (profile.sleep_analysis or {}).get("most_used_scene") if profile else None
-    if most_used:
-      weekly_best = {
-        "audio_name": most_used["scene_name"],
-        "used_times": most_used["count"],
-        "score": int(score),
-        "start_date": (datetime.date.fromisoformat(date) - datetime.timedelta(days=6)).isoformat(),
-        "end_date": date,
-      }
-    if weekly_best is None:
-      weekly_best = {
-        "audio_name": "Sedona Red Rocks",
-        "used_times": 5,
-        "score": 92,
-        "start_date": (datetime.date.fromisoformat(date) - datetime.timedelta(days=6)).isoformat(),
-        "end_date": date,
-      }
-
-    result = {
-      "overall_score": {"score": int(score), "date": date},
-      "weekly_best": weekly_best,
-      "sleep_insight": {
-        "title": "Excellent Deep Sleep Performance",
-        "description": "Your deep sleep accounts for a healthy proportion of total sleep. Keep maintaining a regular sleep schedule.",
-        "date": date,
-      },
-    }
-    return self._filter_modules(result, d.modules)
-
-  def _build_sleep_day(self, d, profile: Optional[UserProfile]) -> dict:
-    date = d.date or datetime.date.today().isoformat()
-    latest = profile.sleep_data[-1] if profile and profile.sleep_data else None
-    score = int(latest.sleep_quality) if latest and latest.sleep_quality else 70
-
-    result = {
-      "score_summary": {"score": score, "date": date},
-      "sleep_scenarios_reco": {
-        "title": "Sedona Desert Calm",
-        "description": "You fell asleep quickly and maintained a stable sleep rhythm after the scenario started.",
-        "date": date,
-      },
-      "stage_insights": {
-        "awake": {"description": "A brief awakening was detected and you returned to sleep quickly.", "date": date},
-        "rem":   {"description": "REM sleep was sustained and supports emotional processing.", "date": date},
-        "core":  {"description": "Core sleep remained stable across most of the night.", "date": date},
-        "deep":  {"description": "Deep sleep contributed strongly to physical recovery.", "date": date},
-      },
-    }
-    return self._filter_modules(result, d.modules)
-
-  def _build_sleep_week(self, d, profile: Optional[UserProfile]) -> dict:
-    today = datetime.date.today()
-    start = d.start_date or (today - datetime.timedelta(days=6)).isoformat()
-    end   = d.end_date   or today.isoformat()
-
-    score = self.get_overall_score(profile) if profile else None
-    score = int(score) if score else 86
-    label = "Excellent" if score >= 80 else "Good" if score >= 60 else "Fair"
-
-    result = {
-      "score_summary": {"score": score, "label": label, "start_date": start, "end_date": end},
-      "sleep_trends": {
-        "body": "Excellent Deep Sleep Performance",
-        "description": "Your deep sleep accounted for a healthy proportion of total sleep this week.",
-        "start_date": start,
-        "end_date": end,
-      },
-      "onset_efficiency": {
-        "scenario_name": "Sedona Desert Calm",
-        "used_times": 5,
-        "score": score,
-        "start_date": start,
-        "end_date": end,
-      },
-    }
-    return self._filter_modules(result, d.modules)
-
-  def _build_sleep_month(self, d, profile: Optional[UserProfile]) -> dict:
-    today = datetime.date.today()
-    start = d.start_date or (today - datetime.timedelta(days=29)).isoformat()
-    end   = d.end_date   or today.isoformat()
-
-    score = self.get_overall_score(profile) if profile else None
-    score = int(score) if score else 89
-    label = "Excellent" if score >= 80 else "Good" if score >= 60 else "Fair"
-
-    # Build score_series from real data, fall back to mock trend
-    score_series: list = []
-    if profile and profile.sleep_data:
-      for sr in profile.sleep_data[-30:]:
-        if sr.sleep_quality is not None:
-          score_series.append({
-            "date": datetime.date.fromtimestamp(sr.timestamp).isoformat(),
-            "score": int(sr.sleep_quality),
-          })
-    if not score_series:
-      cur = datetime.date.fromisoformat(start)
-      end_d = datetime.date.fromisoformat(end)
-      base = 62
-      while cur <= end_d:
-        score_series.append({"date": cur.isoformat(), "score": min(100, base)})
-        base += 1
-        cur += datetime.timedelta(days=1)
-
-    result = {
-      "score_summary": {"score": score, "label": label, "start_date": start, "end_date": end},
-      "sleep_trends": {
-        "body": "This month, you maintained a consistent amount of sleep.",
-        "description": "Deep sleep remained above the standard level and your bedtime trended earlier.",
-        "score_series": score_series,
-        "start_date": start,
-        "end_date": end,
-      },
-      "onset_efficiency": {
-        "scenario_list": ["Sedona Desert Calm", "Maldives Drift Sleep", "Canadian Forest Solace"],
-        "description": "Sedona Desert Calm was your most frequently used sleep scenario this month and showed the best onset performance.",
-        "start_date": start,
-        "end_date": end,
-      },
-    }
-    return self._filter_modules(result, d.modules)
-
-  def _build_explore(self, d, profile: Optional[UserProfile]) -> dict:
-    date  = d.date or datetime.date.today().isoformat()
-    start = (datetime.date.fromisoformat(date) - datetime.timedelta(days=6)).isoformat()
-
-    has_data = profile is not None and bool(profile.sleep_data)
-    latest   = profile.sleep_data[-1] if has_data else None
-    summaries = latest.sequence_summaries if (latest and latest.sleep_status) else {}
-
-    overall_score    = int(latest.sleep_quality) if latest and latest.sleep_quality else 82
-    onset_score      = int(latest.soe)           if latest and latest.soe           else 82
-    structure_score  = 49
-    fluctuation_score = 34
-
-    tb = summaries.get("time_in_bed") or 1
-    rem_pct  = f"{round(summaries.get('rem_sleep_duration',  0) / tb * 100, 1)}%" if summaries else "22%"
-    deep_pct = f"{round(summaries.get('deep_sleep_duration', 0) / tb * 100, 1)}%" if summaries else "29.8%"
-    core_pct = f"{round(summaries.get('core_sleep_duration', 0) / tb * 100, 1)}%" if summaries else "48.2%"
-
-    hr_mid = int(latest.avg_heart_rate) if latest and latest.avg_heart_rate else 70
-    hr_range = f"{hr_mid - 15}-{hr_mid + 15}bpm"
-    resp_fluct = f"{int(latest.respiratory_var or 25)}%" if latest else "25%"
-
-    scene_id   = "cocos_island_moonlight"
-    scene_name = "Cocos Island Moonlight"
-    most_used = (profile.sleep_analysis or {}).get("most_used_scene") if profile else None
-    if most_used:
-      scene_id   = most_used["scene_id"]
-      scene_name = most_used["scene_name"]
-
-    awake_count = summaries.get("night_awake_count", 2)
-    result = {
-      "data_ready": has_data,
-      "header_summary": {
-        "intro_text": "Last night your body entered a stable, relaxed, and highly restorative sleep state.",
-        "intro_detail_text": "What happened last night, what helped you most, and how Mindora adjusted for you.",
-        "date": date,
-      },
-      "score_summary": {
-        "score": overall_score,
-        "title": "Sleep Score",
-        "efficiency_score":   onset_score,
-        "structure_score":    structure_score,
-        "fluctuation_score":  fluctuation_score,
-        "date": date,
-      },
-      "onset_efficiency": {
-        "score": onset_score,
-        "label": "Healthy Range",
-        "onset_minutes": 12,
-        "first_sleep_time":           latest.first_sleep_time if latest else "23:45",
-        "pre_sleep_heart_rate":       f"{int(latest.hr_before_sleep)}bpm"  if latest and latest.hr_before_sleep  else "68bpm",
-        "pre_sleep_respiratory_rate": f"{int(latest.rr_before_sleep)}brpm" if latest and latest.rr_before_sleep else "15brpm",
-        "description": "You fell asleep faster than your recent average and your pre-sleep physiology stayed calm.",
-        "date": date,
-      },
-      "sleep_structure": {
-        "score": structure_score,
-        "label": "Average",
-        "continuous_sleep_minutes": int(tb),
-        "rem_percent":  rem_pct,
-        "deep_percent": deep_pct,
-        "core_percent": core_pct,
-        "description": "Your sleep structure remained relatively balanced, with deep sleep contributing strongly to recovery.",
-        "date": date,
-      },
-      "night_fluctuation": {
-        "score": fluctuation_score,
-        "label": "High Fluctuation" if awake_count > 3 else "Normal",
-        "intervention": "Rain Wash",
-        "awake_count":            awake_count,
-        "awake_duration_minutes": int(summaries.get("night_awake_duration", 5)),
-        "awake_type":             summaries.get("night_awake_type") or "Brief awakening",
-        "heart_rate_range":       hr_range,
-        "respiratory_fluctuation": resp_fluct,
-        "description": "You had a small number of brief interruptions and the system applied a suitable intervention.",
-        "date": date,
-      },
-      "scene_preference": {
-        "scene_id":   scene_id,
-        "scene_name": scene_name,
-        "scene_type": "Ocean wind with slow percussion",
-        "description": "This scene has recently matched your sleep onset rhythm most consistently.",
-        "start_date": start,
-        "end_date":   date,
-      },
-      "sleep_advice": {
-        "description": "Keep your current bedtime and continue using the same wind-down scene for the next few nights.",
-        "date": date,
-      },
-    }
-    return self._filter_modules(result, d.modules)
-
   async def handle_login_http(self, request: web.Request) -> web.Response:
     try:
       data = await request.json()
