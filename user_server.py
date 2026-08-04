@@ -62,35 +62,87 @@ def _ops_config_path() -> Path:
 _ops_config_lock = threading.Lock()
 _ops_config_cache: dict = {"path": None, "mtime": None, "popups": [], "surveys": {}}
 
+# action_type="route" 时 action_payload.route 的白名单（tanchuang_suvey.md「route 候选常量」，与客户端硬编码一致；
+# 新增路由必须先发客户端版本，服务端才能下发）
+POPUP_ROUTE_WHITELIST = {
+  # 一级 Tab
+  "home", "sleep", "explore", "store",
+  # 二级页面
+  "subscription", "redeem", "footprint", "device", "profile", "settings", "faq", "notifications",
+}
 
-def _load_ops_config() -> tuple[list, dict]:
-  """读取弹窗/问卷运营配置（popups, surveys）。文件无变化时直接返回缓存。"""
+# query_popups 响应 data.next_query_after（客户端轮询间隔）的有效区间：60s ~ 24h，超出夹到边界；
+# 运营配置不填则服务端不下发该字段，客户端用默认 300s
+NEXT_QUERY_AFTER_MIN = 60
+NEXT_QUERY_AFTER_MAX = 24 * 3600
+
+
+def _clamp_next_query_after(value) -> Optional[int]:
+  """把运营配置的 next_query_after 夹到 [60s, 24h]；未配置/非法值返回 None（不下发）。"""
+  if value is None:
+    return None
+  try:
+    seconds = int(value)
+  except (TypeError, ValueError):
+    logging.error("invalid next_query_after=%r in ops config, ignored", value)
+    return None
+  return max(NEXT_QUERY_AFTER_MIN, min(NEXT_QUERY_AFTER_MAX, seconds))
+
+
+def _validate_popups(popups: list) -> list:
+  """校验运营配置的弹窗：route 动作的路由必须在白名单内（忽略大小写与首尾空格），
+  非法条目丢弃并记日志，避免坏配置下发到客户端。"""
+  valid = []
+  for popup in popups:
+    if popup.get("action_type") == "route":
+      payload = popup.get("action_payload") or {}
+      route = str(payload.get("route") or "").strip().lower()
+      if route not in POPUP_ROUTE_WHITELIST:
+        logging.error(
+          "popup %s dropped: route %r not in whitelist",
+          popup.get("popup_id"), payload.get("route"),
+        )
+        continue
+      payload["route"] = route
+      popup["action_payload"] = payload
+    valid.append(popup)
+  return valid
+
+
+def _load_ops_config() -> tuple[list, dict, Optional[int]]:
+  """读取弹窗/问卷运营配置 (popups, surveys, next_query_after)。文件无变化时直接返回缓存。"""
   path = _ops_config_path()
   try:
     mtime = os.path.getmtime(path)
   except OSError:
     if _ops_config_cache["path"] is None:
       logging.warning("ops config not found: %s", path)
-    return _ops_config_cache["popups"], _ops_config_cache["surveys"]
+    return _ops_config_cache["popups"], _ops_config_cache["surveys"], _ops_config_cache.get("next_query_after")
 
   with _ops_config_lock:
     if _ops_config_cache["path"] == str(path) and _ops_config_cache["mtime"] == mtime:
-      return _ops_config_cache["popups"], _ops_config_cache["surveys"]
+      return _ops_config_cache["popups"], _ops_config_cache["surveys"], _ops_config_cache.get("next_query_after")
     try:
       raw = json.loads(path.read_text(encoding="utf-8"))
       popups = raw.get("popups") or []
       surveys = raw.get("surveys") or {}
       if not isinstance(popups, list) or not isinstance(surveys, dict):
         raise ValueError("popups must be a list and surveys must be a dict")
+      popups = _validate_popups(popups)
+      next_query_after = _clamp_next_query_after(raw.get("next_query_after"))
     except (json.JSONDecodeError, ValueError) as e:
       logging.error("ops config parse failed (%s), keep last good config: %s", path, e)
-      return _ops_config_cache["popups"], _ops_config_cache["surveys"]
+      return _ops_config_cache["popups"], _ops_config_cache["surveys"], _ops_config_cache.get("next_query_after")
 
     _ops_config_cache.update({
       "path": str(path), "mtime": mtime, "popups": popups, "surveys": surveys,
+      "next_query_after": next_query_after,
     })
-    logging.info("ops config reloaded: %s (popups=%d surveys=%d)", path, len(popups), len(surveys))
-    return popups, surveys
+    logging.info(
+      "ops config reloaded: %s (popups=%d surveys=%d next_query_after=%s)",
+      path, len(popups), len(surveys), next_query_after,
+    )
+    return popups, surveys, next_query_after
 
 
 # 陪伴足迹里程碑规则（peibanzuji.md ③）：连续 N 天 plan_completed=true → 一条已完成里程碑
@@ -860,14 +912,17 @@ class UserProfileServ:
     profile = self.get_profile(uid)
     return profile if profile is not None else UserProfile()
 
-  def query_popups(self, uid: str, language: str, placement: str = "home") -> list[dict]:
+  def query_popups(self, uid: str, language: str, placement: str = "home") -> dict:
     """拉取当前应展示的弹窗列表：按时间窗/展示位/用户频控过滤，按 priority 降序。
+
+    返回 {"popups": [...], "next_query_after": Optional[int]}；
+    next_query_after 为 None 表示服务端不下发（客户端用默认 300s）。
 
     同时对时间窗内 push_message=true（survey 类恒落）的弹窗落地站内消息，
     按 popup_id 去重、每条只落一次，不受频控影响。
     """
     now = int(time.time())
-    popups_catalog, _ = _load_ops_config()
+    popups_catalog, _, next_query_after = _load_ops_config()
     with self.lock:
       profile = self._get_or_create_profile_unlocked(uid)
       inbox_changed = False
@@ -938,11 +993,11 @@ class UserProfileServ:
         self.save_profile(uid, profile)
 
       result.sort(key=lambda p: p.get("priority", 0), reverse=True)
-      return result
+      return {"popups": result, "next_query_after": next_query_after}
 
   def report_popup_event(self, uid: str, popup_id: str, event: str, event_at: int) -> bool:
     """回传弹窗曝光/点击/关闭事件，更新该用户的弹窗状态。"""
-    popups_catalog, _ = _load_ops_config()
+    popups_catalog, _, _ = _load_ops_config()
     if not any(p["popup_id"] == popup_id for p in popups_catalog):
       logging.warning("report_popup for unknown popup_id=%s uid=%s", popup_id, uid)
       return False
@@ -962,7 +1017,7 @@ class UserProfileServ:
 
   def get_survey(self, survey_id: str, language: str) -> Optional[dict]:
     """拉取问卷题目（按语言）；未知 survey_id 返回 None。"""
-    _, surveys = _load_ops_config()
+    _, surveys, _ = _load_ops_config()
     survey = surveys.get(survey_id)
     if survey is None:
       return None
@@ -977,7 +1032,7 @@ class UserProfileServ:
   def submit_survey(self, uid: str, data) -> tuple[Optional[dict], int]:
     """提交问卷。返回 (响应 data, code)；同一 uid+survey_id 幂等：
     重复提交返回既有 submission_id 且 reward_granted=False（code=0）。"""
-    _, surveys = _load_ops_config()
+    _, surveys, _ = _load_ops_config()
     survey = surveys.get(data.survey_id)
     if survey is None:
       return None, 404
@@ -1448,11 +1503,15 @@ class UserServer:
         return web.json_response(InvalidOrExpiredTokenResp().model_dump(), status=401)
 
       if req.request_type == "query_popups":
-        popups = await asyncio.to_thread(
+        result = await asyncio.to_thread(
           self.user_serv.query_popups, uid, req.data.language, req.data.placement,
         )
+        # next_query_after 未配置时不下发该字段，客户端用默认 300s
+        data = {"popups": result["popups"]}
+        if result.get("next_query_after") is not None:
+          data["next_query_after"] = result["next_query_after"]
         resp = BaseResponse(code=0, msg="ok")
-        return web.json_response({**resp.model_dump(), "data": {"popups": popups}})
+        return web.json_response({**resp.model_dump(), "data": data})
 
       # report_popup
       event_at = req.data.event_at or req.timestamp
