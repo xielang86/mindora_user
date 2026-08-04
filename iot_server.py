@@ -32,7 +32,7 @@ from dotenv import load_dotenv
 import logger
 
 load_dotenv()
-run_dir = os.getenv("RUN_DIR")
+run_dir = os.getenv("RUN_DIR") or os.path.dirname(os.path.abspath(__file__))
 logger.init_log(f"{run_dir}/iot_server_logs")
 
 try:

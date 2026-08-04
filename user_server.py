@@ -33,7 +33,7 @@ import logger
 import copy
 
 load_dotenv()
-run_dir = os.getenv("RUN_DIR")
+run_dir = os.getenv("RUN_DIR") or os.path.dirname(os.path.abspath(__file__))
 logger.init_log(f"{run_dir}/user_server_logs")
 # JWT 验签改用 RS256 公钥（见 common/jwt_keys.py），不再需要本地保存签名密钥
 REMOTE_SYNC_HEADER = "X-Mindora-Remote-Sync"
@@ -1331,6 +1331,11 @@ class UserServer:
       if payload is None:
         return None
       uid = payload.get("uid")
+    elif data.uid == "active_uid" and self.active_uid:
+      # "active_uid" 别名：直接解析为最近通过 /login 鉴权的真实 uid。
+      # 不是调试后门——只有在有用户完成 JWT 登录后才可解析，独立于 debug 白名单。
+      # 统一在这里映射，保证 query/update/remote-sync 各路径行为一致。
+      uid = self.active_uid
     elif Config.IS_DEBUG and data.uid is not None and len(data.uid) > 3 and data.uid in self.debug_uid_set:
       uid = data.uid
 
