@@ -28,7 +28,7 @@ import logger
 import copy
 
 load_dotenv()
-run_dir = os.getenv("RUN_DIR")
+run_dir = os.getenv("RUN_DIR") or os.path.dirname(os.path.abspath(__file__))
 logger.init_log(f"{run_dir}/user_server_logs")
 # 设备端仅用 RS256 公钥验签（见 common/jwt_keys.py），本地不保存任何签名密钥
 REMOTE_SYNC_HEADER = "X-Mindora-Remote-Sync"

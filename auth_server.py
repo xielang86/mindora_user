@@ -31,7 +31,7 @@ from uid.uuid import generate_uid_and_salt
 import logger
 
 load_dotenv()
-run_dir = os.getenv("RUN_DIR")
+run_dir = os.getenv("RUN_DIR") or os.path.dirname(os.path.abspath(__file__))
 logger.init_log(f"{run_dir}/auth_logs")
 
 app = FastAPI(title="Auth Server")
