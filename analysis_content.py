@@ -14,7 +14,7 @@ from typing import Any, Optional
 
 from pydantic import ValidationError
 
-from llm_service import extract_sleep_context
+from llm import extract_sleep_context
 from user_profile import (
   UserProfile, SleepInsightReport, AnalysisTextReport,
   ANALYSIS_REPORT_KEYS, ANALYSIS_REPORT_RETENTION,

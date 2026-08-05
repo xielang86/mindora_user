@@ -21,8 +21,6 @@ class Config:
   POPUP_SURVEY_CONFIG_PATH = "data/popup_survey_config.json"
   MaxServerConcurrent = 32
   Mode = 0
-  RemoteHost="http://121.43.54.25:9001"
-  # RemoteHost="http://localhost:9001"
   ALGORITHM="RS256"
   # 验签兼容：旧的 HS256 token（JWT_SECRET_KEY 环境变量）在过期前仍可验
   LEGACY_ALGORITHM="HS256"

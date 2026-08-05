@@ -10,29 +10,32 @@ from typing import Any, List, Optional
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
-from tool.doubao_langchain import VolcEngineArkChat
+from llm.ark_chat import VolcEngineArkChat
 from user_profile import UserProfile, SleepScenario
 
 
+# 仓库根目录（本文件在 llm/ 包内，db/ 和 data/ 在仓库根）
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 _KNOWLEDGE_BASE_PATH = os.path.join(
-    os.path.dirname(__file__),
+    _REPO_ROOT,
     "db",
     "knowledge_base.md",
 )
 
 _TOPOLOGY_PATH = os.path.join(
-    os.path.dirname(__file__),
+    _REPO_ROOT,
     "db",
     "topology.md",
 )
 
 _SOP_CANDIDATES_PATH = os.path.join(
-    os.path.dirname(__file__),
+    _REPO_ROOT,
     "data",
     "reco_candidates.json",
 )
 
-_LLM_TRACE_LOG_PATH = Path(__file__).resolve().parent / "llm_request_response.log"
+_LLM_TRACE_LOG_PATH = Path(_REPO_ROOT) / "llm_request_response.log"
 
 _SCENARIO_CANDIDATES: list[dict[str, Any]] = [
     {

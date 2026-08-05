@@ -13,7 +13,7 @@ from typing import Any, Optional
 from dotenv import load_dotenv
 import jwt
 from pydantic import BaseModel, ValidationError
-from aiohttp import ClientResponseError, ClientSession, web
+from aiohttp import web
 
 import analysis_builders
 from analysis_content import AnalysisContentService
@@ -28,7 +28,7 @@ from user_profile import (
 )
 from auth import AuthRequest
 from uid.uuid import get_or_create_uuid
-from llm_service import SleepAnalysisLLM, deep_merge
+from llm import SleepAnalysisLLM, deep_merge
 import logger
 import copy
 
@@ -36,7 +36,6 @@ load_dotenv()
 run_dir = os.getenv("RUN_DIR") or os.path.dirname(os.path.abspath(__file__))
 logger.init_log(f"{run_dir}/user_server_logs")
 # JWT 验签改用 RS256 公钥（见 common/jwt_keys.py），不再需要本地保存签名密钥
-REMOTE_SYNC_HEADER = "X-Mindora-Remote-Sync"
 
 
 def get_http_status(resp: BaseResponse):
@@ -45,28 +44,6 @@ def get_http_status(resp: BaseResponse):
     status = resp.code
   return status
 
-
-async def query_profile(jwt_token: str, server_uri: str) :
-  query_endpoint = f"{server_uri}/user_profile"
-  async with ClientSession() as session:
-    try:
-      req = ProfileRequest(request_type="query_profile", timestamp=int(time.time()), version="1.0", data=ProfileData(jwt_token = jwt_token))
-      # 构造请求数据
-      async with session.post(
-        query_endpoint,
-        json=req.model_dump(),
-        timeout=2  # 10秒超时
-      ) as response:
-        response.raise_for_status()  # 触发HTTP错误（如4xx、5xx）
-        data = await response.json()
-        return ProfileResponse.model_validate(data)
-
-    except ClientResponseError as e:
-      # 处理HTTP错误响应
-      error_msg = f"查询失败 [HTTP {e.status}]: {e}"
-      raise Exception(error_msg) from e
-    except Exception as e:
-      raise Exception(f"查询用户画像失败: {str(e)}") from e
 
 class UserServer:
   @staticmethod
@@ -92,9 +69,7 @@ class UserServer:
     self.port = Config.PORT
     self.llm = SleepAnalysisLLM()
     self.user_serv = UserProfileServ(llm=self.llm)
-    self.update_task = None
     self.app = web.Application()
-    self.active_uid = ""
     self.system_uid = get_or_create_uuid()
     self.debug_uid_set = {"mindora_test_uid1", "mindora_test_uid2", "mindora_test_uid3", "test_debug_user_001"}
     # Per-user LLM background-update rate limiting and task tracking.
@@ -106,8 +81,6 @@ class UserServer:
 
   def close(self):
     self.user_serv.close()
-    if self.update_task:
-      self.update_task.cancel()
     # Cancel pending LLM background tasks.
     for task in list(self._llm_tasks):
       task.cancel()
@@ -144,11 +117,6 @@ class UserServer:
       if payload is None:
         return None
       uid = payload.get("uid")
-    elif data.uid == "active_uid" and self.active_uid:
-      # "active_uid" 别名：直接解析为最近通过 /login 鉴权的真实 uid。
-      # 不是调试后门——只有在有用户完成 JWT 登录后才可解析，独立于 debug 白名单。
-      # 统一在这里映射，保证 query/update/remote-sync 各路径行为一致。
-      uid = self.active_uid
     elif Config.IS_DEBUG and data.uid is not None and len(data.uid) > 3 and data.uid in self.debug_uid_set:
       uid = data.uid
 
@@ -167,9 +135,6 @@ class UserServer:
 
     if uid is None:
       return InvalidOrExpiredTokenResp()
-
-    if uid == "active_uid":
-      uid = self.active_uid
 
     profile = self.user_serv.get_profile(uid)
     if profile:
@@ -255,49 +220,6 @@ class UserServer:
     except Exception as e:
       logging.error("background llm update failed for uid=%s: %s", uid, e)
 
-  async def sync_profile_to_remote(self, uid: str, request: ProfileRequest) -> bool:
-    if not Config.RemoteHost or len(Config.RemoteHost) < 10:
-      return False
-
-    profile = self.user_serv.get_profile(uid)
-    if profile is None:
-      logging.warning(f"skip remote sync because local profile missing for uid={uid}")
-      return False
-
-    remote_endpoint = f"{Config.RemoteHost.rstrip('/')}/user_profile"
-    sync_data = {"user_profile": profile.model_dump()}
-    if request.data.jwt_token is not None:
-      sync_data["jwt_token"] = request.data.jwt_token
-    else:
-      sync_data["uid"] = uid
-    if request.data.skip_sleep_scenarios_reco_update:
-      sync_data["skip_sleep_scenarios_reco_update"] = True
-
-    payload = ProfileRequest(
-      request_type="update_profile",
-      timestamp=int(time.time()),
-      version=request.version,
-      data=ProfileData.model_validate(sync_data),
-    ).model_dump()
-
-    try:
-      async with ClientSession() as session:
-        async with session.post(
-          remote_endpoint,
-          json=payload,
-          headers={REMOTE_SYNC_HEADER: "1"},
-          timeout=10,
-        ) as response:
-          resp_data = await response.json()
-          if response.status >= 400:
-            logging.error(f"remote profile sync failed status={response.status}, body={resp_data}")
-            return False
-          logging.info(f"remote profile sync succ for uid={uid}, body={resp_data}")
-          return True
-    except Exception as e:
-      logging.error(f"remote profile sync error for uid={uid}: {e}")
-      return False
-
   async def handle_profile_request_http(self, request: web.Request) -> web.Response:
     try:
       data = await request.json()
@@ -310,16 +232,6 @@ class UserServer:
 
       elif req.request_type == "update_profile":
         response_obj = await self.handle_update_profile(req)
-        if (
-          response_obj.code == 0
-          and Config.RemoteHost is not None and len(Config.RemoteHost) > 8
-          and req.data is not None
-        ):
-          uid = self._parse_for_uid(req.data)
-          if isinstance(uid, str) and uid:
-            remote_succ = await self.sync_profile_to_remote(uid, req)
-            if not remote_succ:
-              response_obj.msg = f"{response_obj.msg}, remote sync failed"
         return web.json_response(response_obj.model_dump(), status=get_http_status(response_obj))
 
       # client_request.md：/user_profile 只承载 query_profile / update_profile，
@@ -344,8 +256,6 @@ class UserServer:
       return InvalidOrExpiredTokenResp()
 
     uid = payload.get("uid")
-    self.active_uid = uid
-    self.jwt_token = request.data.jwt_token
     return BaseResponse(code=0, msg="user ativated successufully")
 
   async def handle_login_http(self, request: web.Request) -> web.Response:
@@ -358,55 +268,7 @@ class UserServer:
       response_obj = InvalidReqFormatResp()
 
     logging.info(f"login resp: {response_obj}")
-    if response_obj.code == 0 and len(Config.RemoteHost) > 10 and (self.update_task is None or self.update_task.done()):
-      self.update_task = asyncio.create_task(self.fetch_profile_from_remote(f"{Config.RemoteHost}"))
-    else:
-      logging.info("update task has started already")
-
     return web.json_response(status=get_http_status(response_obj), data=response_obj.model_dump())
-
-  async def fetch_profile_from_remote(self, url):
-    """Periodically pull the active user's profile from the remote server.
-
-    Runs in a background task so it must not block the asyncio event loop.
-    """
-    start_min = int(time.time()) / 60
-    logging.info(f"begin to loop update for activeuid : {self.active_uid}")
-    while True:
-      cur_min = int(time.time()) / 60
-      if cur_min - start_min > 60:
-        logging.info("break because of time")
-        break
-
-      await asyncio.sleep(60)
-
-      resp = await query_profile(self.jwt_token, Config.RemoteHost)
-      if resp is None or resp.code != 0 or resp.data is None:
-        logging.warning(f"none or invalid resp from remote server: {Config.RemoteHost}")
-        continue
-
-      profile_data = resp.data.get("user_profile")
-      if profile_data is None:
-        logging.warning(f"remote resp missing user_profile for activeuid={self.active_uid}")
-        continue
-
-      try:
-        new_profile = UserProfile.model_validate(profile_data)
-      except ValidationError as e:
-        logging.error(f"remote profile validation failed: {e}")
-        continue
-
-      # Offload the synchronous update_profile (which may call LLMs) to a
-      # thread so the event loop stays responsive for local HTTP requests.
-      succ = await asyncio.to_thread(
-        self.user_serv.update_profile,
-        self.active_uid,
-        new_profile,
-      )
-      if not succ:
-        logging.warning(f"erro in update profile for {self.active_uid}")
-      else:
-        logging.info(f"succ update profile for {self.active_uid}")
 
   # -------------------- /analysis --------------------
   async def handle_analysis_http(self, request: web.Request) -> web.Response:

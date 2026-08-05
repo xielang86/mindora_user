@@ -30,7 +30,7 @@ class VolcEngineArkChat(BaseChatModel):
             raise ValueError(
                 "Did not find ark_api_key! "
                 "Please pass it as a parameter (ark_api_key=...) or "
-                "set environment variable `VOLC_ARK_API_KEY`."
+                "set environment variable `ARK_API_KEY`."
             )
         # Ensure API key is ASCII-safe for HTTP headers
         try:
@@ -38,7 +38,7 @@ class VolcEngineArkChat(BaseChatModel):
         except UnicodeEncodeError:
             raise ValueError(
                 "ark_api_key contains non-ASCII characters. "
-                "Please provide the actual ASCII API key (or set VOLC_ARK_API_KEY)."
+                "Please provide the actual ASCII API key (or set ARK_API_KEY)."
             )
         return self
 

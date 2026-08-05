@@ -19,7 +19,7 @@ from typing import Any, Optional, List
 
 from pydantic import BaseModel
 
-from sleep_reco import RecommendationEngine
+from llm import RecommendationEngine
 try:
   import plyvel
 except ImportError:
@@ -29,7 +29,7 @@ from analysis_content import AnalysisContentService
 from common import util
 from config import Config
 from engagement_service import EngagementService
-from llm_service import SleepAnalysisLLM
+from llm import SleepAnalysisLLM
 from user_profile import UserProfile, SleepScenario
 
 run_dir = os.getenv("RUN_DIR") or os.path.dirname(os.path.abspath(__file__))
@@ -536,8 +536,9 @@ class UserProfileServ:
   ) -> bool:
     """写入用户行为（仅更新单个用户数据）.
 
-    Synchronous full-update path. Preserved for backward compatibility with
-    fetch_profile_from_remote and direct callers/tests.
+    Synchronous full-update path (basic + LLM in one call, LLM runs while
+    holding the lock). 生产路径请用 update_profile_basic + update_profile_llm
+    两段式（LLM 不持锁）；本路径保留给直接调用方和测试。
     """
     if new_profile is None or uid is None or not isinstance(uid, str):
       logging.error(f"invalid new profile {new_profile} or uid {uid}")

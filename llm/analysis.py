@@ -1,13 +1,13 @@
 """
-llm_service.py — LLM-powered sleep analysis text generation.
+llm/analysis.py — LLM-powered sleep analysis text generation.
 
-Wraps VolcEngineArkChat (doubao_langchain) and generates the TEXT fields
+Wraps VolcEngineArkChat (llm/ark_chat.py) and generates the TEXT fields
 for each /analysis response type.  Numeric fields (scores, durations, counts)
 are always computed from real sensor data by user_server._build_* methods;
 LLM only fills in human-readable titles, descriptions, labels, and advice.
 
 Usage (from user_server.py):
-    from llm_service import SleepAnalysisLLM, extract_sleep_context
+    from llm import SleepAnalysisLLM, extract_sleep_context
     self.llm = SleepAnalysisLLM()
 
     # after building default response_data:
@@ -29,7 +29,7 @@ from typing import Any, Optional
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
-from tool.doubao_langchain import VolcEngineArkChat
+from llm.ark_chat import VolcEngineArkChat
 
 
 from user_profile import compute_recent_sleep_stats
