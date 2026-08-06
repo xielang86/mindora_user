@@ -48,13 +48,17 @@ def get_http_status(resp: BaseResponse):
 class UserServer:
   @staticmethod
   def _request_for_log(req_or_data) -> Any:
-    """Return a log-safe copy with behaviors summarized by count."""
+    """Return a log-safe copy: jwt_token 打码，behaviors 按条数汇总。"""
     if isinstance(req_or_data, BaseModel):
       data = req_or_data.model_dump(mode="json", exclude_none=True)
     elif isinstance(req_or_data, dict):
       data = copy.deepcopy(req_or_data)
     else:
       return req_or_data
+
+    d = data.get("data")
+    if isinstance(d, dict) and d.get("jwt_token"):
+      d["jwt_token"] = "***"
 
     up = ((data.get("data") or {}).get("user_profile") or {})
     if isinstance(up.get("behaviors"), dict):
@@ -142,7 +146,7 @@ class UserServer:
       return ProfileResponse(code=0, msg="succ", request_type=request.request_type, data={"user_profile": profile.model_dump()})
     else:
       logging.warning("uid=%s query not found request=%s", uid, self._request_for_log(request))
-      return ProfileResponse(code=0, msg=f"User with uid '{request.data}' not found", request_type=request.request_type, data=None)
+      return ProfileResponse(code=0, msg=f"User with uid '{uid}' not found", request_type=request.request_type, data=None)
 
     # incr update the behaviors by time, and update long term weight
   async def handle_update_profile(self, request: ProfileRequest) -> BaseResponse:

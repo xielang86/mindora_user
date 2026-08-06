@@ -12,7 +12,8 @@ DEFAULT_BASE_URL = os.getenv("USER_SERVER_URL", "http://127.0.0.1:9001")
 DEFAULT_PORT = int(os.getenv("USER_SERVER_PORT", "9001"))
 DEFAULT_LANGUAGE = os.getenv("USER_SERVER_LANGUAGE", "zh-Hans")
 DEFAULT_TIMEZONE = os.getenv("USER_SERVER_TIMEZONE", "Asia/Shanghai")
-DEFAULT_DEBUG_UID = os.getenv("USER_SERVER_DEBUG_UID", "test_user")
+# 必须在 user_server.py 的 debug_uid_set 白名单内，否则无 JWT 时会 401
+DEFAULT_DEBUG_UID = os.getenv("USER_SERVER_DEBUG_UID", "mindora_test_uid1")
 
 
 class UserServerClient:
@@ -159,6 +160,39 @@ class UserServerClient:
       },
     )
 
+  def analysis_explore_partial(self, date: str | None = None) -> dict[str, Any]:
+    """analysis_explore — 只取 score_summary + sleep_advice（模块过滤演示）"""
+    return self.analysis_explore(date=date, modules=["score_summary", "sleep_advice"])
+
+  def analysis_invalid_token(self) -> dict[str, Any]:
+    """坏 JWT — 期望 401"""
+    payload = {
+      "request_type": "analysis_overview",
+      "timestamp": int(time.time()),
+      "version": "1.0",
+      "data": {
+        "jwt_token": "invalid.token.value",
+        "language": self.language,
+        "timezone": self.timezone,
+        "date": self.today(),
+      },
+    }
+    return self._post("/analysis", payload)
+
+  def analysis_missing_auth(self) -> dict[str, Any]:
+    """既无 uid 也无 jwt_token — 期望 400"""
+    payload = {
+      "request_type": "analysis_overview",
+      "timestamp": int(time.time()),
+      "version": "1.0",
+      "data": {
+        "language": self.language,
+        "timezone": self.timezone,
+        "date": self.today(),
+      },
+    }
+    return self._post("/analysis", payload)
+
   def run_all(self) -> dict[str, dict[str, Any]]:
     results: dict[str, dict[str, Any]] = {}
     if self.jwt_token:
@@ -171,6 +205,9 @@ class UserServerClient:
     results["analysis_sleep_week"] = self.analysis_sleep_week()
     results["analysis_sleep_month"] = self.analysis_sleep_month()
     results["analysis_explore"] = self.analysis_explore()
+    results["analysis_explore_partial"] = self.analysis_explore_partial()
+    results["analysis_invalid_token"] = self.analysis_invalid_token()
+    results["analysis_missing_auth"] = self.analysis_missing_auth()
     return results
 
   def _analysis_request(self, request_type: str, extra_data: dict[str, Any]) -> dict[str, Any]:
@@ -250,6 +287,9 @@ def build_parser() -> argparse.ArgumentParser:
       "analysis_sleep_week",
       "analysis_sleep_month",
       "analysis_explore",
+      "analysis_explore_partial",
+      "analysis_invalid_token",
+      "analysis_missing_auth",
     ],
   )
   parser.add_argument("--base-url", default=DEFAULT_BASE_URL)
@@ -301,6 +341,12 @@ def main():
     result = client.analysis_sleep_month(start_date=args.start_date, end_date=args.end_date, modules=args.modules)
   elif args.action == "analysis_explore":
     result = client.analysis_explore(date=args.date, modules=args.modules)
+  elif args.action == "analysis_explore_partial":
+    result = client.analysis_explore_partial(date=args.date)
+  elif args.action == "analysis_invalid_token":
+    result = client.analysis_invalid_token()
+  elif args.action == "analysis_missing_auth":
+    result = client.analysis_missing_auth()
 
   print_result(args.action, result)
 
