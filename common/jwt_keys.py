@@ -23,7 +23,10 @@ _public_key: Optional[str] = None
 
 
 def _load_key(path_env: str, inline_env: str, default_path: str) -> Optional[str]:
-  """优先读 inline PEM 环境变量，其次读 key 文件路径。"""
+  """优先读 inline PEM 环境变量，其次读 key 文件路径。
+
+  找不到时返回 None（调用方每次重试，不做负数缓存——密钥文件后部署也能自愈）。
+  """
   inline = os.getenv(inline_env)
   if inline:
     # 允许 inline PEM 用 \n 转义存储（systemd/docker env 常见写法）
@@ -33,6 +36,11 @@ def _load_key(path_env: str, inline_env: str, default_path: str) -> Optional[str
     with open(path, "r", encoding="utf-8") as f:
       return f.read()
   except FileNotFoundError:
+    # 打出实际尝试的绝对路径和来源，部署路径问题的第一排查线索
+    logging.warning(
+      "JWT key file not found: %s (from %s=%s, cwd=%s)",
+      os.path.abspath(path), path_env, os.getenv(path_env, "<unset, using default>"), os.getcwd(),
+    )
     return None
 
 
@@ -40,8 +48,6 @@ def get_private_key() -> Optional[str]:
   global _private_key
   if _private_key is None:
     _private_key = _load_key("JWT_PRIVATE_KEY_PATH", "JWT_PRIVATE_KEY", Config.JWT_PRIVATE_KEY_PATH)
-    if _private_key is None:
-      logging.warning("JWT private key not found (JWT_PRIVATE_KEY_PATH/JWT_PRIVATE_KEY)")
   return _private_key
 
 
@@ -49,8 +55,6 @@ def get_public_key() -> Optional[str]:
   global _public_key
   if _public_key is None:
     _public_key = _load_key("JWT_PUBLIC_KEY_PATH", "JWT_PUBLIC_KEY", Config.JWT_PUBLIC_KEY_PATH)
-    if _public_key is None:
-      logging.warning("JWT public key not found (JWT_PUBLIC_KEY_PATH/JWT_PUBLIC_KEY)")
   return _public_key
 
 

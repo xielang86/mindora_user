@@ -445,6 +445,38 @@ class UserServer:
       return web.json_response(BaseResponse(code=500, msg="Internal server error").model_dump(), status=500)
 
   # -------------------- 启动 --------------------
+  def _startup_self_check(self) -> None:
+    """启动自检：关键运行资源缺失时打 ERROR（不阻断启动），让部署遗漏在启动日志即可见。
+
+    覆盖：
+      - 运营配置 popup_survey_config.json（缺失 → /popup 恒空、/survey 恒 404，
+        故障特征见 ops_config._load_ops_config 的缓存兜底）
+      - 睡眠推荐资源（knowledge_base / topology / reco_candidates，缺失 → 推荐退化为兜底）
+      - LLM 可用性（ARK_API_KEY 未配 → 分析文案用默认模板）
+    """
+    from ops_config import ops_config_status
+
+    st = ops_config_status()
+    if not st["exists"]:
+      logging.error(
+        "[self-check] ops config MISSING: %s — /popup 将恒返回空、/survey 将恒 404。"
+        "部署 data/popup_survey_config.json 即可恢复（mtime 热加载，无需重启）",
+        st["path"],
+      )
+    else:
+      logging.info(
+        "[self-check] ops config OK: %s (popups=%d surveys=%d next_query_after=%s)",
+        st["path"], st["popups"], st["surveys"], st["next_query_after"],
+      )
+
+    from llm import reco as llm_reco
+    for res in (llm_reco._KNOWLEDGE_BASE_PATH, llm_reco._TOPOLOGY_PATH, llm_reco._SOP_CANDIDATES_PATH):
+      if not os.path.exists(res):
+        logging.error("[self-check] reco resource MISSING: %s — 睡眠推荐将退化为兜底策略", res)
+
+    if not self.llm.enabled:
+      logging.warning("[self-check] LLM disabled (ARK_API_KEY 未配置) — 分析/洞察文案使用默认模板")
+
   async def start_http(self):
     """启动HTTP服务器"""
     runner = web.AppRunner(self.app)
@@ -452,6 +484,7 @@ class UserServer:
     site = web.TCPSite(runner, self.host, self.port)
     await site.start()
     logging.info(f"UserServer (LevelDB) started on http://{self.host}:{self.port}")
+    self._startup_self_check()
     # 保持服务运行
     await asyncio.Event().wait()
 

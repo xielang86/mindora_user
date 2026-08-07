@@ -116,3 +116,16 @@ def _load_ops_config() -> tuple[list, dict, Optional[int]]:
       path, len(popups), len(surveys), next_query_after,
     )
     return popups, surveys, next_query_after
+
+
+def ops_config_status() -> dict:
+  """启动自检用：触发一次加载（或命中缓存）并返回配置状态快照。"""
+  popups, surveys, next_query_after = _load_ops_config()
+  path = _ops_config_path()
+  return {
+    "path": str(path),
+    "exists": path.is_file(),
+    "popups": len(popups),
+    "surveys": len(surveys),
+    "next_query_after": next_query_after,
+  }
