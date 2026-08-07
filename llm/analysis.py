@@ -30,6 +30,7 @@ from typing import Any, Optional
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from llm.ark_chat import VolcEngineArkChat
+from llm.router import ModelRouter
 
 
 from user_profile import compute_recent_sleep_stats
@@ -415,32 +416,28 @@ Return ONLY a JSON object (no markdown, no explanation) with exactly these six m
 
 class SleepAnalysisLLM:
     """
-    Async wrapper around VolcEngineArkChat for sleep analysis text generation.
-    Falls back gracefully (returns None) when ARK_API_KEY is not set or
+    Async wrapper for sleep analysis text generation.
+
+    请求方向由 ModelRouter 决定（llm/router.py）：一组 key(env) + url(config) 算一个方向，
+    按 Config.LLM_ROUTING 规则把 request_type 路由到 volc_ark / kimi 等方向。
+    Falls back gracefully (returns None) when no route is available (no API key) or
     on any LLM/network error.
     """
 
-    def __init__(self):
-        self._model: Optional[VolcEngineArkChat] = None
-        self._init_model()
-
-    def _init_model(self):
-        api_key     = os.getenv("ARK_API_KEY")
-        endpoint_id = os.getenv("ARK_ENDPOINT_ID", "ep-20260325170723-znh7n")
-        model       = os.getenv("ARK_MODEL", "doubao-seed-2-0-lite-260215")
-        if not api_key:
-            logging.warning("ARK_API_KEY not set — LLM analysis disabled, using default text")
-            return
-        try:
-            self._model = VolcEngineArkChat(
-                ark_api_key=api_key,
-                endpoint_id=endpoint_id,
-                model=model,
-                temperature=0.5,
+    def __init__(self, router: Optional["ModelRouter"] = None):
+        self._router = router or ModelRouter.from_env()
+        self._model = self._router.chat_model_for("default")
+        if self._model is None:
+            logging.warning(
+                "no available LLM route (set ARK_API_KEY or KIMI_API_KEY) — LLM analysis disabled, using default text"
             )
-            logging.info("SleepAnalysisLLM ready (endpoint=%s, model=%s)", endpoint_id, model)
-        except Exception as e:
-            logging.error("SleepAnalysisLLM init failed: %s", e)
+
+    def _model_for(self, request_type: str) -> Optional[VolcEngineArkChat]:
+        """按 request_type 路由到对应方向的 chat model；兼容 __new__ 构造（无 _router）的旧测试。"""
+        router = getattr(self, "_router", None)
+        if router is None:
+            return self._model
+        return router.chat_model_for(request_type) or self._model
 
     @property
     def enabled(self) -> bool:
@@ -454,11 +451,13 @@ class SleepAnalysisLLM:
 
     # ── internal ──────────────────────────────────────────────
 
-    async def _call(self, user_prompt: str) -> Optional[str]:
+    async def _call(self, user_prompt: str, request_type: str = "default") -> Optional[str]:
         """Run a blocking LLM call in a thread pool."""
         if not self.enabled:
             return None
-        model = self._model
+        model = self._model_for(request_type)
+        if model is None:
+            return None
 
         def _invoke() -> str:
             resp = model.invoke([
@@ -521,7 +520,7 @@ class SleepAnalysisLLM:
         if prompt_fn is None:
             return None
 
-        raw = await self._call(prompt_fn())
+        raw = await self._call(prompt_fn(), request_type)
         return self._parse(raw)
 
     def generate_sync(
@@ -554,8 +553,12 @@ class SleepAnalysisLLM:
         if prompt_fn is None:
             return None
 
+        model = self._model_for(request_type)
+        if model is None:
+            return None
+
         try:
-            resp = self._model.invoke([
+            resp = model.invoke([
                 SystemMessage(content=_SYSTEM),
                 HumanMessage(content=prompt_fn()),
             ])

@@ -35,6 +35,14 @@ def _ops_config_path() -> Path:
 _ops_config_lock = threading.Lock()
 _ops_config_cache: dict = {"path": None, "mtime": None, "popups": [], "surveys": {}}
 
+# 配置成功热加载后的回调（fn(popups, surveys)）。用于消息目录等派生状态同步，
+# 由 engagement_service 在初始化时注册；单个 hook 失败不影响加载主流程。
+_reload_hooks: list = []
+
+
+def register_reload_hook(fn) -> None:
+  _reload_hooks.append(fn)
+
 # action_type="route" 时 action_payload.route 的白名单（tanchuang_suvey.md「route 候选常量」，与客户端硬编码一致；
 # 新增路由必须先发客户端版本，服务端才能下发）
 POPUP_ROUTE_WHITELIST = {
@@ -82,6 +90,19 @@ def _validate_popups(popups: list) -> list:
   return valid
 
 
+def find_dangling_survey_refs(popups: list, surveys: dict) -> list[str]:
+  """弹窗 action_payload.survey_id 必须在 surveys 字典里，否则用户点弹窗拉题会 404。
+
+  返回悬空引用列表（"popup_id→survey_id"），空列表表示一致。
+  """
+  dangling = []
+  for popup in popups:
+    sid = (popup.get("action_payload") or {}).get("survey_id")
+    if sid and sid not in surveys:
+      dangling.append(f"{popup.get('popup_id')}→{sid}")
+  return dangling
+
+
 def _load_ops_config() -> tuple[list, dict, Optional[int]]:
   """读取弹窗/问卷运营配置 (popups, surveys, next_query_after)。文件无变化时直接返回缓存。"""
   path = _ops_config_path()
@@ -102,6 +123,10 @@ def _load_ops_config() -> tuple[list, dict, Optional[int]]:
       if not isinstance(popups, list) or not isinstance(surveys, dict):
         raise ValueError("popups must be a list and surveys must be a dict")
       popups = _validate_popups(popups)
+      dangling = find_dangling_survey_refs(popups, surveys)
+      if dangling:
+        # 文件能解析但引用悬空：弹窗能下发，用户点击后 query_survey 必 404
+        logging.error("ops config dangling survey refs (点弹窗拉题会 404): %s", dangling)
       next_query_after = _clamp_next_query_after(raw.get("next_query_after"))
     except (json.JSONDecodeError, ValueError) as e:
       logging.error("ops config parse failed (%s), keep last good config: %s", path, e)
@@ -115,6 +140,11 @@ def _load_ops_config() -> tuple[list, dict, Optional[int]]:
       "ops config reloaded: %s (popups=%d surveys=%d next_query_after=%s)",
       path, len(popups), len(surveys), next_query_after,
     )
+    for hook in _reload_hooks:
+      try:
+        hook(popups, surveys)
+      except Exception as e:
+        logging.error("ops config reload hook failed: %s", e)
     return popups, surveys, next_query_after
 
 
@@ -128,4 +158,5 @@ def ops_config_status() -> dict:
     "popups": len(popups),
     "surveys": len(surveys),
     "next_query_after": next_query_after,
+    "dangling_survey_refs": find_dangling_survey_refs(popups, surveys),
   }

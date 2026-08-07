@@ -280,6 +280,9 @@ def init_user_rights_columns():
   columns = {
     "user_level": "VARCHAR(32) NOT NULL DEFAULT 'free' COMMENT '用户等级：free/pro/premium'",
     "level_end_at": "DATETIME DEFAULT NULL COMMENT '会员等级结束时间'",
+    # 运营角色：none-普通用户，admin-运营（可 push 消息），super-0号管理员（可授权他人）。
+    # super 只允许数据库 SQL 直接设置，代码不提供设置 super 的入口（见 set_ops_role）。
+    "ops_role": "VARCHAR(16) NOT NULL DEFAULT 'none' COMMENT '运营角色：none/admin/super'",
   }
   db_name = os.getenv("MYSQL_DB", "")
   for col, definition in columns.items():

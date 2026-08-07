@@ -138,6 +138,57 @@ def req_query_popups():
     )
 
 
+def req_query_popups_history():
+    # popup_survey.md 2.1 历史消息恢复：scope=history，不做定向/频控，不带 next_query_after
+    def check(d):
+        popups = d.get("popups")
+        if not isinstance(popups, list):
+            return False, f"popups not a list: {popups!r}"
+        if "next_query_after" in d:
+            return False, "history 响应不应带 next_query_after"
+        for m in popups:
+            if not m.get("delivered_at"):
+                return False, f"{m.get('popup_id')} 缺 delivered_at"
+        return True, f"popups={len(popups)}, delivered_at 全部必填"
+
+    # 按 ID 精确恢复（含过期/下线条目；未知 ID 静默忽略）
+    run_case(
+        "query_popups scope=history 按 ID 恢复",
+        "/popup",
+        envelope("query_popups", {
+            **_auth_data(),
+            "language": LANGUAGE,
+            "scope": "history",
+            "popup_ids": [POPUP_ID, "pop_nonexistent"],
+        }),
+        expect_code=0,
+        check=check,
+    )
+    # popup_ids 缺省 → 全量兜底（该 uid 落地过的 ∩ 仍在有效期内）
+    run_case(
+        "query_popups scope=history 全量兜底",
+        "/popup",
+        envelope("query_popups", {
+            **_auth_data(),
+            "language": LANGUAGE,
+            "scope": "history",
+        }),
+        expect_code=0,
+        check=check,
+    )
+    # 非法 scope → 400
+    run_case(
+        "query_popups scope=bogus → expect 400",
+        "/popup",
+        envelope("query_popups", {
+            **_auth_data(),
+            "language": LANGUAGE,
+            "scope": "bogus",
+        }),
+        expect_code=400,
+    )
+
+
 def req_report_popup():
     # 不依赖 query_popups 的返回（可能被 display_rule 抑制为空），直接用配置里的 id。
     for event in ("impression", "click"):
@@ -361,6 +412,7 @@ def req_missing_auth():
 
 ALL_CASES = [
     req_query_popups,
+    req_query_popups_history,
     req_report_popup,
     req_query_survey,
     req_submit_survey,

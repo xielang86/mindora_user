@@ -69,6 +69,9 @@ class UserProfileServ:
   def query_popups(self, uid: str, language: str, placement: str = "home") -> dict:
     return self.engagement.query_popups(uid, language, placement)
 
+  def query_message_history(self, uid: str, language: str, popup_ids) -> list:
+    return self.engagement.query_message_history(uid, language, popup_ids)
+
   def report_popup_event(self, uid: str, popup_id: str, event: str, event_at: int) -> bool:
     return self.engagement.report_popup_event(uid, popup_id, event, event_at)
 
@@ -165,6 +168,37 @@ class UserProfileServ:
 
       self.text_profiles[uid] = self._profile_to_json_data(profile)
       self._flush_text_profiles_unlocked()
+
+  # -------------------- 全局 KV（非 per-user 数据） --------------------
+  # 用途：消息目录 _meta:msg:<popup_id>（popup_survey.md 2.1 历史消息恢复）等。
+  # "_meta:" 前缀保证与 uid 不冲突；txt_json 模式下与用户数据同文件共存（按 key 隔离）。
+
+  def get_global(self, key: str) -> Optional[Any]:
+    """点查全局 KV。"""
+    with self.lock:
+      if self.storage_mode == "leveldb":
+        data = self.db.get(key.encode("utf-8"))
+        return json.loads(data.decode("utf-8")) if data else None
+      return self.text_profiles.get(key)
+
+  def put_global(self, key: str, value: Any) -> None:
+    """写全局 KV（单条）。"""
+    with self.lock:
+      if self.storage_mode == "leveldb":
+        self.db.put(key.encode("utf-8"), json.dumps(value, ensure_ascii=False).encode("utf-8"))
+        return
+      self.text_profiles[key] = value
+      self._flush_text_profiles_unlocked()
+
+  def iter_global_prefix(self, prefix: str) -> list:
+    """按前缀迭代全局 KV，返回 [(key, value), ...]（LevelDB key 有序，顺序遍历）。"""
+    with self.lock:
+      if self.storage_mode == "leveldb":
+        out = []
+        for k, v in self.db.iterator(prefix=prefix.encode("utf-8")):
+          out.append((k.decode("utf-8"), json.loads(v.decode("utf-8"))))
+        return out
+      return [(k, v) for k, v in self.text_profiles.items() if k.startswith(prefix)]
 
   def _get_or_create_profile_unlocked(self, uid: str) -> UserProfile:
     """读取画像，不存在则返回一个新画像对象（调用方负责 save_profile）。"""

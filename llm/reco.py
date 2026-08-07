@@ -8,9 +8,11 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, List, Optional
 
+from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from llm.ark_chat import VolcEngineArkChat
+from llm.router import ModelRouter
 from user_profile import UserProfile, SleepScenario
 
 
@@ -273,19 +275,10 @@ Task:
 """
 
 
-def _get_model() -> Optional[VolcEngineArkChat]:
-    api_key = os.getenv("ARK_API_KEY")
-    endpoint_id = os.getenv("ARK_ENDPOINT_ID", "ep-20260325170723-znh7n")
-    model = os.getenv("ARK_MODEL", "doubao-seed-2-0-lite-260215")
-    if not api_key:
-        return None
+def _get_model() -> Optional[BaseChatModel]:
+    """睡眠推荐的 LLM 请求方向由 ModelRouter 决定（request_type="sleep_reco"，缺省走 default 方向）。"""
     try:
-        return VolcEngineArkChat(
-            ark_api_key=api_key,
-            endpoint_id=endpoint_id,
-            model=model,
-            temperature=0.3,
-        )
+        return ModelRouter.from_env().chat_model_for("sleep_reco", temperature=0.3)
     except Exception as e:
         logging.error("sleep recommendation llm init failed: %s", e)
         return None
@@ -476,7 +469,7 @@ class RecommendationEngine:
     def generate(profile: UserProfile) -> List[SleepScenario]:
         model = _get_model()
         if model is None:
-            logging.warning("ARK_API_KEY not set, using fallback sleep scenario candidates")
+            logging.warning("no available LLM route (ARK_API_KEY/KIMI_API_KEY unset), using fallback sleep scenario candidates")
             return _fallback_scenarios()
 
         prompt = _build_prompt(profile)
@@ -521,7 +514,7 @@ class RecommendationEngine:
 
         model = _get_model()
         if model is None:
-            logging.warning("ARK_API_KEY not set, using fallback SOP candidates")
+            logging.warning("no available LLM route (ARK_API_KEY/KIMI_API_KEY unset), using fallback SOP candidates")
             return _pick_random_sop_reco(fallback)
 
         prompt = _build_sop_reco_prompt(profile, normalized_candidates)

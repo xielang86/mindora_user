@@ -357,6 +357,15 @@ class UserServer:
         return web.json_response(InvalidOrExpiredTokenResp().model_dump(), status=401)
 
       if req.request_type == "query_popups":
+        # scope=history（popup_survey.md 2.1 历史消息恢复）：不做定向/频控/优先级，
+        # 不带 next_query_after（非轮询，客户端仅登录后调一次）
+        if req.data.scope == "history":
+          messages = await asyncio.to_thread(
+            self.user_serv.query_message_history, uid, req.data.language, req.data.popup_ids,
+          )
+          resp = BaseResponse(code=0, msg="ok")
+          return web.json_response({**resp.model_dump(), "data": {"popups": messages}})
+
         result = await asyncio.to_thread(
           self.user_serv.query_popups, uid, req.data.language, req.data.placement,
         )
@@ -468,6 +477,11 @@ class UserServer:
         "[self-check] ops config OK: %s (popups=%d surveys=%d next_query_after=%s)",
         st["path"], st["popups"], st["surveys"], st["next_query_after"],
       )
+      if st["dangling_survey_refs"]:
+        logging.error(
+          "[self-check] ops config 弹窗引用了不存在的问卷（用户点击后 query_survey 必 404）: %s",
+          st["dangling_survey_refs"],
+        )
 
     from llm import reco as llm_reco
     for res in (llm_reco._KNOWLEDGE_BASE_PATH, llm_reco._TOPOLOGY_PATH, llm_reco._SOP_CANDIDATES_PATH):
@@ -475,7 +489,7 @@ class UserServer:
         logging.error("[self-check] reco resource MISSING: %s — 睡眠推荐将退化为兜底策略", res)
 
     if not self.llm.enabled:
-      logging.warning("[self-check] LLM disabled (ARK_API_KEY 未配置) — 分析/洞察文案使用默认模板")
+      logging.warning("[self-check] LLM disabled (ARK_API_KEY / KIMI_API_KEY 均未配置) — 分析/洞察文案使用默认模板")
 
   async def start_http(self):
     """启动HTTP服务器"""

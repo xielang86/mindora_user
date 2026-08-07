@@ -1,8 +1,14 @@
-"""engagement_service.py — 弹窗 / 问卷 / 陪伴足迹业务逻辑（tanchuang_suvey.md, peibanzuji.md）。
+"""engagement_service.py — 弹窗 / 问卷 / 陪伴足迹业务逻辑（popup_survey.md, peibanzuji.md）。
 
 从 user_server.py 拆出（原 UserProfileServ 的职责D）。存储与并发控制通过
 构造时传入的画像服务（profile_service.UserProfileServ）复用：
 lock / get_profile / save_profile / _get_or_create_profile_unlocked。
+
+站内消息历史恢复（popup_survey.md 2.1）：
+  - 全局消息目录存 LevelDB 全局 KV（_meta:msg:<popup_id> 一消息一 key，append-only），
+    由配置热加载钩子 _sync_message_catalog 维护，不与用户绑定
+  - per-user 只复用 inbox_messages 的落地记录（created_at = 首次下发时间），
+    已读/已删/展示次数一律不存（客户端 Keychain 管理）
 """
 import datetime
 import logging
@@ -11,7 +17,7 @@ import uuid
 from typing import List, Optional
 from zoneinfo import ZoneInfo
 
-from ops_config import _i18n, _load_ops_config
+from ops_config import _i18n, _load_ops_config, register_reload_hook
 from user_profile import (
   UserProfile, PopupState, InboxMessage, SurveySubmission, FootprintDay,
 )
@@ -19,10 +25,121 @@ from user_profile import (
 # 陪伴足迹里程碑规则（peibanzuji.md ③）：连续 N 天 plan_completed=true → 一条已完成里程碑
 FOOTPRINT_MILESTONE_STREAK = 5
 
+# 全局消息目录的 LevelDB key 前缀（一消息一 key，点查友好；_meta: 前缀避免撞 uid）
+MESSAGE_CATALOG_PREFIX = "_meta:msg:"
+
 
 class EngagementService:
   def __init__(self, profile_serv):
     self._ps = profile_serv
+    # 配置热加载 → 同步消息目录（append-only；从配置消失的标 offline）
+    register_reload_hook(self._sync_message_catalog)
+
+  # -------------------- 站内消息目录（popup_survey.md 2.1） --------------------
+  def _sync_message_catalog(self, popups: list, surveys: dict) -> None:
+    """配置热加载回调：把符合落消息规则的弹窗（survey 恒落 / push_message=true）
+    upsert 进全局消息目录；目录中已不在配置里的标 offline=true（不物理删，
+    按 ID 精确恢复仍要能取回内容）。
+    """
+    now = int(time.time())
+    active_ids = set()
+    for popup in popups:
+      if not (popup.get("push_message") or popup.get("type") == "survey"):
+        continue
+      pid = popup.get("popup_id")
+      if not pid:
+        continue
+      active_ids.add(pid)
+      record = {
+        "popup_id": pid,
+        "type": popup.get("type"),
+        "i18n": popup.get("i18n") or {},
+        "action_type": popup.get("action_type", "dismiss"),
+        "action_payload": popup.get("action_payload") or {},
+        "image_url": popup.get("image_url", ""),
+        "start_at": popup.get("start_at"),
+        "end_at": popup.get("end_at"),
+        "priority": popup.get("priority", 0),
+        "display_rule": popup.get("display_rule") or {},
+      }
+      key = MESSAGE_CATALOG_PREFIX + pid
+      existing = self._ps.get_global(key)
+      if existing and not existing.get("offline") and all(
+        existing.get(f) == v for f, v in record.items()
+      ):
+        continue  # 内容无变化，不重写（保留 first_seen_at）
+      record["first_seen_at"] = (existing or {}).get("first_seen_at") or now
+      record["offline"] = False
+      self._ps.put_global(key, record)
+
+    for key, record in self._ps.iter_global_prefix(MESSAGE_CATALOG_PREFIX):
+      if record.get("popup_id") not in active_ids and not record.get("offline"):
+        record["offline"] = True
+        self._ps.put_global(key, record)
+        logging.info("message catalog offline: %s", record.get("popup_id"))
+
+  def query_message_history(
+    self, uid: str, language: str, popup_ids: Optional[List[str]]
+  ) -> List[dict]:
+    """scope=history 历史消息恢复（popup_survey.md 2.1）。
+
+    不做投放定向/频控/优先级裁剪。两种取法：
+      - popup_ids 非空：按 ID 精确恢复，含过期/已下线（offline）条目；未知 ID 静默忽略
+      - popup_ids 空：全量兜底，该 uid 落地过的 ∩ 仍在有效期内（end_at 未到/无 且未下线）
+    delivered_at = 该 uid 首次落地时间（inbox_messages.created_at），无记录退回目录 first_seen_at。
+    """
+    now = int(time.time())
+    with self._ps.lock:
+      profile = self._ps.get_profile(uid)
+    landed = {m.popup_id: m.created_at for m in (profile.inbox_messages if profile else [])}
+
+    records: list[dict] = []
+    if popup_ids:
+      for pid in popup_ids:
+        rec = self._ps.get_global(MESSAGE_CATALOG_PREFIX + pid)
+        if rec is not None:
+          records.append(rec)
+    else:
+      for _key, rec in self._ps.iter_global_prefix(MESSAGE_CATALOG_PREFIX):
+        if rec.get("popup_id") not in landed:
+          continue
+        end_at = rec.get("end_at")
+        if end_at is not None and now > end_at:
+          continue
+        if rec.get("offline"):
+          continue
+        records.append(rec)
+
+    messages = [
+      self._catalog_record_to_message(rec, language, landed)
+      for rec in records
+    ]
+    messages.sort(key=lambda m: m.get("delivered_at") or 0, reverse=True)
+    return messages
+
+  @staticmethod
+  def _catalog_record_to_message(rec: dict, language: str, landed: dict) -> dict:
+    """目录记录 → 与 query_popups 响应 popups[] 同构的消息（+ delivered_at 必填）。"""
+    text = _i18n(rec, language)
+    pid = rec["popup_id"]
+    return {
+      "popup_id": pid,
+      "type": rec.get("type"),
+      "badge": text.get("badge", ""),
+      "badge_style": text.get("badge_style", "purple"),
+      "title": text.get("title", ""),
+      "subtitle": text.get("subtitle", ""),
+      "image_url": rec.get("image_url", ""),
+      "action_text": text.get("action_text", ""),
+      "action_type": rec.get("action_type", "dismiss"),
+      "action_payload": rec.get("action_payload") or {},
+      "push_message": True,
+      "start_at": rec.get("start_at"),
+      "end_at": rec.get("end_at"),
+      "delivered_at": landed.get(pid) or rec.get("first_seen_at"),
+      "priority": rec.get("priority", 0),
+      "display_rule": rec.get("display_rule") or {},
+    }
 
   def query_popups(self, uid: str, language: str, placement: str = "home") -> dict:
     """拉取当前应展示的弹窗列表：按时间窗/展示位/用户频控过滤，按 priority 降序。
@@ -83,6 +200,11 @@ class EngagementService:
           continue
 
         text = _i18n(popup, language)
+        # 首次对该 uid 下发时间：消息弹窗取站内信落地时间（上面已落地），纯弹窗为本次
+        delivered_at = next(
+          (m.created_at for m in profile.inbox_messages if m.popup_id == popup["popup_id"]),
+          now,
+        )
         result.append({
           "popup_id": popup["popup_id"],
           "type": popup["type"],
@@ -97,6 +219,7 @@ class EngagementService:
           "push_message": bool(popup.get("push_message")),
           "start_at": start_at,
           "end_at": end_at,
+          "delivered_at": delivered_at,
           "priority": popup.get("priority", 0),
           "display_rule": rule,
         })

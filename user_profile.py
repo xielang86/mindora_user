@@ -593,7 +593,7 @@ class AnalysisResponse(BaseResponse):
   data: Optional[Dict[str, Any]] = None
 
 
-# -------------------------- /popup 请求模型（tanchuang_suvey.md） --------------------------
+# -------------------------- /popup 请求模型（popup_survey.md） --------------------------
 class PopupData(BaseModel):
   uid: Optional[str] = Field(None, description="用户标识（debug 用）")
   jwt_token: Optional[str] = Field(None, description="当前登录态 JWT")
@@ -602,6 +602,9 @@ class PopupData(BaseModel):
   app_version: Optional[str] = Field(None, description="客户端版本，用于灰度投放")
   platform: Optional[str] = Field(None, description="ios / android")
   placement: str = Field("home", description="展示位，当前固定 home")
+  # query_popups scope=history 字段（popup_survey.md 2.1 历史消息恢复）
+  scope: str = Field("active", description="active=投放查询（缺省）/ history=历史消息恢复")
+  popup_ids: Optional[List[str]] = Field(None, description="仅 scope=history：非空按 ID 精确恢复（含过期条目）；空/缺省拉该 uid 全量有效消息")
   # report_popup 字段
   popup_id: Optional[str] = Field(None, description="report_popup 必填，对应下发的弹窗 ID")
   event: Optional[str] = Field(None, description="report_popup 必填：impression/click/dismiss")
@@ -617,6 +620,8 @@ class PopupRequest(BaseModel):
   def validate_data_by_request_type(self):
     if self.data.jwt_token is None and self.data.uid is None:
       raise ValueError("uid or jwt_token must be provided")
+    if self.data.scope not in ("active", "history"):
+      raise ValueError(f"unknown scope: {self.data.scope}")
     if self.request_type == "report_popup":
       if not self.data.popup_id:
         raise ValueError("report_popup 时 data.popup_id 必填")
