@@ -36,9 +36,6 @@ from llm.router import ModelRouter
 from user_profile import compute_recent_sleep_stats
 
 
-_PROFILE_JSON_MAX_CHARS = 12000
-
-
 # ──────────────────────────────────────────────────────────────
 # Public helpers
 # ──────────────────────────────────────────────────────────────
@@ -51,6 +48,11 @@ def extract_sleep_context(profile, data) -> dict:
     Raw sleep sequences and behavior series are intentionally excluded.
     Sleep stage statistics are aggregated locally; only the stats are
     exposed, along with the ``sleep_analysis`` fields stored in the profile.
+
+    Key 命名约定：
+      - avg_* / typical_* / weekly_top_* : compute_recent_sleep_stats 的 7 天聚合
+      - latest_*                          : 当夜（sleep_data 最后一条）明细
+    prompt 模板只允许引用这里产出的 key，避免出现 None/'—' 占位符。
     """
     ctx: dict[str, Any] = {
         "date":       getattr(data, "date", None) or "",
@@ -66,6 +68,38 @@ def extract_sleep_context(profile, data) -> dict:
     stats = compute_recent_sleep_stats(profile, days=7)
     ctx.update(stats)
 
+    # 当夜明细（sleep_data 最后一条）——日视图 / 探索页的 prompt 需要夜级数据。
+    latest = profile.sleep_data[-1] if profile.sleep_data else None
+    if latest is not None:
+        summaries = latest.sequence_summaries if latest.sleep_status else {}
+        tb = summaries.get("time_in_bed") or 0
+        ctx.update({
+            "latest_score":           latest.sleep_quality,
+            "latest_soe":             latest.soe,
+            "latest_onset_min":       latest.onset,
+            "latest_sleep_arch":      latest.sleep_arch_index,
+            "latest_night_var":       latest.night_var_index,
+            "latest_first_sleep_time": latest.first_sleep_time,
+            "latest_hr_before_sleep": latest.hr_before_sleep,
+            "latest_rr_before_sleep": latest.rr_before_sleep,
+            "latest_hrv":             latest.hrv,
+            "latest_hr_min":          latest.hr_min,
+            "latest_hr_max":          latest.hr_max,
+            "latest_deep_min":        summaries.get("deep_sleep_duration"),
+            "latest_rem_min":         summaries.get("rem_sleep_duration"),
+            "latest_core_min":        summaries.get("core_sleep_duration"),
+            "latest_awake_count":     summaries.get("night_awake_count"),
+            "latest_awake_min":       summaries.get("night_awake_duration"),
+            "latest_awake_type":      summaries.get("night_awake_type"),
+            "latest_deep_pct":        round(summaries.get("deep_sleep_duration", 0) / tb * 100, 1) if tb else None,
+            "latest_rem_pct":         round(summaries.get("rem_sleep_duration", 0) / tb * 100, 1) if tb else None,
+            "latest_core_pct":        round(summaries.get("core_sleep_duration", 0) / tb * 100, 1) if tb else None,
+        })
+
+    # 场景别名：weekly_top_scene_* → prompt 里的 scene_name / used_times
+    ctx["scene_name"] = stats.get("weekly_top_scene_title")
+    ctx["used_times"] = stats.get("weekly_top_scene_count")
+
     # Profile sleep_analysis fields drive the prompt content.
     sleep_analysis = profile.sleep_analysis or {}
     ctx["sleep_trend_week"]  = sleep_analysis.get("sleep_trend_week", "")
@@ -73,71 +107,9 @@ def extract_sleep_context(profile, data) -> dict:
     ctx["scene_title"]       = (sleep_analysis.get("scene") or {}).get("title", "")
     ctx["scene_text"]        = (sleep_analysis.get("scene") or {}).get("text", "")
 
-
-    return ctx
-
-
-def _truncate_text(text: str, max_chars: int) -> str:
-    if len(text) <= max_chars:
-        return text
-    return text[: max_chars - 32] + "\n... [truncated for prompt size]"
-
-
-def _summarize_behavior_series(behaviors: dict[str, Any]) -> dict[str, Any]:
-    summarized: dict[str, Any] = {}
-    for key, values in (behaviors or {}).items():
-        if not isinstance(values, list):
-            summarized[key] = values
-            continue
-        summarized[key] = {
-            "count": len(values),
-            "recent_samples": values[-5:],
-        }
-    return summarized
-
-
-def _serialize_profile_for_prompt(profile) -> str:
-    """Kept for non-sleep-advice prompts; still omits bulky image payloads."""
-    profile_dict = profile.model_dump(mode="json", exclude_none=True)
-
-    if isinstance(profile_dict.get("profile"), dict):
-        # Skip bulky image payloads while keeping the field name visible.
-        if profile_dict["profile"].get("avatar_base64"):
-            profile_dict["profile"]["avatar_base64"] = "[omitted base64 image data]"
-
-    profile_dict["behaviors"] = _summarize_behavior_series(profile_dict.get("behaviors", {}))
-
-    text = json.dumps(profile_dict, ensure_ascii=False, indent=2)
-    return _truncate_text(text, _PROFILE_JSON_MAX_CHARS)
-
-
-def _summarize_profile_for_prompt(profile) -> str:
-    """Return a compact, LLM-friendly snapshot of the user profile.
-
-    Includes only stable user info and the stored sleep_analysis fields.
-    Raw behaviors and full mindora_record history are intentionally omitted.
-    """
-    if not profile:
-        return "{}"
-
-    data: dict[str, Any] = {}
-    if profile.basic_info:
-        data["basic_info"] = profile.basic_info
-    if profile.long_term_profile:
-        data["long_term_profile"] = profile.long_term_profile
-    if profile.profile:
-        prof = profile.profile.model_dump(mode="json", exclude_none=True)
-        prof.pop("avatar_base64", None)
-        data["profile"] = prof
-
-    sleep_analysis = profile.sleep_analysis or {}
-    data["sleep_analysis"] = {
-        "sleep_trend_week": sleep_analysis.get("sleep_trend_week", ""),
-        "sleep_trend_month": sleep_analysis.get("sleep_trend_month", ""),
-        "scene": sleep_analysis.get("scene", {}),
-    }
-
-    return json.dumps(data, ensure_ascii=False, indent=2)
+    # 去掉 None 值，让 prompt 模板里 ctx.get(key, '—') 的默认值真正生效
+    # （key 存在但值为 None 时 .get 不会用默认值，会把 None 渲染进 prompt）
+    return {k: v for k, v in ctx.items() if v is not None}
 
 
 def deep_merge(base: dict, updates: dict) -> None:
@@ -183,8 +155,8 @@ def _prompt_overview(ctx: dict) -> str:
 
 Sleep data summary:
 - Date: {ctx.get('date')}
-- 7-day average sleep quality: {ctx.get('avg_score')} / 100
-- Last night's quality: {ctx.get('latest_score')} / 100
+- 7-day average sleep quality: {ctx.get('avg_sleep_quality','—')} / 100
+- Last night's quality: {ctx.get('latest_score','—')} / 100
 - Most-used scene (7 days): {ctx.get('scene_name','—')} × {ctx.get('used_times','—')} times
 
 Return JSON with exactly these keys:
@@ -200,12 +172,12 @@ def _prompt_sleep_day(ctx: dict) -> str:
     return f"""{_lang_instruction(ctx.get('language','en'))}
 
 Sleep data for {ctx.get('date')}:
-- Quality score: {ctx.get('latest_score')} / 100
-- First sleep time: {ctx.get('first_sleep_time','—')}
-- Pre-sleep HR: {ctx.get('hr_before_sleep','—')} bpm  RR: {ctx.get('rr_before_sleep','—')} brpm
-- Deep: {ctx.get('deep_min')} min ({ctx.get('deep_pct')}%)  REM: {ctx.get('rem_min')} min ({ctx.get('rem_pct')}%)
-- Core: {ctx.get('core_min')} min  Night wakings: {ctx.get('awake_count')} × {ctx.get('awake_min')} min
-- Scene used: {ctx.get('scene_name','—')}
+- Quality score: {ctx.get('latest_score','—')} / 100
+- First sleep time: {ctx.get('latest_first_sleep_time','—')}
+- Pre-sleep HR: {ctx.get('latest_hr_before_sleep','—')} bpm  RR: {ctx.get('latest_rr_before_sleep','—')} brpm
+- Deep: {ctx.get('latest_deep_min','—')} min ({ctx.get('latest_deep_pct','—')}%)  REM: {ctx.get('latest_rem_min','—')} min ({ctx.get('latest_rem_pct','—')}%)
+- Core: {ctx.get('latest_core_min','—')} min  Night wakings: {ctx.get('latest_awake_count','—')} × {ctx.get('latest_awake_min','—')} min
+- Scene used: {ctx.get('recent_scene_title','—')}
 
 Return JSON with exactly these keys:
 {{
@@ -223,15 +195,16 @@ Return JSON with exactly these keys:
 
 
 def _prompt_sleep_week(ctx: dict) -> str:
-    score = ctx.get('avg_score')
+    score = ctx.get('avg_sleep_quality')
     label = "Excellent" if score and score >= 80 else "Good" if score and score >= 60 else "Fair"
+    score = score if score is not None else '—'
     return f"""{_lang_instruction(ctx.get('language','en'))}
 
 Weekly sleep summary ({ctx.get('start_date')} – {ctx.get('end_date')}):
 - Average quality score: {score} / 100  (baseline label: {label})
 - Most-used scene: {ctx.get('scene_name','—')} × {ctx.get('used_times','—')} times
-- Typical first-sleep time: {ctx.get('first_sleep_time','—')}
-- Deep sleep proportion: {ctx.get('deep_pct')}%  REM: {ctx.get('rem_pct')}%
+- Typical first-sleep time: {ctx.get('typical_first_sleep_time','—')}
+- Deep sleep proportion: {ctx.get('avg_deep_pct','—')}%  REM: {ctx.get('avg_rem_pct','—')}%
 
 Return JSON with exactly these keys:
 {{
@@ -246,14 +219,15 @@ Return JSON with exactly these keys:
 
 
 def _prompt_sleep_month(ctx: dict) -> str:
-    score = ctx.get('avg_score')
-    scene_name = ctx.get('scene_name', '—')
+    score = ctx.get('avg_sleep_quality')
+    scene_name = ctx.get('scene_name') or '—'
+    score = score if score is not None else '—'
     return f"""{_lang_instruction(ctx.get('language','en'))}
 
 Monthly sleep summary ({ctx.get('start_date')} – {ctx.get('end_date')}):
 - Average quality score: {score} / 100
 - Top sleep scene: {scene_name}
-- Average deep sleep: {ctx.get('deep_pct')}%  REM: {ctx.get('rem_pct')}%
+- Average deep sleep: {ctx.get('avg_deep_pct','—')}%  REM: {ctx.get('avg_rem_pct','—')}%
 
 Return JSON with exactly these keys:
 {{
@@ -307,19 +281,21 @@ def _prompt_explore(ctx: dict, modules: list) -> str:
             "description": "<1 actionable sentence of personalised advice>",
         }
 
-    hr = ctx.get('avg_heart_rate', '—')
-    hr_lo = round(hr - 15) if isinstance(hr, (int, float)) else '—'
-    hr_hi = round(hr + 15) if isinstance(hr, (int, float)) else '—'
+    # 当夜心率范围：update_profile 时按睡眠窗口持久化的 hr_min/hr_max
+    hr_lo = ctx.get('latest_hr_min')
+    hr_hi = ctx.get('latest_hr_max')
+    hr_lo = round(hr_lo) if isinstance(hr_lo, (int, float)) else '—'
+    hr_hi = round(hr_hi) if isinstance(hr_hi, (int, float)) else '—'
 
     return f"""{_lang_instruction(ctx.get('language','en'))}
 
 Last-night sleep analysis ({ctx.get('date')}):
-- Overall score: {ctx.get('latest_score')} / 100
-- Onset efficiency (SOE): {ctx.get('onset_score')} / 100,  fell asleep in ~? min at {ctx.get('first_sleep_time','—')}
-- Pre-sleep HR: {ctx.get('hr_before_sleep','—')} bpm   RR: {ctx.get('rr_before_sleep','—')} brpm
-- Deep: {ctx.get('deep_pct')}%   REM: {ctx.get('rem_pct')}%   Core: {ctx.get('core_pct')}%
-- Night wakings: {ctx.get('awake_count')} × {ctx.get('awake_min')} min   type: {ctx.get('awake_type','—')}
-- HR range: {hr_lo}–{hr_hi} bpm   HRV: {ctx.get('hrv','—')}
+- Overall score: {ctx.get('latest_score','—')} / 100
+- Onset efficiency (SOE): {ctx.get('latest_soe','—')} / 100,  fell asleep in ~{ctx.get('latest_onset_min','?')} min at {ctx.get('latest_first_sleep_time','—')}
+- Pre-sleep HR: {ctx.get('latest_hr_before_sleep','—')} bpm   RR: {ctx.get('latest_rr_before_sleep','—')} brpm
+- Deep: {ctx.get('latest_deep_pct','—')}%   REM: {ctx.get('latest_rem_pct','—')}%   Core: {ctx.get('latest_core_pct','—')}%
+- Night wakings: {ctx.get('latest_awake_count','—')} × {ctx.get('latest_awake_min','—')} min   type: {ctx.get('latest_awake_type','—')}
+- HR range: {hr_lo}–{hr_hi} bpm   HRV: {ctx.get('latest_hrv','—')}
 - Preferred scene (7 days): {ctx.get('scene_name','—')}
 
 Return JSON with exactly these keys:

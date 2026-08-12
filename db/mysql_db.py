@@ -357,6 +357,44 @@ def get_user_rights_info(uid: str) -> dict:
   return build_user_rights_payload(row.get("user_level"), row.get("level_end_at"))
 
 
+# ── 运营角色（ops_role）────────────────────────────────────────────────────
+# 角色语义：none-普通用户；admin-运营，可 push 消息；super-0号管理员，可授权他人。
+# super 只能由数据库 SQL 直接设置（UPDATE user_auth SET ops_role='super' ...），
+# 本模块的 set_ops_role 刻意不接受 'super'，代码里没有晋升 super 的入口。
+
+OPS_ROLES = ("none", "admin", "super")
+OPS_GRANTABLE_ROLES = ("none", "admin")
+
+
+def get_ops_role(uid: str) -> str:
+  """查询用户运营角色；用户不存在/未激活/列缺失一律返回 none。"""
+  if not uid:
+    return "none"
+  try:
+    row = mysql_db.query_one("SELECT ops_role, status FROM user_auth WHERE uid=%s", (uid,))
+  except Exception as e:
+    logging.warning("ops_role column unavailable, fallback to none: %s", e)
+    return "none"
+  if not row or row.get("status") != 1:
+    return "none"
+  role = (row.get("ops_role") or "none").strip().lower()
+  return role if role in OPS_ROLES else "none"
+
+
+def set_ops_role(uid: str, role: str) -> dict:
+  """设置用户运营角色（仅 none/admin；super 只能数据库直设，见模块注释）。"""
+  role = (role or "").strip().lower()
+  if role not in OPS_GRANTABLE_ROLES:
+    return {"code": 400, "msg": f"role must be one of {OPS_GRANTABLE_ROLES}（super 只能数据库设置）", "data": None}
+  row_count = mysql_db.execute(
+    "UPDATE user_auth SET ops_role=%s, update_time=NOW() WHERE uid=%s AND status=1",
+    (role, uid),
+  )
+  if row_count != 1:
+    return {"code": 404, "msg": "user not found or not active", "data": None}
+  return {"code": 0, "msg": "ops role updated", "data": {"uid": uid, "ops_role": role}}
+
+
 def create_redemption_codes(
   batch_id: str,
   target_level: str,

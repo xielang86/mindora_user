@@ -126,7 +126,9 @@ class RedisDB:
 # 初始化Redis实例（全局单例）
 redis_db = RedisDB()
 
-# ------------------- 业务封装：验证码/JWT操作 -------------------
+# ------------------- 业务封装：验证码操作 -------------------
+# 说明：JWT 不再写 Redis（jwt_token:* 历史上只写不读，验签走本地公钥 verify_token；
+# 软删号后的踢下线如需实现，应在验签路径加状态校验，而不是靠这份记录）。
 def get_verify_code(email: str, device_id: str) -> str | None:
   """获取验证码（key格式：verify_code:{email}:{device_id}）"""
   key = f"verify_code:{email}:{device_id}"
@@ -141,16 +143,6 @@ def delete_verify_code(email: str, device_id: str) -> bool:
   key = f"verify_code:{email}:{device_id}"
   return redis_db.delete(key)
 
-def set_jwt_token(uid: str, device_id: str, token: str, expire_seconds: int):
-  """存储JWT Token（key格式：jwt_token:{uid}:{device_id}）"""
-  key = f"jwt_token:{uid}:{device_id}"
-  redis_db.set(key, token, expire_seconds)
-
-def get_jwt_token(uid: str, device_id: str):
-  """存储JWT Token（key格式：jwt_token:{uid}:{device_id}）"""
-  key = f"jwt_token:{uid}:{device_id}"
-  return redis_db.get(key)
-
 
 if __name__ == "__main__":
   import logger
@@ -164,13 +156,3 @@ if __name__ == "__main__":
   time.sleep(expire_seconds + 1)
   read_code = get_verify_code(email, did)
   logging.info(f"after sleep expire_seconds, write vcode={verify_code}, and read for {read_code}")
-
-  uid = "mindora"
-    
-  jwt_token = "jflasfjdlsakjf"
-  set_jwt_token(uid=uid, device_id = did, token = jwt_token, expire_seconds=expire_seconds)
-  read_token = get_jwt_token(uid=uid, device_id=did)
-  logging.info(f"write jwt_token={jwt_token}, and read for {read_token}")
-  time.sleep(expire_seconds + 1)
-  read_token = get_jwt_token(uid=uid, device_id=did)
-  logging.info(f"after sleep expire_seconds, read for {read_token}")

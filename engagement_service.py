@@ -28,6 +28,9 @@ FOOTPRINT_MILESTONE_STREAK = 5
 # 全局消息目录的 LevelDB key 前缀（一消息一 key，点查友好；_meta: 前缀避免撞 uid）
 MESSAGE_CATALOG_PREFIX = "_meta:msg:"
 
+# 全量问卷提交记录的 LevelDB key 前缀（一提交一 key，append-only，运营后台按前缀全量遍历）
+SURVEY_RECORD_PREFIX = "_meta:survey:"
+
 
 class EngagementService:
   def __init__(self, profile_serv):
@@ -264,9 +267,10 @@ class EngagementService:
       "reward": text.get("reward"),
     }
 
-  def submit_survey(self, uid: str, data) -> tuple[Optional[dict], int]:
+  def submit_survey(self, uid: str, data, email: Optional[str] = None) -> tuple[Optional[dict], int]:
     """提交问卷。返回 (响应 data, code)；同一 uid+survey_id 幂等：
-    重复提交返回既有 submission_id 且 reward_granted=False（code=0）。"""
+    重复提交返回既有 submission_id 且 reward_granted=False（code=0）。
+    email 来自 JWT payload，仅用于运营后台记录展示。"""
     _, surveys, _ = _load_ops_config()
     survey = surveys.get(data.survey_id)
     if survey is None:
@@ -318,6 +322,19 @@ class EngagementService:
       )
       profile.survey_submissions[data.survey_id] = submission
       self._ps.save_profile(uid, profile)
+      # 全量问卷记录（运营后台展示用）：一提交一 key，append-only
+      self._ps.put_global(SURVEY_RECORD_PREFIX + submission.submission_id, {
+        "submission_id": submission.submission_id,
+        "uid": uid,
+        "email": email or "",
+        "survey_id": submission.survey_id,
+        "language": data.language,
+        "submitted_at": submission.submitted_at,
+        "duration_seconds": submission.duration_seconds,
+        "answers": [a.model_dump() for a in submission.answers],
+        "gift_delivery": submission.gift_delivery.model_dump(exclude_none=True) if submission.gift_delivery else None,
+        "reward_granted": submission.reward_granted,
+      })
 
     logging.info(
       "survey submitted uid=%s survey_id=%s submission_id=%s duration=%ss answers=%s gift=%s",
@@ -331,6 +348,14 @@ class EngagementService:
       "reward_title": text.get("reward_title", ""),
       "reward_desc": reward.get("desc", ""),
     }, 0
+
+  def list_survey_records(self, survey_id: Optional[str] = None) -> list[dict]:
+    """全量问卷提交记录（运营后台用），按提交时间倒序；可按 survey_id 过滤。"""
+    records = [rec for _key, rec in self._ps.iter_global_prefix(SURVEY_RECORD_PREFIX)]
+    if survey_id:
+      records = [r for r in records if r.get("survey_id") == survey_id]
+    records.sort(key=lambda r: r.get("submitted_at") or 0, reverse=True)
+    return records
 
   def merge_footprint_days(self, uid: str, days: List[FootprintDay]) -> int:
     """上传陪伴足迹：按 uid+date 幂等合并（布尔取 OR、计数取大、首活跃取小）。返回接受的天数。"""

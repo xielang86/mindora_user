@@ -17,18 +17,6 @@ class BaseResponse(BaseModel):
   msg: str = ""
 
 # -------------------------- 子模型定义（对应data下一级字段的嵌套结构） --------------------------
-class UserSocial(BaseModel):
-  """用户社交账号信息模型"""
-  wechat: Optional[str] = Field(None, description="微信号")
-  phone: str = Field(..., description="手机号")
-  email: Optional[EmailStr] = Field(None, description="邮箱")
-
-class UserPreference(BaseModel):
-  """用户偏好设置模型"""
-  theme: str = Field(default="light", description="界面主题")
-  language: str = Field(default="zh-CN", description="语言")
-  notify: bool = Field(default=True, description="是否开启通知")
-
 class Address(BaseModel):
   id: str = Field(..., description="地址唯一 ID")
   is_default: bool = Field(..., description="是否默认地址")
@@ -50,6 +38,7 @@ class Profile(BaseModel):
   weight: Optional[float] = Field(None, description="体重，单位 kg")
   height: Optional[float] = Field(None, description="身高，单位 cm")
   language: str = Field("zh-CN", description="语言")
+  wechat: Optional[str] = Field(None, description="微信号")
 
 
 # 建议新增：环境与敏感度
@@ -107,6 +96,11 @@ class SleepResult(BaseModel):
 
   hrv: Optional[float] = Field(None, description="心率波动，单位bpm")
   respiratory_var: Optional[float] = Field(None, description="呼吸频率波动，单位次/分钟")
+
+  # 当夜心率范围（update_profile 时从 behaviors.heart_rate 按睡眠窗口算出并持久化；
+  # behaviors 序列有 MAX_BEHAVIOR_LEN 截断，请求时再算会丢历史窗口数据）
+  hr_min: Optional[float] = Field(None, description="当夜睡眠窗口内心率最小值，单位bpm")
+  hr_max: Optional[float] = Field(None, description="当夜睡眠窗口内心率最大值，单位bpm")
 
   avg_heart_rate: Optional[float] = Field(None, description="平均心率，单位bpm")
   avg_respiratory: Optional[float] = Field(None, description="平均呼吸频率，单位次/分钟")

@@ -13,7 +13,7 @@ from typing import Any, Optional
 from dotenv import load_dotenv
 import jwt
 from pydantic import BaseModel, ValidationError
-from aiohttp import web
+from aiohttp import ClientSession, web
 
 import analysis_builders
 from analysis_content import AnalysisContentService
@@ -26,7 +26,8 @@ from user_profile import (
   AnalysisRequest, AnalysisResponse,
   PopupRequest, SurveyRequest, FootprintRequest,
 )
-from auth import AuthRequest
+from auth import AuthRequest, AuthData
+from ops_config import append_popup
 from uid.uuid import get_or_create_uuid
 from llm import SleepAnalysisLLM, deep_merge
 import logger
@@ -98,6 +99,9 @@ class UserServer:
     self.app.router.add_post('/popup', self.handle_popup_http)
     self.app.router.add_post('/survey', self.handle_survey_http)
     self.app.router.add_post('/companion_footprint', self.handle_footprint_http)
+    # 运营后台接口（管理员校验：JWT + auth_server 查 ops_role）
+    self.app.router.add_post('/ops/push', self.handle_ops_push_http)
+    self.app.router.add_post('/ops/survey_records', self.handle_ops_survey_records_http)
 
   # -------------------- 鉴权 --------------------
   def _check_token(self, jwt_token: str)-> dict | None:
@@ -125,6 +129,17 @@ class UserServer:
       uid = data.uid
 
     return uid
+
+  def _parse_uid_email(self, data: Any) -> tuple[Optional[str], Optional[str]]:
+    """解析 (uid, email)；email 来自 JWT payload（问卷记录展示用），debug uid 无 email。"""
+    if data.jwt_token is not None:
+      payload = self._check_token(data.jwt_token)
+      if payload is None:
+        return None, None
+      return payload.get("uid"), payload.get("email")
+    if Config.IS_DEBUG and data.uid is not None and len(data.uid) > 3 and data.uid in self.debug_uid_set:
+      return data.uid, None
+    return None, None
 
   # -------------------- /user_profile --------------------
   def handle_query_profile(self, request: ProfileRequest) -> BaseResponse:
@@ -398,7 +413,7 @@ class UserServer:
     try:
       body = await request.json()
       req = SurveyRequest.model_validate(body)
-      uid = self._parse_for_uid(req.data)
+      uid, email = self._parse_uid_email(req.data)
       if uid is None:
         return web.json_response(InvalidOrExpiredTokenResp().model_dump(), status=401)
 
@@ -409,8 +424,8 @@ class UserServer:
         resp = BaseResponse(code=0, msg="ok")
         return web.json_response({**resp.model_dump(), "data": survey})
 
-      # submit_survey
-      data, code = await asyncio.to_thread(self.user_serv.submit_survey, uid, req.data)
+      # submit_survey（email 存入全量记录，供运营后台展示）
+      data, code = await asyncio.to_thread(self.user_serv.submit_survey, uid, req.data, email)
       if data is None:
         msg = "survey not found" if code == 404 else "invalid survey answers"
         return web.json_response(BaseResponse(code=code, msg=msg).model_dump(), status=code)
@@ -451,6 +466,86 @@ class UserServer:
       return web.json_response(InvalidReqFormatResp().model_dump(), status=400)
     except Exception as e:
       logging.exception("footprint error: %s", e)
+      return web.json_response(BaseResponse(code=500, msg="Internal server error").model_dump(), status=500)
+
+  # -------------------- 运营后台接口（/ops/*） --------------------
+  # 调用方：ops_admin_server.py。鉴权两步：本地验 JWT → auth_server 查 ops_role，
+  # 仅 admin/super 放行（0号管理员 super 由数据库直设，授权走 auth_server grant_ops_role）。
+
+  async def _check_ops_admin(self, jwt_token: str) -> Optional[str]:
+    """校验调用者是运营管理员（ops_role=admin/super），返回 uid；否则 None。"""
+    if not jwt_token:
+      return None
+    payload = self._check_token(jwt_token)
+    if payload is None:
+      return None
+    uid = payload.get("uid")
+    if not uid:
+      return None
+
+    try:
+      req = AuthRequest(
+        request_type="query_ops_role",
+        timestamp=int(time.time()),
+        version="1.0",
+        data=AuthData(jwt_token=jwt_token),
+      )
+      async with ClientSession() as session:
+        async with session.post(
+          f"{Config.AUTH_SERVER_URL}/auth",
+          json=req.model_dump(mode="json"),
+          timeout=3,
+        ) as resp:
+          body = await resp.json()
+    except Exception as e:
+      logging.error("ops role check failed (auth_server unreachable?): %s", e)
+      return None
+
+    role = ((body or {}).get("data") or {}).get("ops_role")
+    if role in ("admin", "super"):
+      return uid
+    logging.warning("ops api rejected: uid=%s ops_role=%s", uid, role)
+    return None
+
+  async def handle_ops_push_http(self, request: web.Request) -> web.Response:
+    """接收运营后台发布的弹窗消息：校验管理员 → 校验消息 → 追加进运营配置（热加载生效，等 App 拉取）。"""
+    try:
+      body = await request.json()
+      uid = await self._check_ops_admin(body.get("jwt_token") or "")
+      if uid is None:
+        return web.json_response(BaseResponse(code=403, msg="not an ops admin").model_dump(), status=403)
+
+      popup = body.get("popup")
+      ok, msg = append_popup(popup)
+      if not ok:
+        return web.json_response(BaseResponse(code=400, msg=msg).model_dump(), status=400)
+
+      logging.info("ops push published by uid=%s popup_id=%s", uid, popup.get("popup_id"))
+      resp = BaseResponse(code=0, msg=msg)
+      return web.json_response({**resp.model_dump(), "data": {"popup_id": popup.get("popup_id")}})
+    except (json.JSONDecodeError, TypeError) as e:
+      logging.error(f"ops push format error: {e}")
+      return web.json_response(InvalidReqFormatResp().model_dump(), status=400)
+    except Exception as e:
+      logging.exception("ops push error: %s", e)
+      return web.json_response(BaseResponse(code=500, msg="Internal server error").model_dump(), status=500)
+
+  async def handle_ops_survey_records_http(self, request: web.Request) -> web.Response:
+    """全量问卷提交记录（_meta:survey:*），运营后台表格展示；可按 survey_id 过滤。"""
+    try:
+      body = await request.json()
+      uid = await self._check_ops_admin(body.get("jwt_token") or "")
+      if uid is None:
+        return web.json_response(BaseResponse(code=403, msg="not an ops admin").model_dump(), status=403)
+
+      records = await asyncio.to_thread(self.user_serv.list_survey_records, body.get("survey_id"))
+      resp = BaseResponse(code=0, msg="ok")
+      return web.json_response({**resp.model_dump(), "data": {"records": records, "total": len(records)}})
+    except (json.JSONDecodeError, TypeError) as e:
+      logging.error(f"ops survey_records format error: {e}")
+      return web.json_response(InvalidReqFormatResp().model_dump(), status=400)
+    except Exception as e:
+      logging.exception("ops survey_records error: %s", e)
       return web.json_response(BaseResponse(code=500, msg="Internal server error").model_dump(), status=500)
 
   # -------------------- 启动 --------------------

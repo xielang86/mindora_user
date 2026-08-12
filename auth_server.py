@@ -23,9 +23,9 @@ from db.mysql_db import (
   init_web_columns, register_user_with_password, get_user_password_hash,
   get_user_by_phone, register_phone_user, get_or_create_wechat_user,
   init_membership_schema, get_user_rights_info, redeem_redemption_code,
-  create_redemption_codes,
+  create_redemption_codes, get_ops_role, set_ops_role,
 )
-from db.redis_db import get_verify_code, set_jwt_token, set_verify_code, delete_verify_code
+from db.redis_db import get_verify_code, set_verify_code, delete_verify_code
 from common.util import normalize_email
 from common.jwt_keys import sign_token, verify_token
 from uid.uuid import generate_uid_and_salt
@@ -205,8 +205,10 @@ def send_verify_code_handler(data: AuthData):
     mock_db["verify_codes"][data.email] = verify_code
   else:
     verify_code = generate_verify_code(4)
-    set_verify_code(email=data.email, device_id=data.device_id, code=verify_code, expire_seconds=VERIFY_CODE_EXPIRE_SECONDS)
-    status_data = send_verify_code_via_163(MY_163_EMAIL, MY_163_AUTH_CODE, data.email, verify_code)
+    # key 的 email 段必须与读取侧（auth_by_verify_code）一致：统一归一化后再写
+    normalized_email = normalize_email(data.email)
+    set_verify_code(email=normalized_email, device_id=data.device_id, code=verify_code, expire_seconds=VERIFY_CODE_EXPIRE_SECONDS)
+    status_data = send_verify_code_via_163(MY_163_EMAIL, MY_163_AUTH_CODE, normalized_email, verify_code)
     resp.code = status_data.get("code")
     resp.msg = status_data.get("msg")
     resp.data = None
@@ -248,6 +250,10 @@ def auth_by_verify_code(data: AuthData) -> AuthResponse:
       resp.msg = "验证码错误"
       logging.info(f"verify: {verify_code} vs {data.verify_code}")
       raise HTTPException(status_code=401, detail="verify code error")
+
+    # 验证成功即消费验证码，防止 TTL 内重放
+    if Config.Mode != 1:
+      delete_verify_code(normalized_email, device_id)
     
     user = get_user_by_email_or_uid(email=normalized_email)
     uid = None
@@ -272,16 +278,14 @@ def auth_by_verify_code(data: AuthData) -> AuthResponse:
     else: 
       uid = user.uid
     
-    # 步骤4：生成JWT Token
+    # 步骤4：生成JWT Token（纯签名验签，不再写 Redis——该 key 只写不读，无校验/失效作用）
     expire_time = datetime.now(timezone.utc) + timedelta(seconds=JWT_EXPIRE_SECONDS)
     jwt_token = sign_token({
       "uid": uid,
       "email": normalized_email,
       "exp": expire_time,
     })
-    
-    # 步骤5：存储JWT Token到Redis（和JWT过期时间一致）
-    set_jwt_token(uid, device_id, jwt_token, JWT_EXPIRE_SECONDS)
+
     resp.data = _build_token_data(
       uid=uid,
       email=normalized_email,
@@ -333,7 +337,6 @@ def auth_by_jwt(data: AuthData) -> AuthResponse:
     raise HTTPException(status_code=401, detail="cannot find user by jwt_token")
 
   token, expire_days = _make_jwt(uid, email)
-  set_jwt_token(uid, "jwt_refresh", token, JWT_EXPIRE_SECONDS)
 
   return AuthResponse(
     request_type=AuthRequestType(AuthRequestType.LOGIN_WITH_JWT),
@@ -537,6 +540,10 @@ def register_with_email_password_handler(data: AuthData) -> AuthResponse:
   if stored_code != data.verify_code:
     raise HTTPException(status_code=401, detail="验证码错误")
 
+  # 验证成功即消费验证码，防止 TTL 内重放
+  if Config.Mode != 1:
+    delete_verify_code(normalized_email, str(data.device_id) if data.device_id else "web")
+
   # 3. Hash password
   uid, salt = generate_uid_and_salt(normalized_email)
   pw_hash = _hash_password(data.password, salt)
@@ -552,8 +559,6 @@ def register_with_email_password_handler(data: AuthData) -> AuthResponse:
 
   # 5. Return JWT
   token, expire_days = _make_jwt(uid, normalized_email)
-  if Config.Mode != 1:
-    set_jwt_token(uid, str(data.device_id) if data.device_id else "web", token, JWT_EXPIRE_SECONDS)
 
   resp.data = _build_token_data(uid=uid, email=normalized_email, token=token, expire_days=expire_days)
   logging.info("Registered (email+password): %s uid=%s", normalized_email, uid)
@@ -582,8 +587,6 @@ def login_with_email_password_handler(data: AuthData) -> AuthResponse:
 
   # 3. Return JWT
   token, expire_days = _make_jwt(user.uid, normalized_email)
-  if Config.Mode != 1:
-    set_jwt_token(user.uid, str(data.device_id) if data.device_id else "web", token, JWT_EXPIRE_SECONDS)
 
   resp.data = _build_token_data(uid=user.uid, email=normalized_email, token=token, expire_days=expire_days)
   logging.info("Login (email+password): %s uid=%s", normalized_email, user.uid)
@@ -627,6 +630,8 @@ def register_or_login_with_phone_handler(data: AuthData, is_register: bool) -> A
       raise HTTPException(status_code=401, detail="验证码已过期或不存在")
     if stored_code != data.verify_code:
       raise HTTPException(status_code=401, detail="验证码错误")
+    # 验证成功即消费验证码，防止 TTL 内重放
+    delete_verify_code(sms_email, sms_device)
 
   # 2. Check if user exists
   user = get_user_by_phone(phone)
@@ -648,8 +653,6 @@ def register_or_login_with_phone_handler(data: AuthData, is_register: bool) -> A
 
   # 3. Return JWT
   token, expire_days = _make_jwt(user.uid, user.email)
-  if Config.Mode != 1:
-    set_jwt_token(user.uid, str(data.device_id) if data.device_id else "web", token, JWT_EXPIRE_SECONDS)
 
   resp.data = _build_token_data(
     uid=user.uid,
@@ -688,8 +691,6 @@ def wechat_callback_handler(data: AuthData) -> AuthResponse:
   user = get_or_create_wechat_user(openid, unionid, nickname, avatar_url)
 
   token, expire_days = _make_jwt(user.uid, user.email)
-  if Config.Mode != 1:
-    set_jwt_token(user.uid, "wechat", token, JWT_EXPIRE_SECONDS)
 
   resp.data = _build_token_data(
     uid=user.uid,
@@ -710,6 +711,42 @@ def query_user_rights_handler(data: AuthData) -> AuthResponse:
     code=0,
     msg="success",
     data=rights_info,
+  )
+
+
+def query_ops_role_handler(data: AuthData) -> AuthResponse:
+  """查询本人运营角色（user_server / 运营后台据此判断 push 权限）。"""
+  payload = decode_access_token(data.jwt_token)
+  uid = payload.get("uid")
+  role = get_ops_role(uid)
+  return AuthResponse(
+    request_type=AuthRequestType.QUERY_OPS_ROLE,
+    code=0,
+    msg="success",
+    data={"uid": uid, "ops_role": role},
+  )
+
+
+def grant_ops_role_handler(data: AuthData) -> AuthResponse:
+  """0号管理员（ops_role=super，数据库直设）授权他人运营角色（none/admin）。"""
+  payload = decode_access_token(data.jwt_token)
+  uid = payload.get("uid")
+  if get_ops_role(uid) != "super":
+    raise HTTPException(status_code=403, detail="只有0号管理员(super)可以授权运营角色")
+
+  target = get_active_user_by_email_or_uid(email=normalize_email(data.target_email))
+  if target is None:
+    raise HTTPException(status_code=404, detail="target user not found or not active")
+
+  result = set_ops_role(target.uid, data.ops_role)
+  if result["code"] != 0:
+    raise HTTPException(status_code=result["code"], detail=result["msg"])
+  logging.info("ops role granted by %s: %s -> %s", uid, target.uid, data.ops_role)
+  return AuthResponse(
+    request_type=AuthRequestType.GRANT_OPS_ROLE,
+    code=0,
+    msg=result["msg"],
+    data=result["data"],
   )
 
 
@@ -833,6 +870,12 @@ async def handle_auth(request: AuthRequest, raw_request: Request):
 
   elif req_type == AuthRequestType.QUERY_USER_RIGHTS:
     return query_user_rights_handler(data)
+
+  elif req_type == AuthRequestType.QUERY_OPS_ROLE:
+    return query_ops_role_handler(data)
+
+  elif req_type == AuthRequestType.GRANT_OPS_ROLE:
+    return grant_ops_role_handler(data)
 
   raise HTTPException(status_code=400, detail="Unsupported request type")
 

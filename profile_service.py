@@ -38,6 +38,8 @@ run_dir = os.getenv("RUN_DIR") or os.path.dirname(os.path.abspath(__file__))
 # all bloking sync api
 class UserProfileServ:
   MAX_BEHAVIOR_LEN = 100
+  # sleep_data 保留条数：与分析报告日级保留一致（日级 30）
+  MAX_SLEEP_DATA_LEN = 30
 
   # -------------------- 门面：委托给拆分后的子服务 --------------------
   _INSIGHT_MODULE_KEYS = AnalysisContentService._INSIGHT_MODULE_KEYS
@@ -78,8 +80,11 @@ class UserProfileServ:
   def get_survey(self, survey_id: str, language: str):
     return self.engagement.get_survey(survey_id, language)
 
-  def submit_survey(self, uid: str, data):
-    return self.engagement.submit_survey(uid, data)
+  def submit_survey(self, uid: str, data, email=None):
+    return self.engagement.submit_survey(uid, data, email=email)
+
+  def list_survey_records(self, survey_id=None) -> list:
+    return self.engagement.list_survey_records(survey_id)
 
   def merge_footprint_days(self, uid: str, days: list) -> int:
     return self.engagement.merge_footprint_days(uid, days)
@@ -509,6 +514,52 @@ class UserProfileServ:
     return sop_reco
 
   # -------------------- 更新路径 --------------------
+  @staticmethod
+  def _merge_sleep_data(old: list, new: list) -> list:
+    """按 timestamp 去重合并 sleep_data（同 timestamp 新记录覆盖旧记录），按时间升序，截断保留最近 N 条。"""
+    if not new:
+      return old
+    by_ts = {r.timestamp: r for r in old}
+    for r in new:
+      by_ts[r.timestamp] = r
+    merged = sorted(by_ts.values(), key=lambda r: r.timestamp)
+    return merged[-UserProfileServ.MAX_SLEEP_DATA_LEN:]
+
+  @staticmethod
+  def _night_window(record) -> Optional[tuple[int, int]]:
+    """当夜睡眠窗口 [start_ts, end_ts]：取 sleep_status 序列的覆盖范围；无序列返回 None。"""
+    if not record.sleep_status:
+      return None
+    start = min(e.start_time for e in record.sleep_status)
+    end = max(int(e.start_time + e.duration * 60) for e in record.sleep_status)
+    return start, end
+
+  def _update_night_hr_range(self, profile: UserProfile) -> None:
+    """按当夜睡眠窗口从 behaviors.heart_rate 计算 hr_min/hr_max 写回各条 SleepResult。
+
+    在 update_profile 时调用：behaviors 有 MAX_BEHAVIOR_LEN 截断，截断前窗口数据最全；
+    每次 update 幂等重算，覆盖增量上报乱序/迟到的样本。
+    """
+    samples = profile.behaviors.get("heart_rate") or []
+    points: list[tuple[int, float]] = []
+    for item in samples:
+      if isinstance(item, (list, tuple)) and len(item) >= 2 and isinstance(item[1], (int, float)):
+        try:
+          points.append((int(item[0]), float(item[1])))
+        except (TypeError, ValueError):
+          continue
+    if not points:
+      return
+    for record in profile.sleep_data:
+      window = self._night_window(record)
+      if window is None:
+        continue
+      values = [v for ts, v in points if window[0] <= ts <= window[1]]
+      if not values:
+        continue
+      record.hr_min = min(values)
+      record.hr_max = max(values)
+
   def _apply_basic_update(self, uid: str, new_profile: UserProfile, profile: Optional[UserProfile]) -> UserProfile:
     """Apply non-LLM profile updates. Must be called while holding self.lock.
 
@@ -517,6 +568,7 @@ class UserProfileServ:
     if profile is None:
       self._update_scene_stats(new_profile)
       self._update_best_scene_by_sleep_quality(new_profile)
+      self._update_night_hr_range(new_profile)
       return new_profile
 
     # just replace, if need
@@ -525,11 +577,13 @@ class UserProfileServ:
 
     profile.long_term_profile = self._merge_profile(profile.long_term_profile, new_profile.long_term_profile)
     profile.behaviors = self._merge_behavior(profile.behaviors, new_profile.behaviors)
+    profile.sleep_data = self._merge_sleep_data(profile.sleep_data, new_profile.sleep_data)
 
     # aggregate SOP play events into mindora_record so we can keep behaviors small
     self._update_mindora_record(profile, new_profile)
     self._update_scene_stats(profile)
     self._update_best_scene_by_sleep_quality(profile)
+    self._update_night_hr_range(profile)
     return profile
 
   def _apply_llm_update(

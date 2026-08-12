@@ -13,6 +13,10 @@ class Config:
   PORT = 9001
   IS_DEBUG = True
   AUTH_PORT=9103
+  # auth_server 地址（user_server 校验运营角色 / 运营后台登录都走它）
+  AUTH_SERVER_URL = os.getenv("AUTH_SERVER_URL", f"http://127.0.0.1:{AUTH_PORT}")
+  # 运营后台服务端口（ops_admin_server.py）
+  OPS_ADMIN_PORT = int(os.getenv("OPS_ADMIN_PORT", "9200"))
   DB_PATH = "data/userprofile_level_db"
   USER_PROFILE_STORAGE_MODE = "leveldb"  # "leveldb" | "txt_json"
   USER_PROFILE_JSON_PATH = "data/user_profiles.txt"

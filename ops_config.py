@@ -160,3 +160,79 @@ def ops_config_status() -> dict:
     "next_query_after": next_query_after,
     "dangling_survey_refs": find_dangling_survey_refs(popups, surveys),
   }
+
+
+# -------------------- 消息发布（运营后台 → user_server /ops/push） --------------------
+
+_POPUP_REQUIRED_I18N_KEYS = ("title", "action_text")
+
+
+def validate_new_popup(popup: dict, existing_ids: set) -> Optional[str]:
+  """校验一条待发布的弹窗消息，返回错误信息（None 表示合法）。
+
+  只校验「发布即生效」所必需的字段；可选字段沿用客户端缺省逻辑。
+  """
+  if not isinstance(popup, dict):
+    return "popup must be a JSON object"
+  popup_id = popup.get("popup_id")
+  if not popup_id or not isinstance(popup_id, str):
+    return "popup_id 必填且为 string"
+  if popup_id in existing_ids:
+    return f"popup_id 已存在: {popup_id}"
+  if popup.get("type") not in ("survey", "mall", "ad"):
+    return "type 必须是 survey/mall/ad"
+  if popup.get("action_type") not in ("survey", "url", "route", "dismiss"):
+    return "action_type 必须是 survey/url/route/dismiss"
+  i18n = popup.get("i18n")
+  if not isinstance(i18n, dict) or not i18n:
+    return "i18n 必填且至少有一组语言文案"
+  for lang, text in i18n.items():
+    if not isinstance(text, dict):
+      return f"i18n.{lang} 必须是 object"
+    missing = [k for k in _POPUP_REQUIRED_I18N_KEYS if not text.get(k)]
+    if missing:
+      return f"i18n.{lang} 缺少必填文案字段: {missing}"
+  if popup.get("action_type") == "route":
+    route = str((popup.get("action_payload") or {}).get("route") or "").strip().lower()
+    if route not in POPUP_ROUTE_WHITELIST:
+      return f"action_payload.route 不在白名单: {route!r}"
+  if popup.get("action_type") == "survey":
+    if not (popup.get("action_payload") or {}).get("survey_id"):
+      return "action_type=survey 时 action_payload.survey_id 必填"
+  if popup.get("action_type") == "url":
+    if not (popup.get("action_payload") or {}).get("url"):
+      return "action_type=url 时 action_payload.url 必填"
+  start_at, end_at = popup.get("start_at"), popup.get("end_at")
+  if start_at is not None and end_at is not None and int(start_at) >= int(end_at):
+    return "start_at 必须小于 end_at"
+  return None
+
+
+def append_popup(popup: dict) -> tuple[bool, str]:
+  """把一条新弹窗消息追加进运营配置 JSON（read-modify-write，原子替换）。
+
+  写入后 mtime 变化触发 _load_ops_config 热加载 → 消息目录同步 → App 下次拉取生效。
+  返回 (是否成功, 信息)。
+  """
+  path = _ops_config_path()
+  with _ops_config_lock:
+    try:
+      raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+      return False, f"ops config unreadable: {e}"
+
+    popups = raw.get("popups") or []
+    error = validate_new_popup(popup, {p.get("popup_id") for p in popups})
+    if error:
+      return False, error
+
+    popups.append(popup)
+    raw["popups"] = popups
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp_path.replace(path)
+
+  logging.info("popup published: %s -> %s", popup.get("popup_id"), path)
+  # 立即触发一次热加载（不等下一次请求），让消息目录同步与新消息即刻生效
+  _load_ops_config()
+  return True, f"published {popup.get('popup_id')}"
