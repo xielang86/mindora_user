@@ -7,7 +7,7 @@ Mindora 设备端 IoT 服务（mDNS + WebSocket + BLE）
   - 设备型号 DEVICE_MODEL = "Mindora 2026"（用户可见名，所有同款设备共用，mDNS service name + BLE 广播 local name）
   - DNS host slug 用 model + device_id 末尾，保证 LAN 内唯一
 
-详细规格 / 使用 / 联调步骤见 doc/iot_server_README.md。
+详细规格 / 使用 / 联调步骤见 Tools/doc/设备端接口契约.md。
 
 平台支持（一份代码三平台跑，无需任何环境变量）：
   - macOS：bless 走 CoreBluetooth via PyObjC
@@ -18,6 +18,11 @@ Mindora 设备端 IoT 服务（mDNS + WebSocket + BLE）
   pip install -r requirements.txt
   （含 bless / zeroconf / websockets）
 """
+# 注解延迟求值：可选依赖缺失时会把 ClientSession / BlessServer 置为 None，
+# 若注解在定义时求值，`ClientSession | None` 会变成 `None | None` 直接 TypeError 崩掉，
+# 让「缺依赖也能跑其余子系统」的降级设计失效。
+from __future__ import annotations
+
 import argparse
 import asyncio
 import json
@@ -25,6 +30,7 @@ import logging
 import os
 import socket
 import sys
+import time
 import uuid
 
 from dotenv import load_dotenv
@@ -33,6 +39,9 @@ import logger
 
 load_dotenv()
 run_dir = os.getenv("RUN_DIR")
+if run_dir is None or len(run_dir) == 0:
+    run_dir = os.path.dirname(os.path.abspath(__file__))
+
 logger.init_log(f"{run_dir}/iot_server_logs")
 
 try:
@@ -106,10 +115,10 @@ DEVICE_HOST_SLUG = "Mindora-2026-" + DEVICE_ID.split("-")[-1][-8:]
 # ==========================================
 # BLE：跟 iOS 端常量对齐的占位 UUID。
 # ⚠️ 上线前必须固件 + iOS 同步换成 `uuidgen` 真随机 UUID，避免跟全网用同样示例的 BLE 配件撞车。
-BLE_SERVICE_UUID = "12345678-1234-5678-1234-56789abcdef0"
-BLE_DEVICE_ID_CHAR_UUID = "12345678-1234-5678-1234-56789abcdef1"
-BLE_REQUEST_CHAR_UUID = "12345678-1234-5678-1234-56789abcdef2"
-BLE_RESPONSE_CHAR_UUID = "12345678-1234-5678-1234-56789abcdef3"
+BLE_SERVICE_UUID = "9fcc2fbe-a190-4ee9-96db-68e82f5f15cc"
+BLE_DEVICE_ID_CHAR_UUID = "6a50d363-d2de-4bd9-b66f-7b02947e7a9c"
+BLE_REQUEST_CHAR_UUID = "a733eb73-3985-4e22-a536-d5de7342e5b4"
+BLE_RESPONSE_CHAR_UUID = "65a042cb-42b5-4a58-8bff-68c614336f14"
 
 WEBSOCKET_PORT = 8765
 USER_SERVER_PORT = 9001
@@ -131,14 +140,99 @@ MDNS_HOST_NAME = f"{MDNS_LOCAL_NAME}."
 zeroconf_instance = None
 
 
-def get_lan_ip():
-    """返回手机在同一局域网能访问的本机 IP。"""
+def _usable(ip: str) -> bool:
+    """回环与 link-local 一律不可用 —— 它们在语义上就不可能被另一台设备访问到。
+    **不做任何网段黑名单**：100.64/10（CGNAT）、198.18/15 等只要真的挂在网卡上就照用，
+    否则会误伤把它们当内网用的真实环境。"""
+    return bool(ip) and not ip.startswith("127.") and not ip.startswith("169.254.")
+
+
+def get_lan_ips() -> list[str]:
+    """枚举本机所有可用的 IPv4（去重、保持顺序）。
+
+    历史教训：老实现用 `socket.connect(("8.8.8.8", 80))` 探本机地址，失败时退回
+    `gethostbyname(gethostname())`。这有三个坑，实测全都踩到了：
+      1. 开机竞态 —— Wi-Fi 还没拿到地址时 connect 抛 OSError，兜底返回 /etc/hosts 里的
+         127.0.0.2，回环地址被写进 mDNS 注册，服务在局域网里整个不可见（现象：手机一次
+         didFind 都没有），且网络起来后不会重注册；
+      2. 无外网环境（工厂内网 / 断网调试）没有默认路由，connect 永远失败；
+      3. 多网卡 / VPN 时选出的是"去 8.8.8.8 该走哪张网卡"，未必是手机所在网段
+         （实测 macOS 开 VPN 时拿到 198.18.0.1）。
+
+    现在改为枚举所有网卡地址并**全部注册**——mDNS 的 A 记录本就允许多条，客户端会逐个
+    尝试，不需要我们猜哪个对，也不需要外网。
+    """
+    ips: list[str] = []
+
+    # 首选 ifaddr：zeroconf 自己就依赖它，不引入新依赖，跨平台。
+    try:
+        import ifaddr
+        for adapter in ifaddr.get_adapters():
+            for ip in adapter.ips:
+                if ip.is_IPv4 and _usable(ip.ip) and ip.ip not in ips:
+                    ips.append(ip.ip)
+        if ips:
+            return ips
+    except Exception as e:  # noqa: BLE001 - 枚举失败就走下面的降级
+        logging.warning(f"[net] ifaddr 枚举失败，降级: {e}")
+
+    # 降级 1：解析系统命令（Linux: ip / macOS: ifconfig）
+    try:
+        import re
+        import subprocess
+        out = subprocess.run(["ip", "-4", "-o", "addr", "show"],
+                             capture_output=True, text=True, timeout=5).stdout
+        if not out:
+            out = subprocess.run(["ifconfig"], capture_output=True, text=True, timeout=5).stdout
+        for m in re.finditer(r"inet\s+(\d+\.\d+\.\d+\.\d+)", out):
+            ip = m.group(1)
+            if _usable(ip) and ip not in ips:
+                ips.append(ip)
+        if ips:
+            return ips
+    except Exception as e:  # noqa: BLE001
+        logging.warning(f"[net] 系统命令枚举失败，降级: {e}")
+
+    # 降级 2：出网地址探测。只作兜底 —— 它依赖默认路由，没外网时必然失败。
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
             sock.connect(("8.8.8.8", 80))
-            return sock.getsockname()[0]
+            ip = sock.getsockname()[0]
+            if _usable(ip):
+                ips.append(ip)
     except OSError:
-        return socket.gethostbyname(socket.gethostname())
+        pass
+    return ips
+
+
+def wait_for_lan_ips(timeout: float = 600.0, interval: float = 2.0) -> list[str]:
+    """等到至少有一个可用地址再返回；超时返回空列表。
+
+    开机时 iot_server 往往比 Wi-Fi 先就绪（systemd 用户级 unit 只 After=default.target，
+    跟网络无关），必须在这里等，而不是拿一个错地址去注册。等 10 分钟是宽松取值：
+    路由器重启、Wi-Fi 漫游、用户在配网页面磨蹭都可能让网络迟迟不就绪，等着不花任何成本；
+    真的等超了也不是绝路 —— 调用方会转入后台重试（见 keep_trying_mdns_registration）。
+    """
+    deadline = time.time() + timeout
+    attempts = 0
+    while True:
+        ips = get_lan_ips()
+        if ips:
+            if attempts:
+                logging.info(f"[net] 等待 {attempts * interval:.0f}s 后拿到地址: {ips}")
+            return ips
+        if time.time() >= deadline:
+            return []
+        attempts += 1
+        if attempts <= 3 or attempts % 15 == 0:   # 前几次照打，之后每 30s 一条，避免刷屏
+            logging.info(f"[net] 暂无可用局域网地址，已等待 {attempts * interval:.0f}s，继续重试…")
+        time.sleep(interval)
+
+
+def get_lan_ip():
+    """兼容旧调用点：返回首个可用地址，取不到时返回 127.0.0.1（仅用于拼展示用的 URL）。"""
+    ips = get_lan_ips()
+    return ips[0] if ips else "127.0.0.1"
 
 
 def build_user_server_info():
@@ -225,7 +319,7 @@ class BleRequestBuffer:
             "total_length": total_length,
             "chunks": {},
             "received_length": 0,
-            "deadline": asyncio.get_event_loop().time() + self._timeout,
+            "deadline": asyncio.get_running_loop().time() + self._timeout,
         })
 
         if buf["total_length"] != total_length:
@@ -234,7 +328,7 @@ class BleRequestBuffer:
                 "total_length": total_length,
                 "chunks": {chunk_index: payload},
                 "received_length": len(payload),
-                "deadline": asyncio.get_event_loop().time() + self._timeout,
+                "deadline": asyncio.get_running_loop().time() + self._timeout,
             }
             return None
 
@@ -251,7 +345,7 @@ class BleRequestBuffer:
         return None
 
     def cleanup_expired(self):
-        now = asyncio.get_event_loop().time()
+        now = asyncio.get_running_loop().time()
         expired = [cid for cid, buf in self._buffers.items() if buf["deadline"] < now]
         for cid in expired:
             self._buffers.pop(cid, None)
@@ -312,8 +406,22 @@ class BleDataChannel:
 
         payload = json.dumps(data, ensure_ascii=False).encode("utf-8")
         total_length = len(payload)
+        if total_length > 0xFFFF:
+            # 2 字节长度头最多表达 65535；超出时回错误而不是让 to_bytes 抛 OverflowError
+            logging.error(f"[BLE] response too large: {total_length} bytes, sending error instead")
+            payload = json.dumps(
+                {"code": 413, "msg": f"response too large: {total_length} bytes", "data": None},
+                ensure_ascii=False,
+            ).encode("utf-8")
+            total_length = len(payload)
+
         chunk_size = 512 - 4  # reserve 4 bytes header
         chunks = [payload[i:i + chunk_size] for i in range(0, len(payload), chunk_size)]
+
+        response_char = self.server.get_characteristic(BLE_RESPONSE_CHAR_UUID)
+        if response_char is None:
+            logging.error("[BLE] response characteristic not found")
+            return
 
         for idx, chunk in enumerate(chunks):
             header = total_length.to_bytes(2, "little")
@@ -321,7 +429,15 @@ class BleDataChannel:
             header += bytes([1 if idx == len(chunks) - 1 else 0])
             frame = header + chunk
             try:
-                await self.server.update_value(BLE_SERVICE_UUID, BLE_RESPONSE_CHAR_UUID, frame)
+                # bless 的 update_value 是同步方法且不带 value 参数：
+                # 必须先写 characteristic.value，再调 update_value 触发 notify
+                response_char.value = frame
+                ok = self.server.update_value(BLE_SERVICE_UUID, BLE_RESPONSE_CHAR_UUID)
+                if not ok:
+                    logging.error("[BLE] notify failed: update_value returned False")
+                    break
+                # 给对端留点消化时间，避免高速 notify 丢包
+                await asyncio.sleep(0.01)
             except Exception as e:
                 logging.error(f"[BLE] notify failed: {e}")
                 break
@@ -360,23 +476,45 @@ async def run_ble_server(enable_data_channel: bool = True):
             BLE_SERVICE_UUID,
             BLE_REQUEST_CHAR_UUID,
             GATTCharacteristicProperties.write,
-            b"",
+            # value 必须是 None：CoreBluetooth 规定「带缓存值的特征必须只读」，
+            # 传 b"" 也算带值，start() 会抛 NSInternalInconsistencyException
+            # （在 delegate 线程里抛，表现为 server.start() 永远不返回、日志停在
+            # 「启动 bless peripheral...」，极难查）。
+            None,
             GATTAttributePermissions.writeable,
         )
         await server.add_new_characteristic(
             BLE_SERVICE_UUID,
             BLE_RESPONSE_CHAR_UUID,
             GATTCharacteristicProperties.notify,
-            b"",
+            None,   # 同上：notify 特征也不能带缓存值
             GATTAttributePermissions.readable,
         )
         if ClientSession is not None:
             http_session = ClientSession()
         ble_channel = BleDataChannel(server, http_session)
-        server.write_request_func = ble_channel.on_write
+
+        # bless 的 write_request_func 是**同步**调用的（backends/server.py:
+        # `self.write_request_func(characteristic, value)`），而且在 CoreBluetooth /
+        # BlueZ 的回调线程上跑。直接把 async 的 on_write 挂上去，只会生成一个从不被
+        # await 的协程 —— BLE 层写入成功、应用层什么都没发生，客户端只能等到超时，
+        # 且没有任何报错。必须包一层同步函数投递回事件循环。
+        loop = asyncio.get_running_loop()
+
+        def _dispatch_write(characteristic, value, **kwargs):
+            asyncio.run_coroutine_threadsafe(
+                ble_channel.on_write(characteristic, value, **kwargs), loop
+            )
+
+        server.write_request_func = _dispatch_write
 
     logging.info("[BLE] 启动 bless peripheral...")
-    await server.start()
+    # prioritize_local_name=False 是必须的：bless 的 CoreBluetooth 后端在
+    # len(name) > 10 时会把 service UUID 从广播包里整个丢掉（只留 local name），
+    # 而 iOS 用 scanForPeripherals(withServices:) 过滤扫描 —— 广播里没有 service UUID
+    # 就永远扫不到。DEVICE_MODEL = "Mindora 2026" 正好 12 字符，必然踩中。
+    # Linux/BlueZ 与 Windows 后端的 start(**kwargs) 会忽略该参数，跨平台安全。
+    await server.start(prioritize_local_name=False)
     logging.info("[BLE] 广播已启动:")
     logging.info(f"  device model : {DEVICE_MODEL}")
     logging.info(f"  service UUID : {BLE_SERVICE_UUID}")
@@ -386,12 +524,20 @@ async def run_ble_server(enable_data_channel: bool = True):
         logging.info(f"  response char  : {BLE_RESPONSE_CHAR_UUID}")
     logging.info(f"  char value   : {DEVICE_ID}")
 
+    # 广播自检：bless 的 start() 返回不代表控制器真的在广播。实测过一次典型翻车 ——
+    # rc.local 里有 `systemctl restart bluetooth`，如果它在 iot_server 之后执行，
+    # 已注册的 LE 广播会被 bluetoothd 重启一并抹掉，而 bless 毫不知情，日志照样写着
+    # 「广播已启动」，手机却一个广播都扫不到（btmgmt info 里 advertising 位是空的）。
+    # bluetoothd 什么时候被谁重启不受本进程控制，所以只能定期回读 + 自动重挂。
+    watchdog = asyncio.create_task(watch_ble_advertising(server))
+
     try:
         # 阻塞直到外层 cancel
         await asyncio.Event().wait()
     except asyncio.CancelledError:
         pass
     finally:
+        watchdog.cancel()
         try:
             await server.stop()
             logging.info("[BLE] 已停止")
@@ -399,6 +545,129 @@ async def run_ble_server(enable_data_channel: bool = True):
             logging.error(f"[BLE] 停止时报错（忽略）: {e}")
         if http_session:
             await http_session.close()
+
+
+async def ble_advertising_active(server) -> bool | None:
+    """回读「现在是否真的在广播」。返回 None 表示查不了（此时不要乱重挂）。
+
+    判据是 **adapter.Powered 且 LEAdvertisingManager1.ActiveInstances > 0**，两个都走 D-Bus 异步读。
+    踩过的两个坑，别再改回去：
+      1. 只看 `bless.is_advertising()`（即 ActiveInstances）不够 —— bluetoothd 被重启后
+         广播对象仍注册着，ActiveInstances 依旧 > 0，但控制器实际已经不发了（实测 adapter
+         连 Powered 都是 false），自检等于形同虚设；
+      2. 别用 `btmgmt info` 之类的子进程 —— 实测在 systemd 服务里 btmgmt 会挂住不返回，
+         subprocess 超时后静默降级，同样让自检失效，还会留下一堆僵尸进程。
+    """
+    adapter = getattr(server, "adapter", None)
+    if adapter is not None:
+        try:
+            props = adapter.get_interface("org.freedesktop.DBus.Properties")
+            powered = (await props.call_get("org.bluez.Adapter1", "Powered")).value
+            instances = (await props.call_get(
+                "org.bluez.LEAdvertisingManager1", "ActiveInstances")).value
+            if not powered:
+                logging.warning("[BLE] 适配器 Powered=false（蓝牙被关掉或 bluetoothd 刚重启）")
+            return bool(powered) and instances > 0
+        except Exception as e:  # noqa: BLE001
+            logging.warning(f"[BLE] D-Bus 回读失败: {e}")
+
+    # macOS / 其他后端没有 BlueZ 的 adapter 代理，退回 bless 自带查询。
+    try:
+        return bool(await server.is_advertising())
+    except Exception as e:  # noqa: BLE001
+        logging.warning(f"[BLE] 广播状态回读失败: {e}")
+    return None
+
+
+async def ble_power_on(server):
+    """适配器被关掉时重新打开（bluetoothd 重启后常见）。仅 BlueZ 有效。"""
+    adapter = getattr(server, "adapter", None)
+    if adapter is None:
+        return
+    try:
+        props = adapter.get_interface("org.freedesktop.DBus.Properties")
+        from dbus_next import Variant
+        await props.call_set("org.bluez.Adapter1", "Powered", Variant("b", True))
+        logging.info("[BLE] 已重新打开适配器电源")
+    except Exception as e:  # noqa: BLE001
+        logging.warning(f"[BLE] 打开适配器电源失败: {e}")
+
+
+async def watch_ble_advertising(server, interval: float = 30.0):
+    """周期自检：不在广播就重挂一次。
+
+    为什么必须有：广播可能在**任何时刻**被外部因素掐掉，且本进程收不到任何通知 ——
+    实测这台设备的 rc.local 里有 `systemctl restart bluetooth`，它一旦晚于本服务执行，
+    已注册的广播随 bluetoothd 一起蒸发，而 bless 毫不知情，日志还写着「广播已启动」。
+    这类外部依赖的重启时机不受本进程控制，只能靠周期回读 + 自愈，不能指望启动顺序。
+    """
+    logging.info(f"[BLE] 广播自检已启动，每 {interval:.0f}s 回读一次")
+    undetectable_logged = False
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            active = await _check_and_heal(server, undetectable_logged)
+        except Exception:  # noqa: BLE001
+            # 任务里未捕获的异常会让 task 静默死掉（asyncio 不会打印，除非有人 await 它），
+            # 自检就此永久停摆且毫无痕迹 —— 这类静默失败必须堵死。
+            logging.exception("[BLE] 自检循环异常，本轮跳过")
+            continue
+        if active is None and not undetectable_logged:
+            undetectable_logged = True
+
+
+async def _check_and_heal(server, undetectable_logged: bool):
+    """回读一次广播状态，未在广播则重挂。返回本次读到的状态（None = 查不了）。"""
+    active = await ble_advertising_active(server)
+    if active is None:
+        if not undetectable_logged:
+            logging.warning("[BLE] 无法回读广播状态，自检降级为不生效（仅提示一次）")
+        return None
+    if active:
+        return True
+    logging.error("[BLE] 自检发现未在广播 → 尝试恢复")
+    await ble_power_on(server)
+    try:
+        await ble_remount(server)
+    except Exception as e:  # noqa: BLE001
+        # bless 的 BlueZ 后端在进程内**无法二次挂载**：start() 与 start_advertising()
+        # 都会 bus.export() 到固定路径，第二次必然抛
+        # "An interface with this name is already exported"。
+        # 已实测无法绕开，所以只能退出让 systemd（Restart=always）重新拉起 ——
+        # 全新进程拿到干净的 D-Bus 连接，广播必然恢复。退出比"卡在不广播"强得多：
+        # 不广播 = App 永远发现不了设备，而重启只损失几秒。
+        logging.error(f"[BLE] 进程内重挂失败（bless 限制）: {e} → 退出，由 systemd 拉起")
+        os._exit(3)
+    ok = await ble_advertising_active(server)
+    logging.info(f"[BLE] 广播已重新挂载，回读状态={ok}")
+    return ok
+
+
+async def ble_remount(server):
+    """重新把 GATT 应用与广播挂回 BlueZ。
+
+    **不能直接 stop() + start()**：bless 的 BlueZ 后端 start() 里有
+    `self.bus.export(self.app.path, self.app)`，而 stop() 并不 unexport，
+    第二次 start 必然抛 `ValueError: An interface with this name is already exported`。
+    所以这里只重做 start() 的后两步（register + start_advertising）——
+    bluetoothd 重启后丢的正是这两样（它自己的注册表），我们在总线上的 export 还在。
+    """
+    app = getattr(server, "app", None)
+    adapter = getattr(server, "adapter", None)
+    if app is None or adapter is None:
+        # 非 BlueZ 后端（如 macOS）：退回整体重启
+        await server.stop()
+        await server.start(prioritize_local_name=False)
+        return
+    try:
+        await app.stop_advertising(adapter)
+    except Exception:  # noqa: BLE001 - 本来就没在广播，忽略
+        pass
+    try:
+        await app.register(adapter)
+    except Exception as e:  # noqa: BLE001 - 已注册时会报错，可继续
+        logging.info(f"[BLE] 重新注册 GATT 应用: {e}")
+    await app.start_advertising(adapter)
 
 
 # ==========================================
@@ -447,12 +716,17 @@ def register_mdns_sync():
         return None
 
     logging.info("注册mDNS服务...")
-    ip_address = get_lan_ip()
+    ip_addresses = wait_for_lan_ips()
+    if not ip_addresses:
+        # 宁可不注册，也绝不拿回环地址去注册一个「看得见却连不上」的假服务。
+        logging.error("[mDNS] 等不到可用的局域网地址，跳过 mDNS 注册（BLE / WebSocket 不受影响）")
+        return None
 
     service_info = ServiceInfo(
         MDNS_SERVICE_TYPE,
         MDNS_SERVICE_NAME,
-        addresses=[socket.inet_aton(ip_address)],
+        # 全部地址都注册：A 记录本就允许多条，客户端会逐个尝试，不用我们猜哪张网卡对。
+        addresses=[socket.inet_aton(ip) for ip in ip_addresses],
         port=WEBSOCKET_PORT,
         server=MDNS_HOST_NAME,
         properties={
@@ -482,9 +756,47 @@ def register_mdns_sync():
     logging.info(f"  service type  : {MDNS_SERVICE_TYPE}")
     logging.info(f"  service name  : {MDNS_SERVICE_NAME}")
     logging.info(f"  host          : {MDNS_HOST_NAME}")
-    logging.info(f"  IP            : {ip_address}")
+    logging.info(f"  IP            : {', '.join(ip_addresses)}")
     logging.info(f"  port          : {WEBSOCKET_PORT}")
     return service_info
+
+
+async def keep_trying_mdns_registration(interval: float = 30.0):
+    """启动时没等到网络（超过 wait_for_lan_ips 的窗口）时，转入后台无限重试注册。
+
+    宁可晚注册，也不能「本次启动失败就永远没有 mDNS」—— 那等于把设备的 Wi-Fi 通道
+    绑死在开机那一刻的网络状态上，跟这次修的开机竞态是同一类错误。
+    """
+    while True:
+        await asyncio.sleep(interval)
+        if not get_lan_ips():
+            continue
+        logging.info("[mDNS] 网络已就绪，补做注册")
+        info = await asyncio.get_running_loop().run_in_executor(None, register_mdns_sync)
+        if info is not None:
+            return info
+
+
+async def watch_mdns_addresses(service_info, interval: float = 30.0):
+    """地址变了就重新通告。覆盖 DHCP 续租换 IP、切 Wi-Fi、插拔网线、开机时网络后到位
+    等场景 —— 注册一次就再也不管，是「重启后有时好有时坏」的根因之一。"""
+    if service_info is None or zeroconf_instance is None:
+        return
+    known = {socket.inet_ntoa(a) for a in service_info.addresses}
+    while True:
+        await asyncio.sleep(interval)
+        current = set(get_lan_ips())
+        if not current or current == known:
+            continue
+        logging.info(f"[mDNS] 本机地址变化 {sorted(known)} → {sorted(current)}，重新通告")
+        try:
+            service_info.addresses = [socket.inet_aton(ip) for ip in sorted(current)]
+            await asyncio.get_running_loop().run_in_executor(
+                None, zeroconf_instance.update_service, service_info
+            )
+            known = current
+        except Exception as e:  # noqa: BLE001
+            logging.error(f"[mDNS] 重新通告失败: {e}")
 
 
 def unregister_mdns_sync(service_info):
@@ -537,6 +849,11 @@ async def main(args):
 
     loop = asyncio.get_event_loop()
     service_info = await loop.run_in_executor(None, register_mdns_sync) if enable_mdns else None
+    if enable_mdns and service_info is None:
+        # 开机时网络迟迟不就绪：转入后台重试，不放弃 mDNS。
+        mdns_watch = asyncio.create_task(keep_trying_mdns_registration())
+    else:
+        mdns_watch = asyncio.create_task(watch_mdns_addresses(service_info)) if service_info else None
     ble_task = asyncio.create_task(run_ble_server(enable_ble_data)) if enable_ble else None
 
     # 主阻塞点优先级：WebSocket（如果开）→ 否则等 BLE task → 否则纯 mDNS 模式只睡等 Ctrl+C
@@ -550,6 +867,8 @@ async def main(args):
     except KeyboardInterrupt:
         logging.info("服务器正在关闭...")
     finally:
+        if mdns_watch is not None:
+            mdns_watch.cancel()
         if ble_task is not None:
             ble_task.cancel()
             try:

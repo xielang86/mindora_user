@@ -50,6 +50,8 @@ class AuthRequestType(StrEnum):
   REDEEM_REDEMPTION_CODE = "redeem_redemption_code"              # 兑换权益码
   GENERATE_REDEMPTION_CODES = "generate_redemption_codes"        # 生成权益码（后台）
   QUERY_USER_RIGHTS = "query_user_rights"                        # 查询用户权益
+  QUERY_OPS_ROLE = "query_ops_role"                              # 查询本人运营角色（ops_role）
+  GRANT_OPS_ROLE = "grant_ops_role"                              # 0号管理员(super)授权他人运营角色
 
   def __str__(self):
     return self.value
@@ -73,6 +75,8 @@ class AuthData(BaseModel):
   quantity: int | None = Field(None, description="生成兑换码数量")
   code_expire_at: datetime | None = Field(None, description="兑换码自身过期时间")
   admin_secret: str | None = Field(None, description="后台生成兑换码口令")
+  target_email: EmailStr | None = Field(None, description="被授权用户邮箱，grant_ops_role 必填")
+  ops_role: str | None = Field(None, description="目标运营角色 none/admin，grant_ops_role 必填（super 只能数据库直设）")
 
   @field_validator("verify_code")
   def check_verify_code_format(cls, v):
@@ -278,6 +282,15 @@ class AuthRequest(BaseModel):
     elif req_type == AuthRequestType.QUERY_USER_RIGHTS:
       if data.jwt_token is None:
         raise ValueError(f"request_type={req_type}时，data.jwt_token必填")
+
+    elif req_type == AuthRequestType.QUERY_OPS_ROLE:
+      if data.jwt_token is None:
+        raise ValueError(f"request_type={req_type}时，data.jwt_token必填")
+
+    elif req_type == AuthRequestType.GRANT_OPS_ROLE:
+      missing = [f for f in ["jwt_token", "target_email", "ops_role"] if getattr(data, f) is None]
+      if missing:
+        raise ValueError(f"request_type={req_type}时，data中以下字段必填：{missing}")
 
     return self
 

@@ -1,649 +1,43 @@
-import asyncio,copy,datetime,json,logging,os,threading,time
-from typing import Any, Optional, List
-from pathlib import Path
+"""user_server.py — Mindora user server 对外 HTTP API 层。
+
+只保留 API 关注点：路由、鉴权（RS256 公钥验签）、请求 handler、远端同步、进程启动。
+业务实现已拆分为：
+  - profile_service.py     画像存储 / 行为聚合 / 更新编排（UserProfileServ 门面）
+  - analysis_content.py    LLM 分析内容生成与检索
+  - analysis_builders.py   /analysis 响应骨架（纯函数）
+  - engagement_service.py  弹窗 / 问卷 / 陪伴足迹
+  - ops_config.py          弹窗问卷运营配置加载
+"""
+import asyncio,copy,datetime,json,logging,os,time
+from typing import Any, Optional
 from dotenv import load_dotenv
 import jwt
 from pydantic import BaseModel, ValidationError
-import websockets
-from aiohttp import ClientResponseError, ClientSession, web
-from sleep_reco import RecommendationEngine
-try:
-  import plyvel
-except ImportError:
-  plyvel = None
-from user_profile import UserProfile, SleepScenario
+from aiohttp import ClientSession, web
+
+import analysis_builders
+from analysis_content import AnalysisContentService
 from config import Config
-from common import util
+from common.jwt_keys import verify_token
+from profile_service import UserProfileServ
 from user_profile import (
   UserProfile, ProfileRequest, ProfileResponse, ProfileData,
   InvalidOrExpiredTokenResp, InvalidReqFormatResp, BaseResponse,
   AnalysisRequest, AnalysisResponse,
-  SleepAdviceRequest, SleepAdviceResponse, SleepAdviceResult,
+  PopupRequest, SurveyRequest, FootprintRequest,
 )
-from auth import AuthRequest
+from auth import AuthRequest, AuthData
+from ops_config import append_popup
 from uid.uuid import get_or_create_uuid
-from llm_service import SleepAnalysisLLM, extract_sleep_context, deep_merge
+from llm import SleepAnalysisLLM, deep_merge
 import logger
 import copy
 
 load_dotenv()
-run_dir = os.getenv("RUN_DIR")
+run_dir = os.getenv("RUN_DIR") or os.path.dirname(os.path.abspath(__file__))
 logger.init_log(f"{run_dir}/user_server_logs")
-JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY")
-REMOTE_SYNC_HEADER = "X-Mindora-Remote-Sync"
+# JWT 验签改用 RS256 公钥（见 common/jwt_keys.py），不再需要本地保存签名密钥
 
-
-# all bloking sync api
-class UserProfileServ:
-  MAX_BEHAVIOR_LEN = 100
-  def __init__(self, llm: Optional[SleepAnalysisLLM] = None):
-    self.lock = threading.RLock()
-    self.storage_mode = (Config.USER_PROFILE_STORAGE_MODE or "leveldb").strip().lower()
-    self.db = None
-    self.json_path = Path(run_dir) / Config.USER_PROFILE_JSON_PATH
-    self.text_profiles: dict[str, Any] = {}
-    self.llm = llm or SleepAnalysisLLM()
-
-    if self.storage_mode == "leveldb":
-      if plyvel is None:
-        raise ImportError("plyvel is required when USER_PROFILE_STORAGE_MODE=leveldb")
-      # 初始化LevelDB（若路径不存在则自动创建）
-      self.db = plyvel.DB(f"{run_dir}/{Config.DB_PATH}", create_if_missing=True)
-    elif self.storage_mode not in {"txt_json", "json_txt", "json"}:
-      raise ValueError(f"unsupported USER_PROFILE_STORAGE_MODE: {self.storage_mode}")
-    else:
-      self.text_profiles = self._load_profiles_from_text_unlocked()
-      logging.info(f"preloaded {len(self.text_profiles)} user profiles from {self.json_path}")
-
-    logging.info(f"user profile storage mode={self.storage_mode}")
-
-  def _profile_to_json_data(self, profile: UserProfile) -> dict:
-    return profile.model_dump(mode="json")
-
-  def _load_profiles_from_text_unlocked(self) -> dict[str, Any]:
-    if not self.json_path.exists():
-      return {}
-
-    raw_text = self.json_path.read_text(encoding="utf-8").strip()
-    if not raw_text:
-      return {}
-
-    profiles = json.loads(raw_text)
-    if not isinstance(profiles, dict):
-      raise ValueError(f"profile json file should be a dict keyed by uid: {self.json_path}")
-    return profiles
-
-  def _save_profiles_to_text_unlocked(self, profiles: dict[str, Any]):
-    self.json_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = self.json_path.with_suffix(self.json_path.suffix + ".tmp")
-    tmp_path.write_text(
-      json.dumps(profiles, ensure_ascii=False, indent=2),
-      encoding="utf-8",
-    )
-    tmp_path.replace(self.json_path)
-
-  def _flush_text_profiles_unlocked(self):
-    self._save_profiles_to_text_unlocked(self.text_profiles)
-
-  def get_profile(self, uid: str) -> Optional[UserProfile]:
-    """读取单个用户画像"""
-    if not uid or not isinstance(uid, str):
-      logging.error(f"erro uid : {uid}")
-      return None
-
-    with self.lock:
-      if self.storage_mode == "leveldb":
-        data = self.db.get(uid.encode('utf-8'))  # LevelDB键值为bytes类型
-        if data:
-          logging.info("get from leveldb uid=%s size=%d bytes", uid, len(data))
-          return UserProfile.model_validate(json.loads(data.decode('utf-8')))
-        logging.info("get from leveldb uid=%s not found", uid)
-        return None
-
-      data = self.text_profiles.get(uid)
-      logging.info("get from json txt uid=%s found=%s size=%d", uid, data is not None, len(json.dumps(data)) if data else 0)
-      if data is not None:
-        return UserProfile.model_validate(data)
-      return None
-
-  def save_profile(self, uid: str, profile: UserProfile):
-    """将单个用户的画像写入持久化存储"""
-    with self.lock:
-      if self.storage_mode == "leveldb":
-        data = json.dumps(self._profile_to_json_data(profile)).encode('utf-8')
-        self.db.put(uid.encode('utf-8'), data)
-        return
-
-      self.text_profiles[uid] = self._profile_to_json_data(profile)
-      self._flush_text_profiles_unlocked()
-
-  def _merge_profile(self, old_profile, new_profile):
-    return old_profile
-
-  @staticmethod
-  def _behavior_counts(behaviors: dict) -> dict:
-    """Return a compact count summary for logging."""
-    return {k: len(v) if isinstance(v, list) else v for k, v in behaviors.items()}
-
-  def _merge_behavior(self, old_behaviors, new_behaviors):
-    # merge sort, consider the old ones is sorted already
-    logging.info(
-      "merge behavior counts before=%s new=%s",
-      self._behavior_counts(old_behaviors),
-      self._behavior_counts(new_behaviors),
-    )
-    for behavior_type, values in new_behaviors.items():
-      if not isinstance(values, list) or not values:
-        # Skip empty updates to avoid wiping existing data (e.g. from remote sync
-        # or compact query_profile responses). If a caller truly wants to clear a
-        # behavior list, it should explicitly send a deletion marker instead.
-        continue
-      values.sort(key=lambda x:x[0])
-      if behavior_type in old_behaviors:
-        old_behaviors[behavior_type].sort(key=lambda x:x[0])
-        old_behaviors[behavior_type]= util.merge_two_sorted_dedup(old_behaviors[behavior_type], values)
-      else:
-        old_behaviors[behavior_type] = values
-
-      if len(old_behaviors[behavior_type]) > UserProfileServ.MAX_BEHAVIOR_LEN:
-        old_behaviors[behavior_type] = old_behaviors[behavior_type][-UserProfileServ.MAX_BEHAVIOR_LEN:]
-
-    logging.info("after update behavior counts=%s", self._behavior_counts(old_behaviors))
-    return old_behaviors
-
-  @staticmethod
-  def _extract_sop_start_events(plays: list) -> list[tuple[str, int, dict]]:
-    """Extract SOP start events from a plays list.
-
-    Returns tuples of (cmd, timestamp, event_dict).
-    """
-    events: list[tuple[str, int, dict]] = []
-    if not isinstance(plays, list):
-      return events
-    for item in plays:
-      if not isinstance(item, (list, tuple)) or len(item) < 2:
-        continue
-      ts, event = item
-      if not isinstance(event, dict):
-        continue
-      cmd = event.get("cmd")
-      event_type = event.get("event")
-      if isinstance(cmd, str) and cmd.startswith("sleep.scene.") and event_type == "sop_start":
-        events.append((cmd, int(ts), event))
-    return events
-
-  def _update_mindora_record(self, profile: UserProfile, new_profile: UserProfile):
-    """Move SOP play counts from behaviors.plays into mindora_record.
-
-    Stores lightweight (timestamp, duration) tuples instead of full event dicts
-    to keep storage and logs small.
-    """
-    plays = new_profile.behaviors.get("plays", [])
-    for cmd, ts, event in self._extract_sop_start_events(plays):
-      duration = event.get("duration") if isinstance(event, dict) else None
-      record = profile.mindora_record.setdefault(cmd, [])
-      record.append((ts, duration))
-      # keep the list sorted by timestamp and cap the length
-      record.sort(key=lambda x: x[0])
-      if len(record) > UserProfileServ.MAX_BEHAVIOR_LEN:
-        record[:] = record[-UserProfileServ.MAX_BEHAVIOR_LEN:]
-
-  @staticmethod
-  def _calc_scene_stats(mindora_record: dict, days: int | None = None) -> dict:
-    """Compute usage counts and total duration per scene from mindora_record.
-
-    If ``days`` is given, only entries whose timestamp is within the last
-    ``days`` days are counted.
-    """
-    cutoff_ts = int(time.time()) - days * 86400 if days else 0
-    stats: dict[str, dict] = {}
-    for scene_id, records in (mindora_record or {}).items():
-      if not isinstance(records, list) or not records:
-        continue
-      total_duration = 0
-      count = 0
-      for entry in records:
-        if isinstance(entry, (list, tuple)) and len(entry) >= 1:
-          try:
-            ts = int(entry[0])
-          except (TypeError, ValueError):
-            continue
-          if ts < cutoff_ts:
-            continue
-          count += 1
-          if len(entry) >= 2 and entry[1] is not None:
-            try:
-              total_duration += float(entry[1])
-            except (TypeError, ValueError):
-              pass
-      if count > 0:
-        stats[scene_id] = {"count": count, "total_duration": round(total_duration, 1)}
-    return stats
-
-  @staticmethod
-  def _pick_most_used_scene(mindora_record: dict, days: int | None = None) -> Optional[tuple[str, dict]]:
-    """Return (scene_id, stats) for the scene with the highest usage count."""
-    stats = UserProfileServ._calc_scene_stats(mindora_record, days=days)
-    if not stats:
-      return None
-    best_id = max(stats.items(), key=lambda x: x[1]["count"])[0]
-    return best_id, stats[best_id]
-
-  def _update_scene_stats(self, profile: UserProfile):
-    """Pre-compute most-used scene (all-time and last 7 days) and persist them in sleep_analysis."""
-    now = int(time.time())
-
-    # All-time most used scene
-    most_used = self._pick_most_used_scene(profile.mindora_record)
-    if most_used is None:
-      profile.sleep_analysis.pop("most_used_scene", None)
-    else:
-      scene_id, scene_stats = most_used
-      short_id = scene_id.replace("sleep.scene.", "")
-      profile.sleep_analysis["most_used_scene"] = {
-        "scene_id": short_id,
-        "scene_name": short_id.replace("_", " ").title(),
-        "count": scene_stats["count"],
-        "total_duration": scene_stats["total_duration"],
-        "updated_at": now,
-      }
-
-    # Most used scene in the last 7 days
-    most_used_7d = self._pick_most_used_scene(profile.mindora_record, days=7)
-    if most_used_7d is None:
-      profile.sleep_analysis.pop("most_used_scene_7d", None)
-    else:
-      scene_id, scene_stats = most_used_7d
-      short_id = scene_id.replace("sleep.scene.", "")
-      profile.sleep_analysis["most_used_scene_7d"] = {
-        "scene_id": short_id,
-        "scene_name": short_id.replace("_", " ").title(),
-        "count": scene_stats["count"],
-        "total_duration": scene_stats["total_duration"],
-        "updated_at": now,
-      }
-
-  @staticmethod
-  def _pick_best_sleep_quality_scene(profile: UserProfile, days: int = 7) -> Optional[dict]:
-    """Return the scene whose usage before sleep onset produced the highest avg sleep_quality.
-
-    For each sleep night in the last ``days`` days:
-      - Compute sleep onset datetime from sleep_data.timestamp + first_sleep_time.
-      - Look at scene usages in the 4-hour wind-down window before onset.
-      - Pick the scene usage closest to onset as the "effective" scene for that night.
-      - Attribute that night's sleep_quality to that scene.
-
-    The returned dict contains the scene with the highest average sleep_quality.
-    """
-    if not profile or not profile.sleep_data or not profile.mindora_record:
-      return None
-
-    now_ts = int(time.time())
-    cutoff_ts = now_ts - days * 86400
-
-    # Collect all scene usages with metadata.
-    usages: list[dict] = []
-    for scene_id, records in profile.mindora_record.items():
-      if not isinstance(records, list) or not records:
-        continue
-      short_id = scene_id.replace("sleep.scene.", "")
-      scene_name = short_id.replace("_", " ").title()
-      for entry in records:
-        if isinstance(entry, (list, tuple)) and len(entry) >= 1:
-          try:
-            ts = int(entry[0])
-          except (TypeError, ValueError):
-            continue
-          if ts < cutoff_ts:
-            continue
-          usages.append({
-            "scene_id": short_id,
-            "scene_name": scene_name,
-            "timestamp": ts,
-          })
-
-    if not usages:
-      return None
-
-    # Attribute sleep_quality to the effective scene per night.
-    scene_qualities: dict[str, list[float]] = {}
-    for record in profile.sleep_data[-days:]:
-      if record.timestamp < cutoff_ts:
-        continue
-      if record.sleep_quality is None or not record.first_sleep_time:
-        continue
-
-      try:
-        sleep_dt = datetime.datetime.fromtimestamp(record.timestamp)
-        hour, minute = record.first_sleep_time.split(":")
-        onset_dt = sleep_dt.replace(hour=int(hour), minute=int(minute), second=0, microsecond=0)
-        if onset_dt > sleep_dt:
-          onset_dt -= datetime.timedelta(days=1)
-      except Exception:
-        continue
-
-      onset_ts = int(onset_dt.timestamp())
-      window_start_ts = onset_ts - 4 * 3600  # 4-hour wind-down window
-
-      # Pick the scene usage closest to onset but not after it.
-      best_usage = None
-      best_delta = None
-      for usage in usages:
-        ts = usage["timestamp"]
-        if ts < window_start_ts or ts > onset_ts:
-          continue
-        delta = onset_ts - ts
-        if best_delta is None or delta < best_delta:
-          best_delta = delta
-          best_usage = usage
-
-      if best_usage is None:
-        continue
-
-      scene_qualities.setdefault(best_usage["scene_id"], []).append(record.sleep_quality)
-
-    if not scene_qualities:
-      return None
-
-    best_scene_id = max(
-      scene_qualities.items(),
-      key=lambda item: sum(item[1]) / len(item[1]),
-    )[0]
-    qualities = scene_qualities[best_scene_id]
-    avg_quality = round(sum(qualities) / len(qualities), 1)
-
-    # Find a human-readable name for the best scene.
-    scene_name = best_scene_id.replace("_", " ").title()
-    for usage in usages:
-      if usage["scene_id"] == best_scene_id:
-        scene_name = usage["scene_name"]
-        break
-
-    return {
-      "scene_id": best_scene_id,
-      "scene_name": scene_name,
-      "avg_sleep_quality": avg_quality,
-      "nights": len(qualities),
-      "updated_at": now_ts,
-    }
-
-  def _update_best_scene_by_sleep_quality(self, profile: UserProfile):
-    """Persist the scene with the highest avg sleep_quality in the last 7 days."""
-    best = self._pick_best_sleep_quality_scene(profile, days=7)
-    if best is None:
-      profile.sleep_analysis.pop("best_sleep_quality_scene_7d", None)
-      return
-    profile.sleep_analysis["best_sleep_quality_scene_7d"] = best
-
-  @staticmethod
-  def _profile_for_log(profile: UserProfile) -> dict:
-    """Return a compact dict for logging (large fields are summarized)."""
-    data = profile.model_dump(mode="json", exclude_none=True)
-    if isinstance(data.get("behaviors"), dict):
-      data["behaviors"] = {
-        k: len(v) if isinstance(v, list) else v for k, v in data["behaviors"].items()
-      }
-    if isinstance(data.get("sleep_scenarios_reco"), list):
-      data["sleep_scenarios_reco"] = [
-        {"scenario_id": s.get("scenario_id"), "scenario_name": s.get("scenario_name")}
-        for s in data["sleep_scenarios_reco"]
-      ]
-    if isinstance(data.get("standard_sop_reco"), list):
-      data["standard_sop_reco"] = [
-        {"scenario_id": s.get("scenario_id"), "scenario_name": s.get("scenario_name")}
-        for s in data["standard_sop_reco"]
-      ]
-    if isinstance(data.get("mindora_record"), dict):
-      data["mindora_record"] = {
-        k: len(v) if isinstance(v, list) else v for k, v in data["mindora_record"].items()
-      }
-    if isinstance(data.get("sleep_data"), list):
-      data["sleep_data"] = len(data["sleep_data"])
-    return data
-
-  def calc_sleep_reco(self, uid: str, new_profile: UserProfile, old_profile: UserProfile) -> List[SleepScenario]:
-    # 1. 触发推荐引擎逻辑
-    sleep_scenarios = old_profile.sleep_scenarios_reco
-    # if RecommendationEngine.should_rerun_recommendation(old_profile, new_profile):
-    logging.info(f"Rerunning sleep scenario recommendation for {uid}")
-    sleep_scenarios = RecommendationEngine.generate(new_profile)
-
-    return sleep_scenarios
-
-  def calc_standard_sop_reco(self, uid: str, new_profile: UserProfile, old_profile: UserProfile) -> List[SleepScenario]:
-    sop_reco = old_profile.standard_sop_reco
-    candidates = []
-    logging.info(f"Rerunning standard SOP recommendation for {uid} with candidates={candidates}")
-    sop_reco = RecommendationEngine.generate_sop_reco(new_profile, candidates)
-    return sop_reco
-
-  def calc_sleep_advice(self, uid: str, profile: UserProfile) -> dict:
-    """Generate sleep advice via LLM and return a structured dict for storage.
-
-    If the stored advice is less than 7 days old, reuse it instead of calling
-    the LLM again.
-    """
-    existing = profile.sleep_analysis.get("sleep_advice_structured") if profile.sleep_analysis else None
-    now = int(time.time())
-    if existing and existing.get("generated_at") and now - existing["generated_at"] < 7 * 86400:
-      logging.info(f"sleep_advice still fresh for uid={uid}, skipping LLM")
-      return existing
-
-    if not self.llm or not self.llm.enabled:
-      return {}
-
-    class _FakeData:
-      date = datetime.date.today().isoformat()
-      start_date = None
-      end_date = None
-      language = "en"
-
-    ctx = extract_sleep_context(profile, _FakeData())
-    ctx["focus"] = []
-
-    llm_result = self.llm.generate_sync("sleep_analysis_advice", ctx, "en", [])
-    if not llm_result:
-      return {}
-
-    return {
-      "analysis": llm_result.get("analysis", ""),
-      "advice": llm_result.get("advice", []),
-      "highlights": llm_result.get("highlights", {}),
-      "date": datetime.date.today().isoformat(),
-      "language": "en",
-      "llm_used": True,
-      "generated_at": int(time.time()),
-    }
-
-  def calc_analysis_cache(self, uid: str, profile: UserProfile, language: str = "en") -> dict:
-    """Pre-generate LLM text for default analysis views and return a cache dict.
-
-    Only default date ranges are cached (today for day/overview/explore,
-    last 7 days for week, last 30 days for month). If a cached entry is still
-    fresh (< 7 days) it is reused instead of calling the LLM again.
-    """
-    if not self.llm or not self.llm.enabled:
-      return profile.sleep_analysis.get("analysis_cache", {}) if profile.sleep_analysis else {}
-
-    today = datetime.date.today()
-    today_str = today.isoformat()
-    week_start = (today - datetime.timedelta(days=6)).isoformat()
-    month_start = (today - datetime.timedelta(days=29)).isoformat()
-
-    analysis_specs = [
-      ("analysis_overview", today_str, None, today_str, []),
-      ("analysis_sleep_day", today_str, None, today_str, []),
-      ("analysis_sleep_week", week_start, today_str, today_str, []),
-      ("analysis_sleep_month", month_start, today_str, today_str, []),
-      ("analysis_explore", today_str, None, today_str, [
-        "header_summary", "score_summary", "onset_efficiency",
-        "sleep_structure", "night_fluctuation", "scene_preference", "sleep_advice",
-      ]),
-    ]
-
-    cache = (profile.sleep_analysis.get("analysis_cache") or {}).copy()
-    now = int(time.time())
-
-    for request_type, start_date, end_date, date, modules in analysis_specs:
-      cache_key = f"{request_type}:{date}:{language}"
-      cached = cache.get(cache_key)
-      if cached and cached.get("generated_at") and now - cached["generated_at"] < 7 * 86400:
-        continue
-
-      class _FakeData:
-        pass
-
-      fake = _FakeData()
-      fake.date = date
-      fake.start_date = start_date
-      fake.end_date = end_date
-      fake.language = language
-      fake.modules = modules
-
-      ctx = extract_sleep_context(profile, fake)
-      try:
-        llm_result = self.llm.generate_sync(request_type, ctx, language, modules)
-      except Exception as e:
-        logging.error(f"analysis cache generation failed for {request_type}: {e}")
-        continue
-
-      if llm_result:
-        cache[cache_key] = {
-          "data": llm_result,
-          "date": date,
-          "start_date": start_date,
-          "end_date": end_date,
-          "language": language,
-          "modules": modules,
-          "generated_at": now,
-        }
-
-    return cache
-
-  def _apply_basic_update(self, uid: str, new_profile: UserProfile, profile: Optional[UserProfile]) -> UserProfile:
-    """Apply non-LLM profile updates. Must be called while holding self.lock.
-
-    Returns the profile object that should be saved.
-    """
-    if profile is None:
-      self._update_scene_stats(new_profile)
-      self._update_best_scene_by_sleep_quality(new_profile)
-      return new_profile
-
-    # just replace, if need
-    if len(new_profile.uid_emb) > 16 or profile.uid_emb is None or len(profile.uid_emb) == 0:
-      profile.uid_emb = new_profile.uid_emb
-
-    profile.long_term_profile = self._merge_profile(profile.long_term_profile, new_profile.long_term_profile)
-    profile.behaviors = self._merge_behavior(profile.behaviors, new_profile.behaviors)
-
-    # aggregate SOP play events into mindora_record so we can keep behaviors small
-    self._update_mindora_record(profile, new_profile)
-    self._update_scene_stats(profile)
-    self._update_best_scene_by_sleep_quality(profile)
-    return profile
-
-  def _apply_llm_update(self, uid: str, profile: UserProfile, old_profile: UserProfile) -> None:
-    """Apply LLM-generated fields to profile in place. Must be called while holding self.lock."""
-    profile.sleep_scenarios_reco = self.calc_sleep_reco(uid, profile, old_profile)
-    profile.standard_sop_reco = self.calc_standard_sop_reco(uid, profile, old_profile)
-    sleep_advice_structured = self.calc_sleep_advice(uid, profile)
-    if sleep_advice_structured:
-      profile.sleep_analysis["sleep_advice_structured"] = sleep_advice_structured
-      profile.sleep_analysis["sleep_advice"] = sleep_advice_structured.get("analysis", "")
-    profile.sleep_analysis["analysis_cache"] = self.calc_analysis_cache(uid, profile)
-
-  def update_profile(self, uid: str, new_profile: UserProfile, skip_sleep_scenarios_reco_update: bool = False) -> bool:
-    """写入用户行为（仅更新单个用户数据）.
-
-    Synchronous full-update path. Preserved for backward compatibility with
-    fetch_profile_from_remote and direct callers/tests.
-    """
-    if new_profile is None or uid is None or not isinstance(uid, str):
-      logging.error(f"invalid new profile {new_profile} or uid {uid}")
-      return False
-
-    with self.lock:
-      # 读取或创建用户画像（仅操作单个用户，避免全量加载）
-      profile = self.get_profile(uid)
-      old_profile = profile
-      profile = self._apply_basic_update(uid, new_profile, profile)
-      # For newly created profiles there is no old profile; use the new profile
-      # object as the old-profile reference so calc_* helpers can read defaults.
-      if old_profile is None:
-        old_profile = profile
-
-      if not skip_sleep_scenarios_reco_update:
-        self._apply_llm_update(uid, profile, old_profile)
-      elif not profile.standard_sop_reco:
-        # make sure we never leave standard_sop_reco empty just because the
-        # sleep-scenarios skip flag is set
-        profile.standard_sop_reco = self.calc_standard_sop_reco(uid, profile, old_profile)
-
-      # 仅保存当前用户的更新（而非全量数据）
-      self.save_profile(uid, profile)
-      logging.info(
-        "Profile updated uid=%s summary=%s",
-        uid,
-        self._profile_for_log(profile),
-      )
-      return True
-
-  def update_profile_basic(self, uid: str, new_profile: UserProfile) -> bool:
-    """Persist basic profile changes without LLM work. Fast path for HTTP update_profile."""
-    if new_profile is None or uid is None or not isinstance(uid, str):
-      logging.error(f"invalid new profile {new_profile} or uid {uid}")
-      return False
-
-    with self.lock:
-      profile = self.get_profile(uid)
-      profile = self._apply_basic_update(uid, new_profile, profile)
-      self.save_profile(uid, profile)
-      logging.info("Profile basic updated uid=%s", uid)
-      return True
-
-  def update_profile_llm(self, uid: str) -> bool:
-    """Run LLM work for an existing profile and persist results.
-
-    Does not hold self.lock during LLM calls so concurrent basic updates are
-    not blocked. Reloads the profile before saving to avoid overwriting
-    concurrent writes.
-    """
-    if uid is None or not isinstance(uid, str):
-      logging.error(f"invalid uid {uid}")
-      return False
-
-    with self.lock:
-      profile = self.get_profile(uid)
-      if profile is None:
-        logging.warning(f"skip llm update: profile not found for uid={uid}")
-        return False
-      old_profile = profile.model_copy(deep=True)
-      llm_profile = profile.model_copy(deep=True)
-
-    sleep_scenarios = self.calc_sleep_reco(uid, llm_profile, old_profile)
-    standard_sop = self.calc_standard_sop_reco(uid, llm_profile, old_profile)
-    sleep_advice_structured = self.calc_sleep_advice(uid, llm_profile)
-    analysis_cache = self.calc_analysis_cache(uid, llm_profile)
-
-    with self.lock:
-      profile = self.get_profile(uid)
-      if profile is None:
-        logging.warning(f"skip llm update: profile disappeared for uid={uid}")
-        return False
-      profile.sleep_scenarios_reco = sleep_scenarios
-      profile.standard_sop_reco = standard_sop
-      if sleep_advice_structured:
-        profile.sleep_analysis["sleep_advice_structured"] = sleep_advice_structured
-        profile.sleep_analysis["sleep_advice"] = sleep_advice_structured.get("analysis", "")
-      profile.sleep_analysis["analysis_cache"] = analysis_cache
-      self.save_profile(uid, profile)
-      logging.info("Profile llm updated uid=%s", uid)
-      return True
-
-  def close(self):
-    if self.db is not None:
-      self.db.close()
 
 def get_http_status(resp: BaseResponse):
   status = 200
@@ -652,38 +46,20 @@ def get_http_status(resp: BaseResponse):
   return status
 
 
-async def query_profile(jwt_token: str, server_uri: str) :
-  query_endpoint = f"{server_uri}/user_profile"
-  async with ClientSession() as session:
-    try:
-      req = ProfileRequest(request_type="query_profile", timestamp=int(time.time()), version="1.0", data=ProfileData(jwt_token = jwt_token))
-      # 构造请求数据
-      async with session.post(
-        query_endpoint,
-        json=req.model_dump(),
-        timeout=2  # 10秒超时
-      ) as response:
-        response.raise_for_status()  # 触发HTTP错误（如4xx、5xx）
-        data = await response.json()
-        return ProfileResponse.model_validate(data)
-            
-    except ClientResponseError as e:
-      # 处理HTTP错误响应
-      error_msg = f"查询失败 [HTTP {e.status}]: {e}"
-      raise Exception(error_msg) from e
-    except Exception as e:
-      raise Exception(f"查询用户画像失败: {str(e)}") from e
-
 class UserServer:
   @staticmethod
   def _request_for_log(req_or_data) -> Any:
-    """Return a log-safe copy with behaviors summarized by count."""
+    """Return a log-safe copy: jwt_token 打码，behaviors 按条数汇总。"""
     if isinstance(req_or_data, BaseModel):
       data = req_or_data.model_dump(mode="json", exclude_none=True)
     elif isinstance(req_or_data, dict):
       data = copy.deepcopy(req_or_data)
     else:
       return req_or_data
+
+    d = data.get("data")
+    if isinstance(d, dict) and d.get("jwt_token"):
+      d["jwt_token"] = "***"
 
     up = ((data.get("data") or {}).get("user_profile") or {})
     if isinstance(up.get("behaviors"), dict):
@@ -698,9 +74,7 @@ class UserServer:
     self.port = Config.PORT
     self.llm = SleepAnalysisLLM()
     self.user_serv = UserProfileServ(llm=self.llm)
-    self.update_task = None
     self.app = web.Application()
-    self.active_uid = ""
     self.system_uid = get_or_create_uuid()
     self.debug_uid_set = {"mindora_test_uid1", "mindora_test_uid2", "mindora_test_uid3", "test_debug_user_001"}
     # Per-user LLM background-update rate limiting and task tracking.
@@ -712,8 +86,6 @@ class UserServer:
 
   def close(self):
     self.user_serv.close()
-    if self.update_task:
-      self.update_task.cancel()
     # Cancel pending LLM background tasks.
     for task in list(self._llm_tasks):
       task.cancel()
@@ -724,12 +96,17 @@ class UserServer:
     self.app.router.add_post('/user_profile', self.handle_profile_request_http)
     self.app.router.add_post('/login', self.handle_login_http)
     self.app.router.add_post('/analysis', self.handle_analysis_http)
-    self.app.router.add_post('/sleep_advice', self.handle_sleep_advice_http)
+    self.app.router.add_post('/popup', self.handle_popup_http)
+    self.app.router.add_post('/survey', self.handle_survey_http)
+    self.app.router.add_post('/companion_footprint', self.handle_footprint_http)
+    # 运营后台接口（管理员校验：JWT + auth_server 查 ops_role）
+    self.app.router.add_post('/ops/push', self.handle_ops_push_http)
+    self.app.router.add_post('/ops/survey_records', self.handle_ops_survey_records_http)
 
+  # -------------------- 鉴权 --------------------
   def _check_token(self, jwt_token: str)-> dict | None:
-    logging.info(f"in login: {jwt_token}")
     try:
-      payload = jwt.decode(jwt_token, JWT_SECRET_KEY, algorithms=[Config.ALGORITHM])
+      payload = verify_token(jwt_token)
     except jwt.ExpiredSignatureError:
       logging.error("login token expired")
       return None
@@ -753,6 +130,18 @@ class UserServer:
 
     return uid
 
+  def _parse_uid_email(self, data: Any) -> tuple[Optional[str], Optional[str]]:
+    """解析 (uid, email)；email 来自 JWT payload（问卷记录展示用），debug uid 无 email。"""
+    if data.jwt_token is not None:
+      payload = self._check_token(data.jwt_token)
+      if payload is None:
+        return None, None
+      return payload.get("uid"), payload.get("email")
+    if Config.IS_DEBUG and data.uid is not None and len(data.uid) > 3 and data.uid in self.debug_uid_set:
+      return data.uid, None
+    return None, None
+
+  # -------------------- /user_profile --------------------
   def handle_query_profile(self, request: ProfileRequest) -> BaseResponse:
     logging.info("handle query_profile request=%s", self._request_for_log(request))
     """查询用户画像（从LevelDB按需读取）"""
@@ -766,16 +155,13 @@ class UserServer:
     if uid is None:
       return InvalidOrExpiredTokenResp()
 
-    if uid == "active_uid":
-      uid = self.active_uid
-
     profile = self.user_serv.get_profile(uid)
     if profile:
       logging.info("profile found uid=%s summary=%s", uid, self.user_serv._profile_for_log(profile))
       return ProfileResponse(code=0, msg="succ", request_type=request.request_type, data={"user_profile": profile.model_dump()})
     else:
       logging.warning("uid=%s query not found request=%s", uid, self._request_for_log(request))
-      return ProfileResponse(code=0, msg=f"User with uid '{request.data}' not found", request_type=request.request_type, data=None)
+      return ProfileResponse(code=0, msg=f"User with uid '{uid}' not found", request_type=request.request_type, data=None)
 
     # incr update the behaviors by time, and update long term weight
   async def handle_update_profile(self, request: ProfileRequest) -> BaseResponse:
@@ -799,12 +185,19 @@ class UserServer:
     if not succ:
       return ProfileResponse(code=500, msg=f"update profile failed", request_type=request.request_type, data=None)
 
-    if not request.data.skip_sleep_scenarios_reco_update:
-      await self._schedule_llm_update_if_needed(uid)
+    skip_reco = request.data.skip_sleep_scenarios_reco_update
+    skip_analysis = request.data.skip_sleep_analysis_update
+    if not (skip_reco and skip_analysis):
+      await self._schedule_llm_update_if_needed(uid, skip_reco, skip_analysis)
 
     return ProfileResponse(code=0, msg=f"update profile for '{request.timestamp}' succ", request_type=request.request_type, data=None)
 
-  async def _schedule_llm_update_if_needed(self, uid: str) -> None:
+  async def _schedule_llm_update_if_needed(
+    self,
+    uid: str,
+    skip_sleep_scenarios_reco_update: bool = False,
+    skip_sleep_analysis_update: bool = False,
+  ) -> None:
     """Schedule a background LLM update for uid unless one ran recently."""
     async with self._llm_tracker_lock:
       now = time.monotonic()
@@ -814,108 +207,37 @@ class UserServer:
         return
       self._llm_update_tracker[uid] = now
 
-    task = asyncio.create_task(self._run_llm_update(uid))
+    task = asyncio.create_task(
+      self._run_llm_update(uid, skip_sleep_scenarios_reco_update, skip_sleep_analysis_update)
+    )
     self._llm_tasks.add(task)
     task.add_done_callback(self._llm_tasks.discard)
 
-  async def _run_llm_update(self, uid: str) -> None:
+  async def _run_llm_update(
+    self,
+    uid: str,
+    skip_sleep_scenarios_reco_update: bool = False,
+    skip_sleep_analysis_update: bool = False,
+  ) -> None:
     """Run LLM work in a background task."""
-    logging.info("start background llm update for uid=%s", uid)
+    logging.info(
+      "start background llm update for uid=%s (skip_reco=%s skip_analysis=%s)",
+      uid, skip_sleep_scenarios_reco_update, skip_sleep_analysis_update,
+    )
     try:
       async with self._llm_semaphore:
-        await asyncio.to_thread(self.user_serv.update_profile_llm, uid)
+        await asyncio.to_thread(
+          self.user_serv.update_profile_llm,
+          uid,
+          skip_sleep_scenarios_reco_update,
+          skip_sleep_analysis_update,
+        )
       logging.info("background llm update done for uid=%s", uid)
     except asyncio.CancelledError:
       logging.info("background llm update cancelled for uid=%s", uid)
       raise
     except Exception as e:
       logging.error("background llm update failed for uid=%s: %s", uid, e)
-
-  async def sync_profile_to_remote(self, uid: str, request: ProfileRequest) -> bool:
-    if not Config.RemoteHost or len(Config.RemoteHost) < 10:
-      return False
-
-    profile = self.user_serv.get_profile(uid)
-    if profile is None:
-      logging.warning(f"skip remote sync because local profile missing for uid={uid}")
-      return False
-
-    remote_endpoint = f"{Config.RemoteHost.rstrip('/')}/user_profile"
-    sync_data = {"user_profile": profile.model_dump()}
-    if request.data.jwt_token is not None:
-      sync_data["jwt_token"] = request.data.jwt_token
-    else:
-      sync_data["uid"] = uid
-    if request.data.skip_sleep_scenarios_reco_update:
-      sync_data["skip_sleep_scenarios_reco_update"] = True
-
-    payload = ProfileRequest(
-      request_type="update_profile",
-      timestamp=int(time.time()),
-      version=request.version,
-      data=ProfileData.model_validate(sync_data),
-    ).model_dump()
-
-    try:
-      async with ClientSession() as session:
-        async with session.post(
-          remote_endpoint,
-          json=payload,
-          headers={REMOTE_SYNC_HEADER: "1"},
-          timeout=10,
-        ) as response:
-          resp_data = await response.json()
-          if response.status >= 400:
-            logging.error(f"remote profile sync failed status={response.status}, body={resp_data}")
-            return False
-          logging.info(f"remote profile sync succ for uid={uid}, body={resp_data}")
-          return True
-    except Exception as e:
-      logging.error(f"remote profile sync error for uid={uid}: {e}")
-      return False
-
-  def handle_login(self, request: AuthRequest) -> BaseResponse:
-    if request.data is None or request.data.jwt_token is None:
-      return InvalidReqFormatResp()
-
-    payload = self._check_token(request.data.jwt_token)
-    if payload is None:
-      return InvalidOrExpiredTokenResp()
-
-    uid = payload.get("uid")
-    self.active_uid = uid
-    self.jwt_token = request.data.jwt_token
-    return BaseResponse(code=0, msg="user ativated successufully")
-
-  async def handle_profile_request(self, websocket, path=None):
-    try:
-      async for msg in websocket:
-        response_obj: BaseResponse
-        try:
-          data = json.loads(msg)
-          req = ProfileRequest.model_validate(data)
-          if req.request_type == "query_profile":
-            response_obj = self.handle_query_profile(req)
-          elif req.request_type == "update_profile":
-            response_obj = await self.handle_update_profile(req)
-          else:
-            response_obj = BaseResponse(code=400, msg="Invalid request type")
-
-        except (json.JSONDecodeError, TypeError, KeyError, ValidationError) as e:
-          response_obj = BaseResponse(code=400, msg=f"Invalid request format: {e}")
-        
-        await websocket.send(json.dumps(response_obj.model_dump()))
-    except websockets.exceptions.ConnectionClosed:
-      logging.error("Connection closed.")
-
-
-  def get_overall_score(self, profile: UserProfile) -> Optional[float]:
-    """计算用户最近7天的平均睡眠质量得分（0-100）"""
-    if not profile.sleep_data:
-      return None
-    recent = profile.sleep_data[-7:]
-    scores = [s.sleep_quality for s in recent if s.sleep_quality is not None]
-    return round(sum(scores) / len(scores), 2) if scores else None
 
   async def handle_profile_request_http(self, request: web.Request) -> web.Response:
     try:
@@ -929,50 +251,10 @@ class UserServer:
 
       elif req.request_type == "update_profile":
         response_obj = await self.handle_update_profile(req)
-        if (
-          response_obj.code == 0
-          and Config.RemoteHost is not None and len(Config.RemoteHost) > 8
-          and req.data is not None
-        ):
-          uid = self._parse_for_uid(req.data)
-          if isinstance(uid, str) and uid:
-            remote_succ = await self.sync_profile_to_remote(uid, req)
-            if not remote_succ:
-              response_obj.msg = f"{response_obj.msg}, remote sync failed"
         return web.json_response(response_obj.model_dump(), status=get_http_status(response_obj))
 
-      elif req.request_type in ["analysis_overview", "insight", "daily_report", "weekly_report", "month_report"]:
-        uid = self._parse_for_uid(req.data)
-        if not uid:
-          return web.json_response(InvalidOrExpiredTokenResp().model_dump(), status=401)
-
-        profile = self.user_serv.get_profile(uid)
-        if not profile:
-          return web.json_response(ProfileResponse(code=404, msg="Profile not found").model_dump(), status=404)
-
-        # Handle different request types
-        response_data = {}
-        if req.request_type == "analysis_overview":
-          response_data = {
-            "overall_score": self.get_overall_score(profile),
-            "weekly_best": profile.sleep_analysis.get("weekly_best"),
-            "sleep_insight": profile.sleep_analysis.get("sleep_insight")
-          }
-        elif req.request_type == "insight":
-          response_data = {"insight": profile.long_term_profile}
-        elif req.request_type == "daily_report":
-          response_data = {"daily": profile.sleep_data[-1] if profile.sleep_data else None}
-        elif req.request_type == "weekly_report":
-          response_data = {"weekly": profile.sleep_data[-7:]}
-        elif req.request_type == "month_report":
-          response_data = {"monthly": profile.sleep_data[-30:]}
-
-        # Filter response based on modules
-        if req.modules:
-          response_data = {key: value for key, value in response_data.items() if key in req.modules}
-
-        return web.json_response(ProfileResponse(code=0, msg="success", request_type=req.request_type, data=response_data).model_dump())
-
+      # client_request.md：/user_profile 只承载 query_profile / update_profile，
+      # 分析类请求统一走 /analysis，洞察报告由 analysis_explore 出口
       else:
         return web.json_response(InvalidReqFormatResp().model_dump(), status=400)
 
@@ -982,9 +264,32 @@ class UserServer:
     except Exception as e:
         logging.exception("Unexpected error: %s", e)
         return web.json_response(BaseResponse(code=500, msg="Internal server error").model_dump(), status=500)
-      
-  # -------------------- /analysis endpoint --------------------
 
+  # -------------------- /login --------------------
+  def handle_login(self, request: AuthRequest) -> BaseResponse:
+    if request.data is None or request.data.jwt_token is None:
+      return InvalidReqFormatResp()
+
+    payload = self._check_token(request.data.jwt_token)
+    if payload is None:
+      return InvalidOrExpiredTokenResp()
+
+    uid = payload.get("uid")
+    return BaseResponse(code=0, msg="user ativated successufully")
+
+  async def handle_login_http(self, request: web.Request) -> web.Response:
+    try:
+      data = await request.json()
+      request = AuthRequest.model_validate(data)
+      response_obj = self.handle_login(request)
+    except (json.JSONDecodeError, TypeError, KeyError, ValidationError) as e:
+      logging.error(f"login error: {e}")
+      response_obj = InvalidReqFormatResp()
+
+    logging.info(f"login resp: {response_obj}")
+    return web.json_response(status=get_http_status(response_obj), data=response_obj.model_dump())
+
+  # -------------------- /analysis --------------------
   async def handle_analysis_http(self, request: web.Request) -> web.Response:
     try:
       body = await request.json()
@@ -998,22 +303,17 @@ class UserServer:
       profile = self.user_serv.get_profile(uid)
       response_data = self._build_analysis_data(req, profile)
 
-      if self.llm.enabled:
-        d = req.data
-        today_str = datetime.date.today().isoformat()
-        anchor_date = d.end_date or d.date or today_str
-        cache_key = f"{req.request_type}:{anchor_date}:{d.language or 'en'}"
-        cached = (profile.sleep_analysis or {}).get("analysis_cache", {}).get(cache_key) if profile else None
-        now = int(time.time())
-
-        if cached and cached.get("generated_at") and now - cached["generated_at"] < 7 * 86400:
-          logging.info(f"analysis cache hit for uid={uid} key={cache_key}")
-          deep_merge(response_data, cached["data"])
-        else:
-          ctx = extract_sleep_context(profile, req.data)
-          llm_text = await self.llm.generate(req.request_type, ctx, req.data.language, req.data.modules)
-          if llm_text:
-            deep_merge(response_data, llm_text)
+      # LLM 文案全部来自 update_profile 时异步生成、按日/周/月序列存储的报告，
+      # 请求时纯查库，不再同步调用 LLM；未命中则只回数值骨架（文案为空/默认）
+      report = UserProfileServ._find_analysis_report(
+        profile, req.request_type, req.data.date, req.data.start_date, req.data.end_date,
+      )
+      if report:
+        # 只合并客户端请求的模块，保持 modules 分字段查询语义不被库存报告击穿
+        updates = report.modules
+        if req.data.modules:
+          updates = {k: v for k, v in updates.items() if k in req.data.modules}
+        deep_merge(response_data, updates)
 
       resp = AnalysisResponse(code=0, msg="success", request_type=req.request_type, data=response_data)
       return web.json_response(resp.model_dump())
@@ -1025,81 +325,12 @@ class UserServer:
       logging.error(f"analysis error: {e}")
       return web.json_response(BaseResponse(code=500, msg="Internal server error").model_dump(), status=500)
 
-  # -------------------- /sleep_advice endpoint --------------------
+  # ---- /analysis 骨架组装：委托给 analysis_builders（纯函数） ----
+  def get_overall_score(self, profile: Optional[UserProfile]) -> Optional[float]:
+    return analysis_builders.get_overall_score(profile)
 
-  _DEFAULT_ADVICE_ANALYSIS = (
-    "Your sleep data shows a balanced pattern overall. "
-    "Deep sleep and REM stages are within a healthy range, "
-    "supporting physical recovery and cognitive function."
-  )
-  _DEFAULT_ADVICE_BULLETS = [
-    "Try to maintain a consistent bedtime to reinforce your circadian rhythm.",
-    "Limit screen exposure at least 30 minutes before bed.",
-    "Consider a light breathing exercise or Mindora scene before sleeping.",
-  ]
-  _DEFAULT_ADVICE_HIGHLIGHTS = {
-    "onset": "Sleep onset appears normal.",
-    "deep": "Deep sleep ratio is within the healthy range.",
-    "rem": "REM activity supports memory consolidation.",
-    "rhythm": "Sleep continuity is stable.",
-  }
-
-  async def handle_sleep_advice_http(self, request: web.Request) -> web.Response:
-    """POST /sleep_advice — return stored sleep advice from the user profile."""
-    try:
-      body = await request.json()
-      req = SleepAdviceRequest.model_validate(body)
-
-      uid = self._parse_for_uid(req.data)
-      if uid is None:
-        return web.json_response(InvalidOrExpiredTokenResp().model_dump(), status=401)
-      if isinstance(uid, BaseResponse):
-        return web.json_response(uid.model_dump(), status=uid.code)
-
-      profile = self.user_serv.get_profile(uid)
-      date = req.data.date or datetime.date.today().isoformat()
-      language = req.data.language or "en"
-
-      # --- read stored advice first --------------------------------------------
-      stored = None
-      if profile and profile.sleep_analysis:
-        stored = profile.sleep_analysis.get("sleep_advice_structured")
-
-      if stored:
-        result = SleepAdviceResult(
-          analysis=stored.get("analysis", self._DEFAULT_ADVICE_ANALYSIS),
-          advice=stored.get("advice", list(self._DEFAULT_ADVICE_BULLETS)),
-          highlights=stored.get("highlights", dict(self._DEFAULT_ADVICE_HIGHLIGHTS)),
-          date=stored.get("date", date),
-          language=stored.get("language", language),
-          llm_used=stored.get("llm_used", True),
-        )
-      else:
-        # Fallback: static defaults when no stored advice exists
-        result = SleepAdviceResult(
-          analysis=self._DEFAULT_ADVICE_ANALYSIS,
-          advice=list(self._DEFAULT_ADVICE_BULLETS),
-          highlights=dict(self._DEFAULT_ADVICE_HIGHLIGHTS),
-          date=date,
-          language=language,
-          llm_used=False,
-        )
-
-      resp = SleepAdviceResponse(
-        code=0, msg="success",
-        request_type="sleep_analysis_advice",
-        data=result,
-      )
-      return web.json_response(resp.model_dump())
-
-    except ValidationError as e:
-      logging.error(f"sleep_advice validation error: {e}")
-      return web.json_response(InvalidReqFormatResp().model_dump(), status=400)
-    except Exception as e:
-      logging.error(f"sleep_advice error: {e}")
-      return web.json_response(
-        BaseResponse(code=500, msg="Internal server error").model_dump(), status=500
-      )
+  def _filter_modules(self, data: dict, modules: list) -> dict:
+    return analysis_builders.filter_modules(data, modules)
 
   def _build_analysis_data(self, req: AnalysisRequest, profile: Optional[UserProfile]) -> dict:
     d = req.data
@@ -1116,289 +347,244 @@ class UserServer:
       return self._build_explore(d, profile)
     raise ValueError(f"Unknown request_type: {rt}")
 
-  def _filter_modules(self, data: dict, modules: list) -> dict:
-    return {k: v for k, v in data.items() if k in modules} if modules else data
-
   def _build_overview(self, d, profile: Optional[UserProfile]) -> dict:
-    date = d.date or datetime.date.today().isoformat()
-    score = self.get_overall_score(profile) if profile else None
-    if score is None:
-      score = 82
-
-    weekly_best = None
-    most_used = (profile.sleep_analysis or {}).get("most_used_scene") if profile else None
-    if most_used:
-      weekly_best = {
-        "audio_name": most_used["scene_name"],
-        "used_times": most_used["count"],
-        "score": int(score),
-        "start_date": (datetime.date.fromisoformat(date) - datetime.timedelta(days=6)).isoformat(),
-        "end_date": date,
-      }
-    if weekly_best is None:
-      weekly_best = {
-        "audio_name": "Sedona Red Rocks",
-        "used_times": 5,
-        "score": 92,
-        "start_date": (datetime.date.fromisoformat(date) - datetime.timedelta(days=6)).isoformat(),
-        "end_date": date,
-      }
-
-    result = {
-      "overall_score": {"score": int(score), "date": date},
-      "weekly_best": weekly_best,
-      "sleep_insight": {
-        "title": "Excellent Deep Sleep Performance",
-        "description": "Your deep sleep accounts for a healthy proportion of total sleep. Keep maintaining a regular sleep schedule.",
-        "date": date,
-      },
-    }
-    return self._filter_modules(result, d.modules)
+    return analysis_builders.build_overview(d, profile)
 
   def _build_sleep_day(self, d, profile: Optional[UserProfile]) -> dict:
-    date = d.date or datetime.date.today().isoformat()
-    latest = profile.sleep_data[-1] if profile and profile.sleep_data else None
-    score = int(latest.sleep_quality) if latest and latest.sleep_quality else 70
-
-    result = {
-      "score_summary": {"score": score, "date": date},
-      "sleep_scenarios_reco": {
-        "title": "Sedona Desert Calm",
-        "description": "You fell asleep quickly and maintained a stable sleep rhythm after the scenario started.",
-        "date": date,
-      },
-      "stage_insights": {
-        "awake": {"description": "A brief awakening was detected and you returned to sleep quickly.", "date": date},
-        "rem":   {"description": "REM sleep was sustained and supports emotional processing.", "date": date},
-        "core":  {"description": "Core sleep remained stable across most of the night.", "date": date},
-        "deep":  {"description": "Deep sleep contributed strongly to physical recovery.", "date": date},
-      },
-    }
-    return self._filter_modules(result, d.modules)
+    return analysis_builders.build_sleep_day(d, profile)
 
   def _build_sleep_week(self, d, profile: Optional[UserProfile]) -> dict:
-    today = datetime.date.today()
-    start = d.start_date or (today - datetime.timedelta(days=6)).isoformat()
-    end   = d.end_date   or today.isoformat()
-
-    score = self.get_overall_score(profile) if profile else None
-    score = int(score) if score else 86
-    label = "Excellent" if score >= 80 else "Good" if score >= 60 else "Fair"
-
-    result = {
-      "score_summary": {"score": score, "label": label, "start_date": start, "end_date": end},
-      "sleep_trends": {
-        "body": "Excellent Deep Sleep Performance",
-        "description": "Your deep sleep accounted for a healthy proportion of total sleep this week.",
-        "start_date": start,
-        "end_date": end,
-      },
-      "onset_efficiency": {
-        "scenario_name": "Sedona Desert Calm",
-        "used_times": 5,
-        "score": score,
-        "start_date": start,
-        "end_date": end,
-      },
-    }
-    return self._filter_modules(result, d.modules)
+    return analysis_builders.build_sleep_week(d, profile)
 
   def _build_sleep_month(self, d, profile: Optional[UserProfile]) -> dict:
-    today = datetime.date.today()
-    start = d.start_date or (today - datetime.timedelta(days=29)).isoformat()
-    end   = d.end_date   or today.isoformat()
-
-    score = self.get_overall_score(profile) if profile else None
-    score = int(score) if score else 89
-    label = "Excellent" if score >= 80 else "Good" if score >= 60 else "Fair"
-
-    # Build score_series from real data, fall back to mock trend
-    score_series: list = []
-    if profile and profile.sleep_data:
-      for sr in profile.sleep_data[-30:]:
-        if sr.sleep_quality is not None:
-          score_series.append({
-            "date": datetime.date.fromtimestamp(sr.timestamp).isoformat(),
-            "score": int(sr.sleep_quality),
-          })
-    if not score_series:
-      cur = datetime.date.fromisoformat(start)
-      end_d = datetime.date.fromisoformat(end)
-      base = 62
-      while cur <= end_d:
-        score_series.append({"date": cur.isoformat(), "score": min(100, base)})
-        base += 1
-        cur += datetime.timedelta(days=1)
-
-    result = {
-      "score_summary": {"score": score, "label": label, "start_date": start, "end_date": end},
-      "sleep_trends": {
-        "body": "This month, you maintained a consistent amount of sleep.",
-        "description": "Deep sleep remained above the standard level and your bedtime trended earlier.",
-        "score_series": score_series,
-        "start_date": start,
-        "end_date": end,
-      },
-      "onset_efficiency": {
-        "scenario_list": ["Sedona Desert Calm", "Maldives Drift Sleep", "Canadian Forest Solace"],
-        "description": "Sedona Desert Calm was your most frequently used sleep scenario this month and showed the best onset performance.",
-        "start_date": start,
-        "end_date": end,
-      },
-    }
-    return self._filter_modules(result, d.modules)
+    return analysis_builders.build_sleep_month(d, profile)
 
   def _build_explore(self, d, profile: Optional[UserProfile]) -> dict:
-    date  = d.date or datetime.date.today().isoformat()
-    start = (datetime.date.fromisoformat(date) - datetime.timedelta(days=6)).isoformat()
+    return analysis_builders.build_explore(d, profile)
 
-    has_data = profile is not None and bool(profile.sleep_data)
-    latest   = profile.sleep_data[-1] if has_data else None
-    summaries = latest.sequence_summaries if (latest and latest.sleep_status) else {}
-
-    overall_score    = int(latest.sleep_quality) if latest and latest.sleep_quality else 82
-    onset_score      = int(latest.soe)           if latest and latest.soe           else 82
-    structure_score  = 49
-    fluctuation_score = 34
-
-    tb = summaries.get("time_in_bed") or 1
-    rem_pct  = f"{round(summaries.get('rem_sleep_duration',  0) / tb * 100, 1)}%" if summaries else "22%"
-    deep_pct = f"{round(summaries.get('deep_sleep_duration', 0) / tb * 100, 1)}%" if summaries else "29.8%"
-    core_pct = f"{round(summaries.get('core_sleep_duration', 0) / tb * 100, 1)}%" if summaries else "48.2%"
-
-    hr_mid = int(latest.avg_heart_rate) if latest and latest.avg_heart_rate else 70
-    hr_range = f"{hr_mid - 15}-{hr_mid + 15}bpm"
-    resp_fluct = f"{int(latest.respiratory_var or 25)}%" if latest else "25%"
-
-    scene_id   = "cocos_island_moonlight"
-    scene_name = "Cocos Island Moonlight"
-    most_used = (profile.sleep_analysis or {}).get("most_used_scene") if profile else None
-    if most_used:
-      scene_id   = most_used["scene_id"]
-      scene_name = most_used["scene_name"]
-
-    awake_count = summaries.get("night_awake_count", 2)
-    result = {
-      "data_ready": has_data,
-      "header_summary": {
-        "intro_text": "Last night your body entered a stable, relaxed, and highly restorative sleep state.",
-        "intro_detail_text": "What happened last night, what helped you most, and how Mindora adjusted for you.",
-        "date": date,
-      },
-      "score_summary": {
-        "score": overall_score,
-        "title": "Sleep Score",
-        "efficiency_score":   onset_score,
-        "structure_score":    structure_score,
-        "fluctuation_score":  fluctuation_score,
-        "date": date,
-      },
-      "onset_efficiency": {
-        "score": onset_score,
-        "label": "Healthy Range",
-        "onset_minutes": 12,
-        "first_sleep_time":           latest.first_sleep_time if latest else "23:45",
-        "pre_sleep_heart_rate":       f"{int(latest.hr_before_sleep)}bpm"  if latest and latest.hr_before_sleep  else "68bpm",
-        "pre_sleep_respiratory_rate": f"{int(latest.rr_before_sleep)}brpm" if latest and latest.rr_before_sleep else "15brpm",
-        "description": "You fell asleep faster than your recent average and your pre-sleep physiology stayed calm.",
-        "date": date,
-      },
-      "sleep_structure": {
-        "score": structure_score,
-        "label": "Average",
-        "continuous_sleep_minutes": int(tb),
-        "rem_percent":  rem_pct,
-        "deep_percent": deep_pct,
-        "core_percent": core_pct,
-        "description": "Your sleep structure remained relatively balanced, with deep sleep contributing strongly to recovery.",
-        "date": date,
-      },
-      "night_fluctuation": {
-        "score": fluctuation_score,
-        "label": "High Fluctuation" if awake_count > 3 else "Normal",
-        "intervention": "Rain Wash",
-        "awake_count":            awake_count,
-        "awake_duration_minutes": int(summaries.get("night_awake_duration", 5)),
-        "awake_type":             summaries.get("night_awake_type") or "Brief awakening",
-        "heart_rate_range":       hr_range,
-        "respiratory_fluctuation": resp_fluct,
-        "description": "You had a small number of brief interruptions and the system applied a suitable intervention.",
-        "date": date,
-      },
-      "scene_preference": {
-        "scene_id":   scene_id,
-        "scene_name": scene_name,
-        "scene_type": "Ocean wind with slow percussion",
-        "description": "This scene has recently matched your sleep onset rhythm most consistently.",
-        "start_date": start,
-        "end_date":   date,
-      },
-      "sleep_advice": {
-        "description": "Keep your current bedtime and continue using the same wind-down scene for the next few nights.",
-        "date": date,
-      },
-    }
-    return self._filter_modules(result, d.modules)
-
-  async def handle_login_http(self, request: web.Request) -> web.Response:
+  # -------------------- /popup（tanchuang_suvey.md） --------------------
+  async def handle_popup_http(self, request: web.Request) -> web.Response:
     try:
-      data = await request.json()
-      request = AuthRequest.model_validate(data)
-      response_obj = self.handle_login(request)
-    except (json.JSONDecodeError, TypeError, KeyError) as e:
-      logging.error(f"login error: {e}, request={request}")
-      response_obj = InvalidReqFormatResp()
+      body = await request.json()
+      req = PopupRequest.model_validate(body)
+      uid = self._parse_for_uid(req.data)
+      if uid is None:
+        return web.json_response(InvalidOrExpiredTokenResp().model_dump(), status=401)
 
-    logging.info(f"login resp: {response_obj}")
-    if response_obj.code == 0 and len(Config.RemoteHost) > 10 and (self.update_task is None or self.update_task.done()):
-      self.update_task = asyncio.create_task(self.fetch_profile_from_remote(f"{Config.RemoteHost}")) 
-    else:
-      logging.info("update task has started already")
+      if req.request_type == "query_popups":
+        # scope=history（popup_survey.md 2.1 历史消息恢复）：不做定向/频控/优先级，
+        # 不带 next_query_after（非轮询，客户端仅登录后调一次）
+        if req.data.scope == "history":
+          messages = await asyncio.to_thread(
+            self.user_serv.query_message_history, uid, req.data.language, req.data.popup_ids,
+          )
+          resp = BaseResponse(code=0, msg="ok")
+          return web.json_response({**resp.model_dump(), "data": {"popups": messages}})
 
-    return web.json_response(status=get_http_status(response_obj), data=response_obj.model_dump())
-  
-  async def fetch_profile_from_remote(self, url):
-    """Periodically pull the active user's profile from the remote server.
+        result = await asyncio.to_thread(
+          self.user_serv.query_popups, uid, req.data.language, req.data.placement,
+        )
+        # next_query_after 未配置时不下发该字段，客户端用默认 300s
+        data = {"popups": result["popups"]}
+        if result.get("next_query_after") is not None:
+          data["next_query_after"] = result["next_query_after"]
+        resp = BaseResponse(code=0, msg="ok")
+        return web.json_response({**resp.model_dump(), "data": data})
 
-    Runs in a background task so it must not block the asyncio event loop.
-    """
-    start_min = int(time.time()) / 60
-    logging.info(f"begin to loop update for activeuid : {self.active_uid}")
-    while True:
-      cur_min = int(time.time()) / 60
-      if cur_min - start_min > 60:
-        logging.info("break because of time")
-        break
-
-      await asyncio.sleep(60)
-
-      resp = await query_profile(self.jwt_token, Config.RemoteHost)
-      if resp is None or resp.code != 0 or resp.data is None:
-        logging.warning(f"none or invalid resp from remote server: {Config.RemoteHost}")
-        continue
-
-      profile_data = resp.data.get("user_profile")
-      if profile_data is None:
-        logging.warning(f"remote resp missing user_profile for activeuid={self.active_uid}")
-        continue
-
-      try:
-        new_profile = UserProfile.model_validate(profile_data)
-      except ValidationError as e:
-        logging.error(f"remote profile validation failed: {e}")
-        continue
-
-      # Offload the synchronous update_profile (which may call LLMs) to a
-      # thread so the event loop stays responsive for local HTTP requests.
-      succ = await asyncio.to_thread(
-        self.user_serv.update_profile,
-        self.active_uid,
-        new_profile,
+      # report_popup
+      event_at = req.data.event_at or req.timestamp
+      ok = await asyncio.to_thread(
+        self.user_serv.report_popup_event, uid, req.data.popup_id, req.data.event, event_at,
       )
-      if not succ:
-        logging.warning(f"erro in update profile for {self.active_uid}")
-      else:
-        logging.info(f"succ update profile for {self.active_uid}")
+      if not ok:
+        return web.json_response(BaseResponse(code=400, msg="unknown popup_id").model_dump(), status=400)
+      resp = BaseResponse(code=0, msg="ok")
+      return web.json_response({**resp.model_dump(), "data": {}})
+
+    except ValidationError as e:
+      logging.error(f"popup validation error: {e}")
+      return web.json_response(InvalidReqFormatResp().model_dump(), status=400)
+    except Exception as e:
+      logging.exception("popup error: %s", e)
+      return web.json_response(BaseResponse(code=500, msg="Internal server error").model_dump(), status=500)
+
+  # -------------------- /survey（tanchuang_suvey.md） --------------------
+  async def handle_survey_http(self, request: web.Request) -> web.Response:
+    try:
+      body = await request.json()
+      req = SurveyRequest.model_validate(body)
+      uid, email = self._parse_uid_email(req.data)
+      if uid is None:
+        return web.json_response(InvalidOrExpiredTokenResp().model_dump(), status=401)
+
+      if req.request_type == "query_survey":
+        survey = self.user_serv.get_survey(req.data.survey_id, req.data.language)
+        if survey is None:
+          return web.json_response(BaseResponse(code=404, msg="survey not found").model_dump(), status=404)
+        resp = BaseResponse(code=0, msg="ok")
+        return web.json_response({**resp.model_dump(), "data": survey})
+
+      # submit_survey（email 存入全量记录，供运营后台展示）
+      data, code = await asyncio.to_thread(self.user_serv.submit_survey, uid, req.data, email)
+      if data is None:
+        msg = "survey not found" if code == 404 else "invalid survey answers"
+        return web.json_response(BaseResponse(code=code, msg=msg).model_dump(), status=code)
+      resp = BaseResponse(code=0, msg="ok")
+      return web.json_response({**resp.model_dump(), "data": data})
+
+    except ValidationError as e:
+      logging.error(f"survey validation error: {e}")
+      return web.json_response(InvalidReqFormatResp().model_dump(), status=400)
+    except Exception as e:
+      logging.exception("survey error: %s", e)
+      return web.json_response(BaseResponse(code=500, msg="Internal server error").model_dump(), status=500)
+
+  # -------------------- /companion_footprint（peibanzuji.md） --------------------
+  async def handle_footprint_http(self, request: web.Request) -> web.Response:
+    try:
+      body = await request.json()
+      req = FootprintRequest.model_validate(body)
+      uid = self._parse_for_uid(req.data)
+      if uid is None:
+        return web.json_response(InvalidOrExpiredTokenResp().model_dump(), status=401)
+
+      if req.request_type == "upload_footprint":
+        accepted = await asyncio.to_thread(self.user_serv.merge_footprint_days, uid, req.data.days)
+        resp = BaseResponse(code=0, msg="ok")
+        return web.json_response({**resp.model_dump(), "data": {"accepted_days": accepted}})
+
+      # query_footprint
+      data = await asyncio.to_thread(
+        self.user_serv.query_footprint,
+        uid, req.data.scope, req.data.year, req.data.month, req.data.timezone,
+      )
+      resp = BaseResponse(code=0, msg="ok")
+      return web.json_response({**resp.model_dump(), "data": data})
+
+    except ValidationError as e:
+      logging.error(f"footprint validation error: {e}")
+      return web.json_response(InvalidReqFormatResp().model_dump(), status=400)
+    except Exception as e:
+      logging.exception("footprint error: %s", e)
+      return web.json_response(BaseResponse(code=500, msg="Internal server error").model_dump(), status=500)
+
+  # -------------------- 运营后台接口（/ops/*） --------------------
+  # 调用方：ops_admin_server.py。鉴权两步：本地验 JWT → auth_server 查 ops_role，
+  # 仅 admin/super 放行（0号管理员 super 由数据库直设，授权走 auth_server grant_ops_role）。
+
+  async def _check_ops_admin(self, jwt_token: str) -> Optional[str]:
+    """校验调用者是运营管理员（ops_role=admin/super），返回 uid；否则 None。"""
+    if not jwt_token:
+      return None
+    payload = self._check_token(jwt_token)
+    if payload is None:
+      return None
+    uid = payload.get("uid")
+    if not uid:
+      return None
+
+    try:
+      req = AuthRequest(
+        request_type="query_ops_role",
+        timestamp=int(time.time()),
+        version="1.0",
+        data=AuthData(jwt_token=jwt_token),
+      )
+      async with ClientSession() as session:
+        async with session.post(
+          f"{Config.AUTH_SERVER_URL}/auth",
+          json=req.model_dump(mode="json"),
+          timeout=3,
+        ) as resp:
+          body = await resp.json()
+    except Exception as e:
+      logging.error("ops role check failed (auth_server unreachable?): %s", e)
+      return None
+
+    role = ((body or {}).get("data") or {}).get("ops_role")
+    if role in ("admin", "super"):
+      return uid
+    logging.warning("ops api rejected: uid=%s ops_role=%s", uid, role)
+    return None
+
+  async def handle_ops_push_http(self, request: web.Request) -> web.Response:
+    """接收运营后台发布的弹窗消息：校验管理员 → 校验消息 → 追加进运营配置（热加载生效，等 App 拉取）。"""
+    try:
+      body = await request.json()
+      uid = await self._check_ops_admin(body.get("jwt_token") or "")
+      if uid is None:
+        return web.json_response(BaseResponse(code=403, msg="not an ops admin").model_dump(), status=403)
+
+      popup = body.get("popup")
+      ok, msg = append_popup(popup)
+      if not ok:
+        return web.json_response(BaseResponse(code=400, msg=msg).model_dump(), status=400)
+
+      logging.info("ops push published by uid=%s popup_id=%s", uid, popup.get("popup_id"))
+      resp = BaseResponse(code=0, msg=msg)
+      return web.json_response({**resp.model_dump(), "data": {"popup_id": popup.get("popup_id")}})
+    except (json.JSONDecodeError, TypeError) as e:
+      logging.error(f"ops push format error: {e}")
+      return web.json_response(InvalidReqFormatResp().model_dump(), status=400)
+    except Exception as e:
+      logging.exception("ops push error: %s", e)
+      return web.json_response(BaseResponse(code=500, msg="Internal server error").model_dump(), status=500)
+
+  async def handle_ops_survey_records_http(self, request: web.Request) -> web.Response:
+    """全量问卷提交记录（_meta:survey:*），运营后台表格展示；可按 survey_id 过滤。"""
+    try:
+      body = await request.json()
+      uid = await self._check_ops_admin(body.get("jwt_token") or "")
+      if uid is None:
+        return web.json_response(BaseResponse(code=403, msg="not an ops admin").model_dump(), status=403)
+
+      records = await asyncio.to_thread(self.user_serv.list_survey_records, body.get("survey_id"))
+      resp = BaseResponse(code=0, msg="ok")
+      return web.json_response({**resp.model_dump(), "data": {"records": records, "total": len(records)}})
+    except (json.JSONDecodeError, TypeError) as e:
+      logging.error(f"ops survey_records format error: {e}")
+      return web.json_response(InvalidReqFormatResp().model_dump(), status=400)
+    except Exception as e:
+      logging.exception("ops survey_records error: %s", e)
+      return web.json_response(BaseResponse(code=500, msg="Internal server error").model_dump(), status=500)
+
+  # -------------------- 启动 --------------------
+  def _startup_self_check(self) -> None:
+    """启动自检：关键运行资源缺失时打 ERROR（不阻断启动），让部署遗漏在启动日志即可见。
+
+    覆盖：
+      - 运营配置 popup_survey_config.json（缺失 → /popup 恒空、/survey 恒 404，
+        故障特征见 ops_config._load_ops_config 的缓存兜底）
+      - 睡眠推荐资源（knowledge_base / topology / reco_candidates，缺失 → 推荐退化为兜底）
+      - LLM 可用性（ARK_API_KEY 未配 → 分析文案用默认模板）
+    """
+    from ops_config import ops_config_status
+
+    st = ops_config_status()
+    if not st["exists"]:
+      logging.error(
+        "[self-check] ops config MISSING: %s — /popup 将恒返回空、/survey 将恒 404。"
+        "部署 data/popup_survey_config.json 即可恢复（mtime 热加载，无需重启）",
+        st["path"],
+      )
+    else:
+      logging.info(
+        "[self-check] ops config OK: %s (popups=%d surveys=%d next_query_after=%s)",
+        st["path"], st["popups"], st["surveys"], st["next_query_after"],
+      )
+      if st["dangling_survey_refs"]:
+        logging.error(
+          "[self-check] ops config 弹窗引用了不存在的问卷（用户点击后 query_survey 必 404）: %s",
+          st["dangling_survey_refs"],
+        )
+
+    from llm import reco as llm_reco
+    for res in (llm_reco._KNOWLEDGE_BASE_PATH, llm_reco._TOPOLOGY_PATH, llm_reco._SOP_CANDIDATES_PATH):
+      if not os.path.exists(res):
+        logging.error("[self-check] reco resource MISSING: %s — 睡眠推荐将退化为兜底策略", res)
+
+    if not self.llm.enabled:
+      logging.warning("[self-check] LLM disabled (ARK_API_KEY / KIMI_API_KEY 均未配置) — 分析/洞察文案使用默认模板")
 
   async def start_http(self):
     """启动HTTP服务器"""
@@ -1407,19 +593,14 @@ class UserServer:
     site = web.TCPSite(runner, self.host, self.port)
     await site.start()
     logging.info(f"UserServer (LevelDB) started on http://{self.host}:{self.port}")
+    self._startup_self_check()
     # 保持服务运行
     await asyncio.Event().wait()
-
-  async def start(self):
-    async with websockets.serve(self.handle_profile_request, self.host, self.port):
-      logging.info(f"UserServer started on ws://{self.host}:{self.port}")
-      await asyncio.Future()  # 持续运行
 
 
 if __name__ == "__main__":
   server = UserServer()
   try:
-    # asyncio.run(server.start())
     asyncio.run(server.start_http())
   except KeyboardInterrupt:
     logging.warning("Shutting down UserServer.")

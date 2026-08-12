@@ -13,17 +13,39 @@ class Config:
   PORT = 9001
   IS_DEBUG = True
   AUTH_PORT=9103
+  # auth_server 地址（user_server 校验运营角色 / 运营后台登录都走它）
+  AUTH_SERVER_URL = os.getenv("AUTH_SERVER_URL", f"http://127.0.0.1:{AUTH_PORT}")
+  # 运营后台服务端口（ops_admin_server.py）
+  OPS_ADMIN_PORT = int(os.getenv("OPS_ADMIN_PORT", "9200"))
   DB_PATH = "data/userprofile_level_db"
   USER_PROFILE_STORAGE_MODE = "leveldb"  # "leveldb" | "txt_json"
   USER_PROFILE_JSON_PATH = "data/user_profiles.txt"
+  # 弹窗/问卷运营配置（JSON，运营后台线上写入；user_server 按 mtime 检查更新，
+  # 可用 POPUP_SURVEY_CONFIG_PATH 环境变量覆盖为绝对路径）
+  POPUP_SURVEY_CONFIG_PATH = "data/popup_survey_config.json"
   MaxServerConcurrent = 32
   Mode = 0
-  RemoteHost="http://121.43.54.25:9001"
-  # RemoteHost="http://localhost:9001"
-  ALGORITHM="HS256"
+  ALGORITHM="RS256"
+  # 验签兼容：旧的 HS256 token（JWT_SECRET_KEY 环境变量）在过期前仍可验
+  LEGACY_ALGORITHM="HS256"
+  # JWT 密钥文件默认路径（可用 JWT_PRIVATE_KEY_PATH/JWT_PUBLIC_KEY_PATH 环境变量覆盖，
+  # 或直接用 JWT_PRIVATE_KEY/JWT_PUBLIC_KEY inline PEM 环境变量）
+  JWT_PRIVATE_KEY_PATH = "jwt_private.pem"
+  JWT_PUBLIC_KEY_PATH = "jwt_public.pem"
   # 边缘端轻量化开关：关闭后 user_server 不会 import/实例化 LLM 与推荐引擎
   ENABLE_LLM = True
   ENABLE_SLEEP_RECO = True
+
+  # ── LLM 请求方向（provider）：api_base/model 放配置文件，api_key 一律走环境变量 ──
+  # volc_ark 方向：key=ARK_API_KEY（env），endpoint=ARK_ENDPOINT_ID（env）
+  ARK_API_BASE = "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
+  ARK_MODEL = "doubao-seed-2-0-lite-260215"
+  # kimi 方向：key=KIMI_API_KEY（env），model 可用 KIMI_MODEL（env）覆盖
+  KIMI_API_BASE = "https://api.moonshot.cn/v1/chat/completions"
+  KIMI_MODEL = "moonshot-v1-8k"
+  # 模型路由：request_type → 方向名，"default" 兜底；
+  # 所选方向不可用（缺 key）时自动降级到第一个可用方向（见 llm/router.py）
+  LLM_ROUTING = {"default": "volc_ark"}
 
   # 同一用户两次 LLM 后台更新之间的最小间隔（秒）
   LLM_UPDATE_COOLDOWN_SECONDS = 300
