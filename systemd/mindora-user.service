@@ -1,0 +1,19 @@
+[Unit]
+Description=Mindora user_server (HTTP API, port 9001)
+After=network-online.target mysql.service redis-server.service mindora-auth.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/server/mindora_user
+EnvironmentFile=/etc/mindora/mindora.env
+EnvironmentFile=/etc/mindora/mindora-user.env
+ExecStart=/root/server/mindora_py/bin/python /root/server/mindora_user/user_server.py
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
