@@ -220,7 +220,11 @@ def main():
   parser.add_argument("--out", default=None)
   args = parser.parse_args()
 
-  base_url = f"http://{args.host}:{args.port}" if args.host else args.base_url
+  if args.host and "://" in args.host:
+    # 容错：--host 误传完整 URL 时按 base-url 处理（正确用法是 --base-url）
+    base_url = args.host
+  else:
+    base_url = f"http://{args.host}:{args.port}" if args.host else args.base_url
   client = UserServerClient(
     base_url=base_url, jwt_token=args.jwt_token, uid=args.uid,
     language=args.language, timezone=args.timezone,

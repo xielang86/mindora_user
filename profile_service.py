@@ -30,7 +30,7 @@ from common import util
 from config import Config
 from engagement_service import EngagementService
 from llm import SleepAnalysisLLM
-from user_profile import UserProfile, SleepScenario
+from user_profile import UserProfile, SleepScenario, Profile
 
 run_dir = os.getenv("RUN_DIR") or os.path.dirname(os.path.abspath(__file__))
 
@@ -515,6 +515,30 @@ class UserProfileServ:
 
   # -------------------- 更新路径 --------------------
   @staticmethod
+  def _merge_personal_profile(old: Optional[Profile], new: Optional[Profile]) -> Optional[Profile]:
+    """个人资料容器合并（个人资料同步约定.md §1）：
+
+      - 键不出现（不在 model_fields_set）→ 保持原值
+      - 键出现但值为 None（显式 null） → 保持原值
+      - "" → 置空（用户主动清空）；有内容 → 覆盖
+      - address_list 整体替换（键出现时，含空数组=清空地址）
+      - 头像无新值时客户端整个键不出现，自然保持原值
+
+    old 为 None（新建画像）时以 Profile() 默认值为底，显式 null 落在默认值上。
+    """
+    if new is None:
+      return old
+    merged = old.model_copy(deep=True) if old is not None else Profile()
+    for fname in type(new).model_fields:
+      if fname not in new.model_fields_set:
+        continue
+      value = getattr(new, fname)
+      if value is None:
+        continue
+      setattr(merged, fname, value)
+    return merged
+
+  @staticmethod
   def _merge_sleep_data(old: list, new: list) -> list:
     """按 timestamp 去重合并 sleep_data（同 timestamp 新记录覆盖旧记录），按时间升序，截断保留最近 N 条。"""
     if not new:
@@ -566,6 +590,7 @@ class UserProfileServ:
     Returns the profile object that should be saved.
     """
     if profile is None:
+      new_profile.profile = self._merge_personal_profile(None, new_profile.profile)
       self._update_scene_stats(new_profile)
       self._update_best_scene_by_sleep_quality(new_profile)
       self._update_night_hr_range(new_profile)
@@ -575,6 +600,7 @@ class UserProfileServ:
     if len(new_profile.uid_emb) > 16 or profile.uid_emb is None or len(profile.uid_emb) == 0:
       profile.uid_emb = new_profile.uid_emb
 
+    profile.profile = self._merge_personal_profile(profile.profile, new_profile.profile)
     profile.long_term_profile = self._merge_profile(profile.long_term_profile, new_profile.long_term_profile)
     profile.behaviors = self._merge_behavior(profile.behaviors, new_profile.behaviors)
     profile.sleep_data = self._merge_sleep_data(profile.sleep_data, new_profile.sleep_data)

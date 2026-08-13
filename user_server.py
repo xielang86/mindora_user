@@ -190,7 +190,15 @@ class UserServer:
     if not (skip_reco and skip_analysis):
       await self._schedule_llm_update_if_needed(uid, skip_reco, skip_analysis)
 
-    return ProfileResponse(code=0, msg=f"update profile for '{request.timestamp}' succ", request_type=request.request_type, data=None)
+    # 个人资料同步约定 §2/§3：msg 回显 uid（不用 timestamp）；返回合并后的完整 profile，
+    # 客户端用它更新本地快照基准（服务端归一化后两边才对得上）
+    merged = await asyncio.to_thread(self.user_serv.get_profile, uid)
+    return ProfileResponse(
+      code=0,
+      msg=f"update profile for '{uid}' succ",
+      request_type=request.request_type,
+      data={"user_profile": merged.model_dump()} if merged else None,
+    )
 
   async def _schedule_llm_update_if_needed(
     self,
