@@ -207,18 +207,35 @@ def _unwrap(wrapped: dict) -> dict:
   return body if isinstance(body, dict) else {"code": -1, "error": body}
 
 
+def _uid_from_jwt(token: str) -> str | None:
+  """从 JWT payload 解析 uid（不验签，仅用于输出目录命名）。"""
+  try:
+    payload_b64 = token.split(".")[1]
+    payload_b64 += "=" * (-len(payload_b64) % 4)  # base64url 补齐
+    import base64
+    payload = json.loads(base64.urlsafe_b64decode(payload_b64))
+    return payload.get("uid") or payload.get("sub")
+  except Exception:
+    return None
+
+
 def main():
   parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
   parser.add_argument("--base-url", default=os.getenv("APP_SERVER_URL", "http://127.0.0.1:9001"))
   parser.add_argument("--host", default=None, help="user_server IP；传入后覆盖 --base-url")
   parser.add_argument("--port", type=int, default=9001)
   parser.add_argument("--jwt-token", default=os.getenv("JWT_TOKEN", ""))
-  parser.add_argument("--uid", default="mindora_test_uid1")
+  parser.add_argument("--uid", default=None,
+                      help="不传时：有 jwt-token 则从 token payload 解析 uid，否则回退 mindora_test_uid1")
   parser.add_argument("--date", default=datetime.date.today().isoformat(), help="与 app 展示日期保持一致")
   parser.add_argument("--language", default="zh-Hans")
   parser.add_argument("--timezone", default="Asia/Shanghai")
   parser.add_argument("--out", default=None)
   args = parser.parse_args()
+
+  # uid 只用于输出目录命名/报告标注；带 jwt 时服务端按 token 里的 uid 取数，
+  # 这里从 token payload 解析出真实 uid，避免目录名误标成默认 debug uid
+  uid = args.uid or _uid_from_jwt(args.jwt_token) or "mindora_test_uid1"
 
   if args.host and "://" in args.host:
     # 容错：--host 误传完整 URL 时按 base-url 处理（正确用法是 --base-url）
@@ -226,14 +243,14 @@ def main():
   else:
     base_url = f"http://{args.host}:{args.port}" if args.host else args.base_url
   client = UserServerClient(
-    base_url=base_url, jwt_token=args.jwt_token, uid=args.uid,
+    base_url=base_url, jwt_token=args.jwt_token, uid=uid,
     language=args.language, timezone=args.timezone,
   )
 
-  out_dir = Path(args.out or f"out_analysis/{args.uid}_{int(time.time())}")
+  out_dir = Path(args.out or f"out_analysis/{uid}_{int(time.time())}")
   out_dir.mkdir(parents=True, exist_ok=True)
 
-  print(f"target: {base_url}  uid={args.uid}  date={args.date}")
+  print(f"target: {base_url}  uid={uid}  date={args.date}")
   profile_resp = _unwrap(client.query_profile())
   profile = ((profile_resp.get("data") or {}).get("user_profile")) or {}
   (out_dir / "query_profile.json").write_text(json.dumps(profile_resp, ensure_ascii=False, indent=2))
@@ -249,7 +266,7 @@ def main():
       print(f"    ⚠️ {json.dumps(resp, ensure_ascii=False)[:200]}")
 
   checker = run_checks(profile, responses, args.date)
-  report = render_report(checker, args.uid, args.date,
+  report = render_report(checker, uid, args.date,
                          {p.name: str(p) for p in sorted(out_dir.glob('*.json'))})
   (out_dir / "CHECK_REPORT.md").write_text(report)
 
