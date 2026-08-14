@@ -16,6 +16,7 @@ import threading
 import time
 from pathlib import Path
 from typing import Any, Optional, List
+from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel
 
@@ -40,6 +41,30 @@ class UserProfileServ:
   MAX_BEHAVIOR_LEN = 100
   # sleep_data 保留条数：与分析报告日级保留一致（日级 30）
   MAX_SLEEP_DATA_LEN = 30
+
+  # ── 健康数据口径版本（健康数据同步接口_0814.md §8）─────────────────────
+  # v2 新增/改名的 key：一晚只有几~几十个点（已裁剪到睡眠跨度），上限对齐
+  # md 客户端单切片上限 5000（约覆盖 100 晚），否则对账窗口稍长就被截断失真。
+  # 未列出的 key（v1 全天序列、plays/clicks 等）沿用 MAX_BEHAVIOR_LEN。
+  HEALTH_V2_BEHAVIOR_KEYS = {
+    "sleep_heart_rate_min", "sleep_heart_rate_max",
+    "sleep_heart_rate_variability_sdnn", "sleep_respiratory_rate",
+    "sleep_body_temperature",
+    "sleep_stage_unspecified", "sleep_stage_awake", "sleep_in_bed",
+  }
+  HEALTH_V2_BEHAVIOR_CAP = 5000
+  # v1→v2 被改名或改语义的 key：v2 批次覆盖某天时，清除这些 key 当天的旧样本，
+  # 使该天"现存数据"收敛为单一版本（md §8.4 同天多版本取最低的语义才能闭环）。
+  HEALTH_V1_DEPRECATED_KEYS = {
+    "heart_rate", "heart_rate_variability_sdnn", "respiratory_rate",
+    "body_temperature", "sleep_stage_light",
+  }
+  # 参与自然日登记/对账的健康指标 key（v1+v2；plays/clicks 等交互行为不算健康数据）。
+  # deep/rem/resting/wrist 在 v1/v2 名字与语义均未变，两个版本都算。
+  HEALTH_BEHAVIOR_KEYS = HEALTH_V2_BEHAVIOR_KEYS | HEALTH_V1_DEPRECATED_KEYS | {
+    "resting_heart_rate", "sleeping_wrist_temperature",
+    "sleep_stage_deep", "sleep_stage_rem",
+  }
 
   # -------------------- 门面：委托给拆分后的子服务 --------------------
   _INSIGHT_MODULE_KEYS = AnalysisContentService._INSIGHT_MODULE_KEYS
@@ -239,11 +264,114 @@ class UserProfileServ:
       else:
         old_behaviors[behavior_type] = values
 
-      if len(old_behaviors[behavior_type]) > UserProfileServ.MAX_BEHAVIOR_LEN:
-        old_behaviors[behavior_type] = old_behaviors[behavior_type][-UserProfileServ.MAX_BEHAVIOR_LEN:]
+      cap = (UserProfileServ.HEALTH_V2_BEHAVIOR_CAP
+             if behavior_type in UserProfileServ.HEALTH_V2_BEHAVIOR_KEYS
+             else UserProfileServ.MAX_BEHAVIOR_LEN)
+      if len(old_behaviors[behavior_type]) > cap:
+        old_behaviors[behavior_type] = old_behaviors[behavior_type][-cap:]
 
     logging.info("after update behavior counts=%s", self._behavior_counts(old_behaviors))
     return old_behaviors
+
+  # -------------------- 健康数据口径版本（健康数据同步接口_0814.md §8）--------------------
+  @staticmethod
+  def _resolve_tz(tz_name: Optional[str]) -> datetime.tzinfo:
+    """请求携带的 timezone → tzinfo；缺失/非法时回退 UTC 并告警。"""
+    if tz_name:
+      try:
+        return ZoneInfo(tz_name)
+      except Exception:
+        logging.warning("invalid timezone %r, fallback to UTC", tz_name)
+    else:
+      logging.warning("health sync without timezone, fallback to UTC")
+    return datetime.timezone.utc
+
+  @staticmethod
+  def _health_day(ts: Any, tz: datetime.tzinfo) -> Optional[str]:
+    """Unix 秒时间戳 → 该时区下的自然日 yyyy-MM-dd；非法输入返回 None。"""
+    try:
+      return datetime.datetime.fromtimestamp(int(ts), tz).date().isoformat()
+    except (TypeError, ValueError, OverflowError, OSError):
+      return None
+
+  def _apply_health_schema_update(
+    self,
+    profile: UserProfile,
+    new_profile: UserProfile,
+    health_schema_version: Optional[int],
+    timezone: Optional[str],
+  ) -> None:
+    """按本批 behaviors 覆盖的自然日登记口径版本；v2 批次清除当天 v1 废弃 key 的旧样本。
+
+    版本语义（md §8.4）：某天现存数据的版本，多版本取最低。v2 批次 purge 后该天
+    现存数据只剩 v2，故直接登记本批版本；v1 批次（缺省=1）只登记，不 purge——
+    若该天已有 v2 数据，v1 样本混入后版本回落 1，下次 v2 批次再 purge 收敛。
+    """
+    version = health_schema_version if health_schema_version else 1
+    if version > Config.HEALTH_SCHEMA_VERSION:
+      logging.warning(
+        "health_schema_version %s newer than server-known %s",
+        version, Config.HEALTH_SCHEMA_VERSION,
+      )
+    tz = self._resolve_tz(timezone)
+
+    days: set[str] = set()
+    for key, values in (new_profile.behaviors or {}).items():
+      if key not in self.HEALTH_BEHAVIOR_KEYS or not isinstance(values, list):
+        continue
+      for item in values:
+        if isinstance(item, (list, tuple)) and item:
+          day = self._health_day(item[0], tz)
+          if day:
+            days.add(day)
+    if not days:
+      return
+
+    if version >= 2:
+      for key in self.HEALTH_V1_DEPRECATED_KEYS:
+        samples = profile.behaviors.get(key)
+        if not samples:
+          continue
+        kept = [s for s in samples
+                if not (isinstance(s, (list, tuple)) and s and self._health_day(s[0], tz) in days)]
+        removed = len(samples) - len(kept)
+        if removed:
+          logging.info("purge %d v1 samples of %s on days %s (health v2)", removed, key, sorted(days))
+          profile.behaviors[key] = kept
+
+    for day in days:
+      profile.health_sync_days[day] = version
+
+  def query_health_sync_days(
+    self,
+    uid: str,
+    start_date: str,
+    end_date: str,
+    timezone: Optional[str],
+  ) -> Optional[list[dict]]:
+    """对账（健康数据同步接口_0814.md §8.4）：窗口内已有健康数据的天 + 各天口径版本。
+
+    "有哪些天"从 behaviors 实际时间戳按请求时区现算——老画像没有
+    health_sync_days 也能回答（缺省版本 1），且被截断淘汰的天不会谎报。
+    无画像返回 None。
+    """
+    profile = self.get_profile(uid)
+    if profile is None:
+      return None
+    tz = self._resolve_tz(timezone)
+
+    days: dict[str, int] = {}
+    for key in self.HEALTH_BEHAVIOR_KEYS:
+      for item in profile.behaviors.get(key) or []:
+        if not isinstance(item, (list, tuple)) or not item:
+          continue
+        day = self._health_day(item[0], tz)
+        if day and start_date <= day <= end_date:
+          days[day] = profile.health_sync_days.get(day, 1)
+    return [
+      {"date": day, "health_schema_version": days[day]}
+      for day in sorted(days)
+    ]
 
   @staticmethod
   def _extract_sop_start_events(plays: list) -> list[tuple[str, int, dict]]:
@@ -558,39 +686,64 @@ class UserProfileServ:
     end = max(int(e.start_time + e.duration * 60) for e in record.sleep_status)
     return start, end
 
-  def _update_night_hr_range(self, profile: UserProfile) -> None:
-    """按当夜睡眠窗口从 behaviors.heart_rate 计算 hr_min/hr_max 写回各条 SleepResult。
-
-    在 update_profile 时调用：behaviors 有 MAX_BEHAVIOR_LEN 截断，截断前窗口数据最全；
-    每次 update 幂等重算，覆盖增量上报乱序/迟到的样本。
-    """
-    samples = profile.behaviors.get("heart_rate") or []
-    points: list[tuple[int, float]] = []
-    for item in samples:
+  @staticmethod
+  def _hr_pairs_from_points(samples) -> dict[int, float]:
+    """behaviors 数值序列 → {ts: value}（非法条目跳过）。"""
+    points: dict[int, float] = {}
+    for item in samples or []:
       if isinstance(item, (list, tuple)) and len(item) >= 2 and isinstance(item[1], (int, float)):
         try:
-          points.append((int(item[0]), float(item[1])))
+          points[int(item[0])] = float(item[1])
         except (TypeError, ValueError):
           continue
-    if not points:
+    return points
+
+  def _update_night_hr_range(self, profile: UserProfile) -> None:
+    """计算各条 SleepResult 的当夜心率区间 hr_min/hr_max，update_profile 时调用。
+
+    两个口径（健康数据同步接口_0814.md §8.2）：
+      - v2：客户端直接上传 sleep_heart_rate_min/max（一晚一对，时间戳同为该晚
+        睡眠会话起点），按会话起点落入当夜窗口配对写入；
+      - v1 fallback：从 behaviors.heart_rate 全天序列按睡眠窗口取 min/max。
+        behaviors 有截断，截断前窗口数据最全；每次 update 幂等重算。
+    """
+    v2_min = self._hr_pairs_from_points(profile.behaviors.get("sleep_heart_rate_min"))
+    v2_max = self._hr_pairs_from_points(profile.behaviors.get("sleep_heart_rate_max"))
+    v2_pairs = [(ts, v2_min[ts], v2_max[ts]) for ts in v2_min.keys() & v2_max.keys()]
+
+    v1_points = sorted(self._hr_pairs_from_points(profile.behaviors.get("heart_rate")).items())
+
+    if not v2_pairs and not v1_points:
       return
     for record in profile.sleep_data:
       window = self._night_window(record)
       if window is None:
         continue
-      values = [v for ts, v in points if window[0] <= ts <= window[1]]
-      if not values:
+      matched = [(mn, mx) for ts, mn, mx in v2_pairs if window[0] <= ts <= window[1]]
+      if matched:
+        record.hr_min = min(mn for mn, _mx in matched)
+        record.hr_max = max(mx for _mn, mx in matched)
         continue
-      record.hr_min = min(values)
-      record.hr_max = max(values)
+      values = [v for ts, v in v1_points if window[0] <= ts <= window[1]]
+      if values:
+        record.hr_min = min(values)
+        record.hr_max = max(values)
 
-  def _apply_basic_update(self, uid: str, new_profile: UserProfile, profile: Optional[UserProfile]) -> UserProfile:
+  def _apply_basic_update(
+    self,
+    uid: str,
+    new_profile: UserProfile,
+    profile: Optional[UserProfile],
+    health_schema_version: Optional[int] = None,
+    timezone: Optional[str] = None,
+  ) -> UserProfile:
     """Apply non-LLM profile updates. Must be called while holding self.lock.
 
     Returns the profile object that should be saved.
     """
     if profile is None:
       new_profile.profile = self._merge_personal_profile(None, new_profile.profile)
+      self._apply_health_schema_update(new_profile, new_profile, health_schema_version, timezone)
       self._update_scene_stats(new_profile)
       self._update_best_scene_by_sleep_quality(new_profile)
       self._update_night_hr_range(new_profile)
@@ -602,6 +755,8 @@ class UserProfileServ:
 
     profile.profile = self._merge_personal_profile(profile.profile, new_profile.profile)
     profile.long_term_profile = self._merge_profile(profile.long_term_profile, new_profile.long_term_profile)
+    # 版本登记 + v1 purge 必须在 merge 前：purge 清的是存量里被覆盖天的旧口径样本
+    self._apply_health_schema_update(profile, new_profile, health_schema_version, timezone)
     profile.behaviors = self._merge_behavior(profile.behaviors, new_profile.behaviors)
     profile.sleep_data = self._merge_sleep_data(profile.sleep_data, new_profile.sleep_data)
 
@@ -647,6 +802,8 @@ class UserProfileServ:
     new_profile: UserProfile,
     skip_sleep_scenarios_reco_update: bool = False,
     skip_sleep_analysis_update: bool = False,
+    health_schema_version: Optional[int] = None,
+    timezone: Optional[str] = None,
   ) -> bool:
     """写入用户行为（仅更新单个用户数据）.
 
@@ -662,7 +819,9 @@ class UserProfileServ:
       # 读取或创建用户画像（仅操作单个用户，避免全量加载）
       profile = self.get_profile(uid)
       old_profile = profile
-      profile = self._apply_basic_update(uid, new_profile, profile)
+      profile = self._apply_basic_update(
+        uid, new_profile, profile, health_schema_version, timezone,
+      )
       # For newly created profiles there is no old profile; use the new profile
       # object as the old-profile reference so calc_* helpers can read defaults.
       if old_profile is None:
@@ -683,7 +842,13 @@ class UserProfileServ:
       )
       return True
 
-  def update_profile_basic(self, uid: str, new_profile: UserProfile) -> bool:
+  def update_profile_basic(
+    self,
+    uid: str,
+    new_profile: UserProfile,
+    health_schema_version: Optional[int] = None,
+    timezone: Optional[str] = None,
+  ) -> bool:
     """Persist basic profile changes without LLM work. Fast path for HTTP update_profile."""
     if new_profile is None or uid is None or not isinstance(uid, str):
       logging.error(f"invalid new profile {new_profile} or uid {uid}")
@@ -691,7 +856,7 @@ class UserProfileServ:
 
     with self.lock:
       profile = self.get_profile(uid)
-      profile = self._apply_basic_update(uid, new_profile, profile)
+      profile = self._apply_basic_update(uid, new_profile, profile, health_schema_version, timezone)
       self.save_profile(uid, profile)
       logging.info("Profile basic updated uid=%s", uid)
       return True

@@ -84,10 +84,26 @@ class UserServerClient:
     }
     return self._post("/user_profile", payload)
 
+  def query_health_sync_state(self, start_date: str, end_date: str) -> dict[str, Any]:
+    """健康数据对账（健康数据同步接口_0814.md §8.4）：窗口内已有数据的天+口径版本。"""
+    payload = {
+      "request_type": "query_health_sync_state",
+      "timestamp": int(time.time()),
+      "version": "1.0",
+      "data": {
+        **self._auth_data(),
+        "timezone": self.timezone,
+        "start_date": start_date,
+        "end_date": end_date,
+      },
+    }
+    return self._post("/user_profile", payload)
+
   def update_profile(
     self,
     user_profile: dict[str, Any] | None = None,
     skip_sleep_scenarios_reco_update: bool = False,
+    health_schema_version: int | None = None,
   ) -> dict[str, Any]:
     payload = {
       "request_type": "update_profile",
@@ -96,9 +112,13 @@ class UserServerClient:
       "data": {
         **self._auth_data(),
         "user_profile": user_profile or self.default_user_profile(),
+        "language": self.language,
+        "timezone": self.timezone,
         "skip_sleep_scenarios_reco_update": skip_sleep_scenarios_reco_update,
       },
     }
+    if health_schema_version is not None:
+      payload["data"]["health_schema_version"] = health_schema_version
     return self._post("/user_profile", payload)
 
   def analysis_overview(self, date: str | None = None, modules: list[str] | None = None) -> dict[str, Any]:

@@ -36,6 +36,10 @@ class Config:
   ENABLE_LLM = True
   ENABLE_SLEEP_RECO = True
 
+  # 健康数据口径版本（健康数据同步接口_0814.md §8）：服务端当前认知的最新版本。
+  # 上传缺省 health_schema_version 按 1 处理；客户端版本高于此值时告警（不拒绝）。
+  HEALTH_SCHEMA_VERSION = int(os.getenv("HEALTH_SCHEMA_VERSION", "2"))
+
   # ── LLM 请求方向（provider）：api_base/model 放配置文件，api_key 一律走环境变量 ──
   # volc_ark 方向：key=ARK_API_KEY（env），endpoint=ARK_ENDPOINT_ID（env）
   ARK_API_BASE = "https://ark.cn-beijing.volces.com/api/v3/chat/completions"

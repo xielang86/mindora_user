@@ -452,17 +452,28 @@ class UserProfile(BaseModel):
 
   behaviors: Dict[str, List[Tuple[int, Any]]] = Field(
     default_factory=lambda: {
-      # 生命体征
+      # 生命体征（v1 口径，健康数据同步接口.md；v2 客户端不再写 heart_rate）
       "heart_rate": [], "blood_oxygen": [], "resting_heart_rate": [],
       "heart_rate_variability_sdnn": [], "respiratory_rate": [],
       "sleeping_wrist_temperature": [], "body_temperature": [],
+      # 生命体征（v2 口径，健康数据同步接口_0814.md：全部裁剪到睡眠跨度）
+      "sleep_heart_rate_min": [], "sleep_heart_rate_max": [],
+      "sleep_heart_rate_variability_sdnn": [], "sleep_respiratory_rate": [],
+      "sleep_body_temperature": [],
       # 睡眠状态
       "sleep_status": [],
       "sleep_stage_deep": [], "sleep_stage_rem": [], "sleep_stage_light": [],
+      # 睡眠阶段（v2 新增轨）
+      "sleep_stage_unspecified": [], "sleep_stage_awake": [], "sleep_in_bed": [],
       # 交互行为
       "clicks": [], "plays": [],
     }
   )
+
+  # 健康数据按自然日的口径版本登记（yyyy-MM-dd → health_schema_version）。
+  # update_profile 时按请求 timezone 把 behaviors 时间戳归日写入；缺省/老数据按 1 处理。
+  # 对账接口 query_health_sync_state 据此回答版本，"有哪些天"则按 behaviors 实际数据现算。
+  health_sync_days: Dict[str, int] = Field(default_factory=dict)
 
   # only the recent 7 days sleep data will be returned to app, and used for sleep analysis and advice generation, such as the data of yestoday night
   sleep_data:  List[SleepResult] = Field(default_factory=list)
@@ -516,6 +527,15 @@ class ProfileData(BaseModel):
   uid: Optional[str] = Field(None, description="uid, just for debug")
   jwt_token: str | None = Field(None, description="JWT token，in wan should be fixed")
   user_profile: Optional[UserProfile] = Field(None, description="user profile")
+  language: Optional[str] = Field(None, description="界面语言，如 en、zh-Hans（健康同步 v2 必填）")
+  timezone: Optional[str] = Field(None, description="客户端时区，如 Asia/Shanghai；健康数据按自然日归类的日界依据")
+  health_schema_version: Optional[int] = Field(
+    None,
+    description="健康数据口径版本（健康数据同步接口_0814.md §8.3）；缺省按 1 处理",
+  )
+  # query_health_sync_state 对账窗口（§8.4）
+  start_date: Optional[str] = Field(None, description="对账起始自然日 yyyy-MM-dd")
+  end_date: Optional[str] = Field(None, description="对账结束自然日 yyyy-MM-dd")
   skip_sleep_scenarios_reco_update: bool = Field(
     True,
     description="只跳过助眠场景推荐(sleep_scenarios_reco)的重算，不影响睡眠分析(insight/analysis cache)",

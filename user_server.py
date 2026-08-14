@@ -164,6 +164,39 @@ class UserServer:
       return ProfileResponse(code=0, msg=f"User with uid '{uid}' not found", request_type=request.request_type, data=None)
 
     # incr update the behaviors by time, and update long term weight
+  def handle_query_health_sync_state(self, request: ProfileRequest) -> BaseResponse:
+    """健康数据对账（健康数据同步接口_0814.md §8.4）：返回窗口内已有数据的天+口径版本。"""
+    if request.data is None:
+      return InvalidOrExpiredTokenResp()
+    uid = self._parse_for_uid(request.data)
+    if uid is None:
+      return InvalidOrExpiredTokenResp()
+
+    d = request.data
+    try:
+      start = datetime.date.fromisoformat(d.start_date or "")
+      end = datetime.date.fromisoformat(d.end_date or "")
+    except ValueError:
+      return ProfileResponse(
+        code=400, msg="start_date/end_date required (yyyy-MM-dd)",
+        request_type=request.request_type, data=None,
+      )
+    if start > end:
+      return ProfileResponse(
+        code=400, msg="start_date must not be after end_date",
+        request_type=request.request_type, data=None,
+      )
+
+    days = self.user_serv.query_health_sync_days(uid, d.start_date, d.end_date, d.timezone)
+    if days is None:
+      return ProfileResponse(
+        code=0, msg=f"User with uid '{uid}' not found",
+        request_type=request.request_type, data={"days": []},
+      )
+    return ProfileResponse(
+      code=0, msg="success", request_type=request.request_type, data={"days": days},
+    )
+
   async def handle_update_profile(self, request: ProfileRequest) -> BaseResponse:
     """写入用户行为（仅更新单个用户数据）"""
     if request.data is None:
@@ -181,6 +214,8 @@ class UserServer:
         self.user_serv.update_profile_basic,
         uid,
         request.data.user_profile,
+        request.data.health_schema_version,
+        request.data.timezone,
       )
     if not succ:
       return ProfileResponse(code=500, msg=f"update profile failed", request_type=request.request_type, data=None)
@@ -261,8 +296,12 @@ class UserServer:
         response_obj = await self.handle_update_profile(req)
         return web.json_response(response_obj.model_dump(), status=get_http_status(response_obj))
 
-      # client_request.md：/user_profile 只承载 query_profile / update_profile，
-      # 分析类请求统一走 /analysis，洞察报告由 analysis_explore 出口
+      elif req.request_type == "query_health_sync_state":
+        response_obj = self.handle_query_health_sync_state(req)
+        return web.json_response(response_obj.model_dump(), status=get_http_status(response_obj))
+
+      # client_request.md：/user_profile 只承载 query_profile / update_profile /
+      # query_health_sync_state，分析类请求统一走 /analysis，洞察报告由 analysis_explore 出口
       else:
         return web.json_response(InvalidReqFormatResp().model_dump(), status=400)
 
