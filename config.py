@@ -36,6 +36,18 @@ class Config:
   ENABLE_LLM = True
   ENABLE_SLEEP_RECO = True
 
+  # ── 高级会员体验期（高级会员体验期接口.md §4）──────────────────────────────
+  # Basic 档（普通会员）内购 product_id 白名单：report_subscription 仅对它们盖第②段体验期；
+  # premium.* 已是 Premium，不触发
+  BASIC_SUBSCRIPTION_PRODUCT_IDS = frozenset({
+    "com.mindora316.monthly",
+    "com.mindora316.yearly",
+  })
+
+  # ── 睡眠计划同步（睡眠计划同步接口.md）────────────────────────────────────
+  # 会员等级查询结果（auth_server query_user_rights）的内存缓存时长；查询失败不缓存、按 free 降级
+  SLEEP_PLAN_TIER_CACHE_SECONDS = int(os.getenv("SLEEP_PLAN_TIER_CACHE_SECONDS", "60"))
+
   # 健康数据口径版本（健康数据同步接口_0814.md §8）：服务端当前认知的最新版本。
   # 上传缺省 health_schema_version 按 1 处理；客户端版本高于此值时告警（不拒绝）。
   HEALTH_SCHEMA_VERSION = int(os.getenv("HEALTH_SCHEMA_VERSION", "2"))

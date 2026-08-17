@@ -403,6 +403,70 @@ class FootprintDay(BaseModel):
   companion_minutes: int = Field(0, description="当天助眠陪伴分钟数（累计值，合并取大）")
   first_active_at: Optional[int] = Field(None, description="当天首次活跃秒级时间戳（合并取小）")
 
+# -------------------------- 睡眠计划同步（睡眠计划同步接口.md） --------------------------
+# 注意与上方设备端 SleepPlan（target_bed_time 等，供 goal_achieved 用）不是一回事：
+# 这里是 App 端账号级计划，服务端是唯一事实源，含墓碑（deleted=true）记录。
+class SleepPlanCycle(BaseModel):
+  """计划周期；fixed_daily=官方预设每天执行，weekdays=自定义按周几"""
+  type: Optional[str] = Field(None, description="fixed_daily | weekdays")
+  days_count: Optional[int] = Field(None, description="fixed_daily 必填：官方预设总天数（习惯养成21/时差修正7/焦虑修复14）")
+  weekdays: List[int] = Field(default_factory=list, description="weekdays 必填：1=周一…7=周日，须至少3天连续")
+  repeats_weekly: Optional[bool] = Field(None, description="weekdays 必填；false 时仅执行一轮")
+
+
+class SyncedSleepPlan(BaseModel):
+  """睡眠计划同步对象（上报与下发同构）。
+
+  除 plan_id/updated_at 外全部可选：墓碑只需 plan_id/deleted/deleted_at/updated_at 四个字段；
+  完整计划的字段校验在服务端合并层（sleep_plan_service）做，不在模型层卡死。
+  """
+  plan_id: str = Field(..., description="客户端生成的标准大写 UUID，全局主键（uid+plan_id upsert）")
+  kind: Optional[str] = Field(None, description="custom | habit_formation | jet_lag | anxiety_relief")
+  custom_name: str = Field("", description="仅 kind=custom 有效，≤10 字符")
+  target_minutes: Optional[int] = Field(None, description="目标睡眠时长（分钟），≥60")
+  sleep_time: Optional[int] = Field(None, description="入睡时刻，0-1439（当天分钟数，设备当前时区本地时间）")
+  wake_time: Optional[int] = Field(None, description="起床时刻，0-1439；≤sleep_time 表示次日")
+  cycle: Optional[SleepPlanCycle] = None
+  reminder_enabled: Optional[bool] = None
+  reminder_minutes_before: Optional[int] = Field(None, description="提前分钟数：15/30/60/90")
+  alarm_sound_id: Optional[str] = Field(None, description="temple_bell | sunlit_coast | rainforest_mist")
+  sleep_aid_category: Optional[str] = Field(None, description="推荐策略：smart | preference | trending")
+  status: Optional[str] = Field(None, description="not_enabled | active | completed | stopped（stopped 仅兼容历史）")
+  timezone: Optional[str] = Field(None, description="仅审计：该计划最后保存时的时区，不参与触发时刻计算")
+  created_at: Optional[int] = Field(None, description="创建时刻秒级时间戳")
+  updated_at: int = Field(..., description="最近更新秒级时间戳，冲突解决依据（后写胜出）")
+  activated_at: Optional[int] = Field(None, description="本轮开启起算时刻；status != active 时必须为 null")
+  deleted: bool = Field(False, description="墓碑标记")
+  deleted_at: Optional[int] = Field(None, description="删除时刻，deleted=true 时必填")
+
+
+class SleepPlanSyncData(BaseModel):
+  uid: Optional[str] = Field(None, description="debug 用；正式请求以 jwt_token 为准")
+  jwt_token: Optional[str] = None
+  language: Optional[str] = Field(None, description="界面语言，如 zh-Hans / en")
+  timezone: Optional[str] = Field(None, description="设备当前时区（IANA），触发时刻换算与日历日完成判定都靠它")
+  device_id: Optional[str] = Field(None, description="设备唯一标识，多端冲突排查/审计用")
+  last_sync_at: Optional[int] = Field(None, description="上次同步成功时服务端返回的 server_time；首次不传")
+  plans: List[SyncedSleepPlan] = Field(default_factory=list, description="sync_plans：自 last_sync_at 以来有变更的计划（含墓碑）")
+
+
+class SleepPlanSyncRequest(BaseModel):
+  request_type: str = Field(..., description="sync_plans | query_plans")
+  timestamp: int = Field(..., description="请求发送时间戳（秒级）")
+  version: str = Field("1.0")
+  data: SleepPlanSyncData
+
+  @model_validator(mode='after')
+  def validate_data_by_request_type(self):
+    if self.data.jwt_token is None and self.data.uid is None:
+      raise ValueError("uid or jwt_token must be provided")
+    if self.request_type == "sync_plans":
+      pass  # plans 可为空数组（无变更时仅拉取）
+    elif self.request_type != "query_plans":
+      raise ValueError(f"unknown request_type: {self.request_type}")
+    return self
+
+
 class UserProfile(BaseModel):
   """用户画像信息"""
   uid_emb: List[float] = Field(default_factory=list)
@@ -411,6 +475,10 @@ class UserProfile(BaseModel):
 
   # 睡眠计划（设备端制定的睡眠目标，配合 SleepResult.goal_achieved 计算达成率）
   sleep_plan: Optional[SleepPlan] = Field(None, description="用户的睡眠目标计划")
+
+  # App 端账号级睡眠计划（睡眠计划同步接口.md；服务端为唯一事实源，含墓碑记录）
+  sleep_plans: List[SyncedSleepPlan] = Field(default_factory=list, description="账号级睡眠计划全量（含 deleted 墓碑）")
+  sleep_plans_synced_at: Optional[int] = Field(None, description="最近一次计划同步的 server_time（秒）")
 
   # 洞察页 6 模块 LLM 分析结果（mindora_advice.md 模块0-5）
   sleep_insight: Optional[SleepInsightReport] = Field(None, description="洞察页6模块睡眠分析结果")

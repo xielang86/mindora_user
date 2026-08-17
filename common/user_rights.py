@@ -6,6 +6,11 @@ from typing import Any
 
 
 DEFAULT_USER_LEVEL = "free"
+PREMIUM_LEVEL = "premium"
+
+# 高级会员体验期（高级会员体验期接口.md §1）：注册 / 首次购买 Basic 各赠 7 天 Premium，
+# 两段独立起算，有效体验期 = MAX(signup_trial_end_at, basic_purchase_trial_end_at)
+PREMIUM_TRIAL_DAYS = 7
 
 LEVEL_PRIORITIES = {
   "free": 0,
@@ -70,9 +75,26 @@ def is_level_active(level: str | None, level_end_at: datetime | None, now: datet
   return level_end_at > current_time
 
 
-def get_effective_user_level(level: str | None, level_end_at: datetime | None, now: datetime | None = None) -> str:
+def is_premium_trial_active(trial_end_at: datetime | None, now: datetime | None = None) -> bool:
+  """体验期（两段 7 天 Premium 的 max 值）是否仍在生效。"""
+  if trial_end_at is None:
+    return False
+  current_time = now or datetime.now()
+  return trial_end_at > current_time
+
+
+def get_effective_user_level(
+  level: str | None,
+  level_end_at: datetime | None,
+  now: datetime | None = None,
+  trial_end_at: datetime | None = None,
+) -> str:
+  current_time = now or datetime.now()
+  # 体验期优先级高于 user_level：体验期内即便 free/pro 也按 premium 生效
+  if is_premium_trial_active(trial_end_at, current_time):
+    return PREMIUM_LEVEL
   normalized = normalize_user_level(level)
-  if is_level_active(normalized, level_end_at, now):
+  if is_level_active(normalized, level_end_at, current_time):
     return normalized
   return DEFAULT_USER_LEVEL
 
@@ -81,15 +103,21 @@ def build_user_rights_payload(
   user_level: str | None,
   level_end_at: datetime | None,
   now: datetime | None = None,
+  trial_end_at: datetime | None = None,
 ) -> dict[str, Any]:
   current_time = now or datetime.now()
   stored_level = normalize_user_level(user_level)
-  effective_level = get_effective_user_level(stored_level, level_end_at, current_time)
+  effective_level = get_effective_user_level(stored_level, level_end_at, current_time, trial_end_at)
+  trial_active = is_premium_trial_active(trial_end_at, current_time)
   return {
     "stored_user_level": stored_level,
     "effective_user_level": effective_level,
     "level_end_at": level_end_at.isoformat() if level_end_at else None,
-    "membership_active": is_level_active(stored_level, level_end_at, current_time),
+    # 不在体验期（或从未发放）时为 None；注意不能用 null 撤销体验期，撤销靠降 effective_user_level
+    "premium_trial_end_at": trial_end_at.isoformat() if trial_active else None,
+    "membership_active": (
+      is_level_active(stored_level, level_end_at, current_time) or trial_active
+    ),
     "rights": get_level_rights(effective_level),
     "server_time": current_time.isoformat(),
   }

@@ -52,6 +52,7 @@ class AuthRequestType(StrEnum):
   QUERY_USER_RIGHTS = "query_user_rights"                        # 查询用户权益
   QUERY_OPS_ROLE = "query_ops_role"                              # 查询本人运营角色（ops_role）
   GRANT_OPS_ROLE = "grant_ops_role"                              # 0号管理员(super)授权他人运营角色
+  REPORT_SUBSCRIPTION = "report_subscription"                    # 内购购买成功上报（首次 Basic 触发 Premium 体验期）
 
   def __str__(self):
     return self.value
@@ -77,6 +78,11 @@ class AuthData(BaseModel):
   admin_secret: str | None = Field(None, description="后台生成兑换码口令")
   target_email: EmailStr | None = Field(None, description="被授权用户邮箱，grant_ops_role 必填")
   ops_role: str | None = Field(None, description="目标运营角色 none/admin，grant_ops_role 必填（super 只能数据库直设）")
+  # ── 内购上报（report_subscription，高级会员体验期接口.md §4）─────────────────
+  platform: str | None = Field(None, description="平台 ios/android，report_subscription 必填")
+  product_id: str | None = Field(None, description="内购产品ID，report_subscription 必填")
+  original_transaction_id: str | None = Field(None, description="Apple 原始交易ID（对账用），report_subscription 必填")
+  purchased_at: int | None = Field(None, description="购买时刻秒级时间戳，report_subscription 必填")
 
   @field_validator("verify_code")
   def check_verify_code_format(cls, v):
@@ -107,7 +113,7 @@ class AuthData(BaseModel):
       raise ValueError("JWT token empty")
     return v
 
-  @field_validator("redemption_code", "batch_id", "admin_secret")
+  @field_validator("redemption_code", "batch_id", "admin_secret", "platform", "product_id", "original_transaction_id")
   def check_optional_non_empty_text(cls, v):
     if v is not None:
       value = v.strip()
@@ -292,6 +298,16 @@ class AuthRequest(BaseModel):
       if missing:
         raise ValueError(f"request_type={req_type}时，data中以下字段必填：{missing}")
 
+    elif req_type == AuthRequestType.REPORT_SUBSCRIPTION:
+      missing = [
+        f for f in ["jwt_token", "platform", "product_id", "original_transaction_id", "purchased_at"]
+        if getattr(data, f) is None
+      ]
+      if missing:
+        raise ValueError(f"request_type={req_type}时，data中以下字段必填：{missing}")
+      if data.purchased_at is not None and data.purchased_at <= 0:
+        raise ValueError("purchased_at must be positive seconds timestamp")
+
     return self
 
   # mode='after'：所有字段基础校验完成后，再执行该校验（对应原 skip_on_failure=True）
@@ -354,8 +370,9 @@ class JWTTokenData(BaseModel):
   token: str = Field(..., description="JWT Token，必填，非空字符串")
   expire_days: int = Field(..., description="Token过期天数，必填，必须大于0")
   user_level: str = Field("free", description="数据库中记录的当前用户等级")
-  effective_user_level: str = Field("free", description="当前生效的用户等级，过期后回退到free")
+  effective_user_level: str = Field("free", description="当前生效的用户等级，过期后回退到free（Premium 体验期内为 premium）")
   level_end_at: datetime | None = Field(None, description="等级结束时间")
+  premium_trial_end_at: datetime | None = Field(None, description="Premium 体验期结束时刻；不在体验期为 null")
   rights: dict[str, Any] | None = Field(None, description="返回给App的权益内容")
 
   @field_validator("uid", "token")

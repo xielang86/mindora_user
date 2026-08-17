@@ -24,6 +24,7 @@ from db.mysql_db import (
   get_user_by_phone, register_phone_user, get_or_create_wechat_user,
   init_membership_schema, get_user_rights_info, redeem_redemption_code,
   create_redemption_codes, get_ops_role, set_ops_role,
+  report_subscription,
 )
 from db.redis_db import get_verify_code, set_verify_code, delete_verify_code
 from common.util import normalize_email
@@ -160,15 +161,20 @@ def _safe_email(email: str | None, uid: str) -> str:
   return f"{uid[:12]}@mindora.local"
 
 
+def _parse_iso_dt(value, uid: str, field: str):
+  """rights payload 里的 ISO 时间字段转 datetime；非法值降级为 None。"""
+  if isinstance(value, datetime):
+    return value
+  if isinstance(value, str):
+    try:
+      return datetime.fromisoformat(value)
+    except ValueError:
+      logging.warning("invalid %s format for uid=%s: %s", field, uid, value)
+  return None
+
+
 def _build_token_data(uid: str, email: str | None, token: str, expire_days: int) -> JWTTokenData:
   rights_info = get_user_rights_info(uid)
-  level_end_at = rights_info.get("level_end_at")
-  if isinstance(level_end_at, str):
-    try:
-      level_end_at = datetime.fromisoformat(level_end_at)
-    except ValueError:
-      logging.warning("invalid level_end_at format for uid=%s: %s", uid, level_end_at)
-      level_end_at = None
   return JWTTokenData(
     uid=uid,
     email=_safe_email(email, uid),
@@ -176,7 +182,8 @@ def _build_token_data(uid: str, email: str | None, token: str, expire_days: int)
     expire_days=expire_days,
     user_level=rights_info.get("stored_user_level", "free"),
     effective_user_level=rights_info.get("effective_user_level", "free"),
-    level_end_at=level_end_at,
+    level_end_at=_parse_iso_dt(rights_info.get("level_end_at"), uid, "level_end_at"),
+    premium_trial_end_at=_parse_iso_dt(rights_info.get("premium_trial_end_at"), uid, "premium_trial_end_at"),
     rights=rights_info.get("rights"),
   )
 
@@ -764,6 +771,46 @@ def redeem_redemption_code_handler(data: AuthData) -> AuthResponse:
   )
 
 
+def report_subscription_handler(data: AuthData) -> AuthResponse:
+  """report_subscription（高级会员体验期接口.md §4 方案A）：
+  客户端 StoreKit 购买成功后上报；仅 Basic 档 product_id 触发第②段体验期盖章。"""
+  payload = decode_access_token(data.jwt_token)
+  uid = payload.get("uid")
+  product_id = (data.product_id or "").strip()
+
+  if product_id not in Config.BASIC_SUBSCRIPTION_PRODUCT_IDS:
+    # Premium 档（已是 Premium）或未知产品：不触发体验期，原样返回当前会员状态
+    logging.info("report_subscription: product_id=%s not eligible for trial, uid=%s", product_id, uid)
+    return AuthResponse(
+      request_type=AuthRequestType.REPORT_SUBSCRIPTION,
+      code=0,
+      msg="product not eligible for premium trial",
+      data=get_user_rights_info(uid),
+    )
+
+  purchased_at = datetime.fromtimestamp(data.purchased_at) if data.purchased_at else None
+  result = report_subscription(
+    uid=uid,
+    platform=data.platform or "",
+    product_id=product_id,
+    original_transaction_id=data.original_transaction_id,
+    purchased_at=purchased_at,
+  )
+  if result["code"] != 0:
+    raise HTTPException(status_code=result["code"], detail=result["msg"])
+  logging.info(
+    "report_subscription: uid=%s product_id=%s txn=%s trial_granted=%s",
+    uid, product_id, data.original_transaction_id,
+    (result.get("data") or {}).get("trial_granted"),
+  )
+  return AuthResponse(
+    request_type=AuthRequestType.REPORT_SUBSCRIPTION,
+    code=0,
+    msg=result["msg"],
+    data=result["data"],
+  )
+
+
 def generate_redemption_codes_handler(data: AuthData) -> AuthResponse:
   if not REDEMPTION_ADMIN_SECRET:
     raise HTTPException(status_code=503, detail="REDEMPTION_ADMIN_SECRET is not configured")
@@ -876,6 +923,9 @@ async def handle_auth(request: AuthRequest, raw_request: Request):
 
   elif req_type == AuthRequestType.GRANT_OPS_ROLE:
     return grant_ops_role_handler(data)
+
+  elif req_type == AuthRequestType.REPORT_SUBSCRIPTION:
+    return report_subscription_handler(data)
 
   raise HTTPException(status_code=400, detail="Unsupported request type")
 

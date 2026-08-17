@@ -30,6 +30,8 @@ from auth import AuthRequest, AuthData
 from ops_config import append_popup
 from uid.uuid import get_or_create_uuid
 from llm import SleepAnalysisLLM, deep_merge
+import sleep_plan_service
+from user_profile import SleepPlanSyncRequest
 import logger
 import copy
 
@@ -91,6 +93,8 @@ class UserServer:
     # 收窄后的活跃信号只认两类：/analysis 请求（用户在看法分析页）、
     # plays 事件（设备/场景真实使用）。query_profile 等纯打开不算。
     self._activity: dict[str, float] = {}
+    # 睡眠计划：uid -> (effective_user_level, fetched_at)，auth_server 查询短缓存
+    self._tier_cache: dict[str, tuple[str, float]] = {}
     self.setup_routes()
 
   def close(self):
@@ -112,6 +116,7 @@ class UserServer:
     self.app.router.add_post('/popup', self.handle_popup_http)
     self.app.router.add_post('/survey', self.handle_survey_http)
     self.app.router.add_post('/companion_footprint', self.handle_footprint_http)
+    self.app.router.add_post('/sleep_plan', self.handle_sleep_plan_http)
     # 运营后台接口（管理员校验：JWT + auth_server 查 ops_role）
     self.app.router.add_post('/ops/push', self.handle_ops_push_http)
     self.app.router.add_post('/ops/survey_records', self.handle_ops_survey_records_http)
@@ -648,6 +653,103 @@ class UserServer:
       return web.json_response(InvalidReqFormatResp().model_dump(), status=400)
     except Exception as e:
       logging.exception("footprint error: %s", e)
+      return web.json_response(BaseResponse(code=500, msg="Internal server error").model_dump(), status=500)
+
+  # -------------------- /sleep_plan（睡眠计划同步接口.md） --------------------
+  async def _get_effective_level(self, uid: str, jwt_token: Optional[str]) -> str:
+    """查询用户当前生效等级（auth_server query_user_rights），60s 内存缓存。
+
+    查询失败按 free 降级且不缓存（下次重试）：只影响「新增计划」的额度判定，
+    已有计划的更新/删除不受影响；客户端有乐观更新 + 重传队列，可自愈。
+    """
+    now = time.time()
+    cached = self._tier_cache.get(uid)
+    if cached and now - cached[1] < Config.SLEEP_PLAN_TIER_CACHE_SECONDS:
+      return cached[0]
+
+    level = "free"
+    if jwt_token:
+      try:
+        req = AuthRequest(
+          request_type="query_user_rights",
+          timestamp=int(now),
+          version="1.0",
+          data=AuthData(jwt_token=jwt_token),
+        )
+        async with ClientSession() as session:
+          async with session.post(
+            f"{Config.AUTH_SERVER_URL}/auth",
+            json=req.model_dump(mode="json"),
+            timeout=3,
+          ) as resp:
+            body = await resp.json()
+        level = ((body or {}).get("data") or {}).get("effective_user_level") or "free"
+      except Exception as e:
+        logging.error("query_user_rights failed for uid=%s: %s", uid, e)
+        return "free"
+    elif Config.IS_DEBUG and uid in self.debug_uid_set:
+      level = "premium"  # 测试 uid 放行全额度
+
+    self._tier_cache[uid] = (level, now)
+    return level
+
+  async def handle_sleep_plan_http(self, request: web.Request) -> web.Response:
+    """睡眠计划同步：sync_plans（上报变更+拉全量）/ query_plans（仅拉全量）。
+
+    服务端是唯一事实源：合并/额度/唯一开启/完成判定都在 sleep_plan_service；
+    客户端乐观更新后以本响应整体覆盖本地。
+    """
+    try:
+      body = await request.json()
+      req = SleepPlanSyncRequest.model_validate(body)
+      uid = self._parse_for_uid(req.data)
+      if uid is None:
+        return web.json_response(InvalidOrExpiredTokenResp().model_dump(), status=401)
+
+      d = req.data
+      incoming = d.plans if req.request_type == "sync_plans" else []
+      effective_level = await self._get_effective_level(uid, d.jwt_token)
+
+      def _do_sync() -> sleep_plan_service.SyncResult:
+        profile = self.user_serv.get_profile(uid)
+        stored = list(profile.sleep_plans) if profile else []
+        result = sleep_plan_service.sync_plans(
+          stored, incoming,
+          effective_level=effective_level,
+          tz_name=d.timezone,
+        )
+        # 环境信息随同步请求刷新（触发时刻按最近一次同步的时区换算，§6⑥；
+        # 客户端该字段必填，非默认值，可以直接覆盖）
+        meta_changed = False
+        if profile is not None:
+          meta_changed = self.user_serv._note_request_meta(profile, d.timezone, d.language, fill_only=False)
+        if result.changed or meta_changed:
+          if profile is None:
+            profile = UserProfile()
+            self.user_serv._note_request_meta(profile, d.timezone, d.language, fill_only=False)
+          profile.sleep_plans = result.plans
+          profile.sleep_plans_synced_at = int(time.time())
+          self.user_serv.save_profile(uid, profile)
+        return result
+
+      result = await asyncio.to_thread(_do_sync)
+
+      visible = result.visible_plans
+      data = {
+        "server_time": int(time.time()),
+        "membership_tier": sleep_plan_service.client_tier(effective_level),
+        "quota": {"used": len(visible), "limit": sleep_plan_service.plan_quota(effective_level)},
+        "plans": [p.model_dump(mode="json") for p in visible],
+        "rejected": result.rejected,
+      }
+      resp = BaseResponse(code=0, msg="ok")
+      return web.json_response({**resp.model_dump(), "data": data})
+
+    except ValidationError as e:
+      logging.error(f"sleep_plan validation error: {e}")
+      return web.json_response(InvalidReqFormatResp().model_dump(), status=400)
+    except Exception as e:
+      logging.exception("sleep_plan error: %s", e)
       return web.json_response(BaseResponse(code=500, msg="Internal server error").model_dump(), status=500)
 
   # -------------------- 运营后台接口（/ops/*） --------------------

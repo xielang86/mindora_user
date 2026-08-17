@@ -7,10 +7,11 @@ from pymysql.err import OperationalError, ProgrammingError
 from dbutils.pooled_db import PooledDB  # 核心：引入DBUtils连接池
 from dotenv import load_dotenv
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from auth import UserData
 from common.user_rights import (
   DEFAULT_USER_LEVEL,
+  PREMIUM_TRIAL_DAYS,
   build_user_rights_payload,
   normalize_user_level,
   resolve_level_upgrade,
@@ -130,13 +131,18 @@ def get_user_contact(uid: str) -> dict | None:
   return mysql_db.query_one(sql, (uid,))
 
 
+def _signup_trial_end() -> datetime:
+  """第①段体验期盖章时刻：注册 NOW() + PREMIUM_TRIAL_DAYS（高级会员体验期接口.md §2）。"""
+  return datetime.now() + timedelta(days=PREMIUM_TRIAL_DAYS)
+
+
 def insert_user(email: str, uid: str, salt: str, device_list: str) -> int:
-  """插入新用户"""
+  """插入新用户（含第①段注册体验期盖章）"""
   sql = """
-  INSERT INTO user_auth (uid, email, salt, device_list) 
-  VALUES (%s, %s, %s, %s)
+  INSERT INTO user_auth (uid, email, salt, device_list, signup_trial_end_at)
+  VALUES (%s, %s, %s, %s, %s)
   """
-  return mysql_db.execute(sql, (uid, email, salt, device_list))
+  return mysql_db.execute(sql, (uid, email, salt, device_list, _signup_trial_end()))
 
 def insert_or_restore_user(email: str, uid: str, salt: str, device_list: str) -> dict:
   """
@@ -148,19 +154,20 @@ def insert_or_restore_user(email: str, uid: str, salt: str, device_list: str) ->
   :return: 业务状态结果
   """
   
-  placeholders = ", ".join(["%s"] * 5)
-  # 核心：仅恢复软删除用户，正常用户不更新
+  placeholders = ", ".join(["%s"] * 6)
+  # 核心：仅恢复软删除用户，正常用户不更新。
+  # 恢复分支刻意不动 signup_trial_end_at —— 注销重注册不得重发第①段体验期。
   update_clause = """
       status = CASE WHEN user_auth.status = 0 THEN 1 ELSE user_auth.status END,
       device_list = CASE WHEN user_auth.status = 0 THEN VALUES(device_list) ELSE user_auth.device_list END,
       update_time = CASE WHEN user_auth.status = 0 THEN NOW() ELSE user_auth.update_time END
   """
   sql = f"""
-  INSERT INTO user_auth (email, uid, salt, status, device_list)
+  INSERT INTO user_auth (email, uid, salt, status, device_list, signup_trial_end_at)
   VALUES ({placeholders})
   ON DUPLICATE KEY UPDATE {update_clause}
   """
-  params = (email, uid, salt, 1, device_list)
+  params = (email, uid, salt, 1, device_list, _signup_trial_end())
   
   try:
     # 4. 执行SQL并判断结果
@@ -283,6 +290,10 @@ def init_user_rights_columns():
     # 运营角色：none-普通用户，admin-运营（可 push 消息），super-0号管理员（可授权他人）。
     # super 只允许数据库 SQL 直接设置，代码不提供设置 super 的入口（见 set_ops_role）。
     "ops_role": "VARCHAR(16) NOT NULL DEFAULT 'none' COMMENT '运营角色：none/admin/super'",
+    # 高级会员体验期（高级会员体验期接口.md §2）：两段各自独立的 7 天 Premium，
+    # 非空即不再写（幂等）；有效体验期 = MAX(两列)
+    "signup_trial_end_at": "DATETIME DEFAULT NULL COMMENT '注册赠送的 Premium 体验期结束时刻'",
+    "basic_purchase_trial_end_at": "DATETIME DEFAULT NULL COMMENT '首次购买 Basic 赠送的 Premium 体验期结束时刻'",
   }
   db_name = os.getenv("MYSQL_DB", "")
   for col, definition in columns.items():
@@ -327,11 +338,40 @@ def init_redemption_tables():
     logging.warning("Could not create redemption_codes table: %s", e)
 
 
+def init_subscription_reports_table():
+  """Create subscription_reports table（report_subscription 上报留档，供 Apple 对账）."""
+  sql = """
+  CREATE TABLE IF NOT EXISTS subscription_reports (
+    id BIGINT NOT NULL AUTO_INCREMENT,
+    uid VARCHAR(64) NOT NULL COMMENT '上报用户UID',
+    platform VARCHAR(16) NOT NULL DEFAULT '' COMMENT 'ios/android',
+    product_id VARCHAR(128) NOT NULL COMMENT '内购产品ID',
+    original_transaction_id VARCHAR(128) NOT NULL COMMENT 'Apple 原始交易ID（对账用）',
+    purchased_at DATETIME DEFAULT NULL COMMENT '客户端上报的购买时刻',
+    reported_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '服务端收到上报时刻',
+    PRIMARY KEY (id),
+    KEY idx_subscription_uid (uid),
+    KEY idx_subscription_txn (original_transaction_id)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='订阅上报记录表';
+  """
+  try:
+    mysql_db.execute(sql, ())
+  except Exception as e:
+    logging.warning("Could not create subscription_reports table: %s", e)
+
+
 def init_membership_schema():
   """Best-effort runtime initialization for rights-related schema."""
   init_web_columns()
   init_user_rights_columns()
   init_redemption_tables()
+  init_subscription_reports_table()
+
+
+def _max_dt(*values) -> datetime | None:
+  """取若干 DATETIME 列的最大值（忽略 None/非法值）。"""
+  valid = [v for v in values if isinstance(v, datetime)]
+  return max(valid) if valid else None
 
 
 def _hash_redemption_code(code: str) -> str:
@@ -345,16 +385,29 @@ def _generate_redemption_code_text() -> str:
 
 
 def get_user_rights_info(uid: str) -> dict:
-  sql = "SELECT user_level, level_end_at, status FROM user_auth WHERE uid=%s"
+  sql_with_trial = (
+    "SELECT user_level, level_end_at, status, "
+    "signup_trial_end_at, basic_purchase_trial_end_at "
+    "FROM user_auth WHERE uid=%s"
+  )
+  sql_legacy = "SELECT user_level, level_end_at, status FROM user_auth WHERE uid=%s"
   try:
-    row = mysql_db.query_one(sql, (uid,))
+    row = mysql_db.query_one(sql_with_trial, (uid,))
   except Exception as e:
-    logging.warning("membership columns unavailable, fallback to free rights: %s", e)
-    return build_user_rights_payload(DEFAULT_USER_LEVEL, None)
+    # 体验期列未就绪（ALTER 尚未执行）时回退旧口径，不阻塞登录
+    logging.warning("trial columns unavailable, fallback to legacy rights query: %s", e)
+    try:
+      row = mysql_db.query_one(sql_legacy, (uid,))
+    except Exception as e2:
+      logging.warning("membership columns unavailable, fallback to free rights: %s", e2)
+      return build_user_rights_payload(DEFAULT_USER_LEVEL, None)
 
   if not row or row.get("status") != 1:
     return build_user_rights_payload(DEFAULT_USER_LEVEL, None)
-  return build_user_rights_payload(row.get("user_level"), row.get("level_end_at"))
+  trial_end_at = _max_dt(row.get("signup_trial_end_at"), row.get("basic_purchase_trial_end_at"))
+  return build_user_rights_payload(
+    row.get("user_level"), row.get("level_end_at"), trial_end_at=trial_end_at,
+  )
 
 
 # ── 运营角色（ops_role）────────────────────────────────────────────────────
@@ -467,7 +520,8 @@ def redeem_redemption_code(uid: str, redemption_code: str) -> dict:
     with conn.cursor(pymysql.cursors.DictCursor) as cursor:
       cursor.execute(
         """
-        SELECT uid, status, user_level, level_end_at
+        SELECT uid, status, user_level, level_end_at,
+               signup_trial_end_at, basic_purchase_trial_end_at
         FROM user_auth
         WHERE uid=%s
         FOR UPDATE
@@ -540,7 +594,10 @@ def redeem_redemption_code(uid: str, redemption_code: str) -> dict:
       )
 
     conn.commit()
-    rights_payload = build_user_rights_payload(upgrade["new_user_level"], upgrade["new_level_end_at"], now=now)
+    trial_end_at = _max_dt(user_row.get("signup_trial_end_at"), user_row.get("basic_purchase_trial_end_at"))
+    rights_payload = build_user_rights_payload(
+      upgrade["new_user_level"], upgrade["new_level_end_at"], now=now, trial_end_at=trial_end_at,
+    )
     rights_payload["redeemed_code"] = {
       "batch_id": code_row["batch_id"],
       "target_level": normalize_user_level(code_row["target_level"]),
@@ -561,14 +618,98 @@ def redeem_redemption_code(uid: str, redemption_code: str) -> dict:
       conn.close()
 
 
+def report_subscription(
+  uid: str,
+  platform: str,
+  product_id: str,
+  original_transaction_id: str,
+  purchased_at: datetime | None,
+) -> dict:
+  """report_subscription（高级会员体验期接口.md §4）：客户端首次购买 Basic 后上报。
+
+  - basic_purchase_trial_end_at IS NULL 才写 NOW()+PREMIUM_TRIAL_DAYS（第②段体验期，
+    幂等全靠 NULL 守卫，客户端重复上报无害，与第①段是否有效无关、不做衔接）；
+  - 每次上报都留档 subscription_reports（original_transaction_id 供 Apple 对账）。
+
+  product_id 档位校验在调用方（auth_server）完成，这里假定已是 Basic 档。
+  """
+  if not uid or not product_id or not original_transaction_id:
+    return {"code": 400, "msg": "uid/product_id/original_transaction_id are required", "data": None}
+
+  conn = None
+  try:
+    conn = mysql_db.get_connection()
+    conn.begin()
+    now = datetime.now()
+
+    with conn.cursor(pymysql.cursors.DictCursor) as cursor:
+      cursor.execute(
+        """
+        SELECT uid, status, user_level, level_end_at,
+               signup_trial_end_at, basic_purchase_trial_end_at
+        FROM user_auth
+        WHERE uid=%s
+        FOR UPDATE
+        """,
+        (uid,),
+      )
+      user_row = cursor.fetchone()
+      if not user_row:
+        conn.rollback()
+        return {"code": 404, "msg": "user not found", "data": None}
+      if user_row["status"] != 1:
+        conn.rollback()
+        return {"code": 403, "msg": "user is not active", "data": None}
+
+      trial_granted = False
+      if user_row.get("basic_purchase_trial_end_at") is None:
+        new_trial_end = now + timedelta(days=PREMIUM_TRIAL_DAYS)
+        cursor.execute(
+          """
+          UPDATE user_auth
+          SET basic_purchase_trial_end_at=%s, update_time=NOW()
+          WHERE uid=%s AND basic_purchase_trial_end_at IS NULL
+          """,
+          (new_trial_end, uid),
+        )
+        trial_granted = cursor.rowcount == 1
+        if trial_granted:
+          user_row["basic_purchase_trial_end_at"] = new_trial_end
+
+      cursor.execute(
+        """
+        INSERT INTO subscription_reports
+          (uid, platform, product_id, original_transaction_id, purchased_at)
+        VALUES (%s, %s, %s, %s, %s)
+        """,
+        (uid, platform or "", product_id, original_transaction_id, purchased_at),
+      )
+
+    conn.commit()
+    trial_end_at = _max_dt(user_row.get("signup_trial_end_at"), user_row.get("basic_purchase_trial_end_at"))
+    rights_payload = build_user_rights_payload(
+      user_row.get("user_level"), user_row.get("level_end_at"), now=now, trial_end_at=trial_end_at,
+    )
+    rights_payload["trial_granted"] = trial_granted
+    msg = "premium trial granted" if trial_granted else "subscription reported (trial already granted before)"
+    return {"code": 0, "msg": msg, "data": rights_payload}
+  except Exception as e:
+    if conn:
+      conn.rollback()
+    return {"code": 500, "msg": f"report subscription failed: {e}", "data": None}
+  finally:
+    if conn:
+      conn.close()
+
+
 def register_user_with_password(email: str, uid: str, salt: str,
                                  password_hash: str, device_list: str) -> int:
   """Insert a new user who registered with email+password (web flow)."""
   sql = """
-  INSERT INTO user_auth (uid, email, salt, password_hash, device_list)
-  VALUES (%s, %s, %s, %s, %s)
+  INSERT INTO user_auth (uid, email, salt, password_hash, device_list, signup_trial_end_at)
+  VALUES (%s, %s, %s, %s, %s, %s)
   """
-  return mysql_db.execute(sql, (uid, email, salt, password_hash, device_list))
+  return mysql_db.execute(sql, (uid, email, salt, password_hash, device_list, _signup_trial_end()))
 
 
 def get_user_password_hash(email: str) -> str | None:
@@ -589,10 +730,10 @@ def get_user_by_phone(phone: str) -> "UserData | None":
 def register_phone_user(phone: str, uid: str, salt: str, device_list: str) -> int:
   """Insert a new user who registered via phone+SMS code."""
   sql = """
-  INSERT INTO user_auth (uid, phone, salt, device_list)
-  VALUES (%s, %s, %s, %s)
+  INSERT INTO user_auth (uid, phone, salt, device_list, signup_trial_end_at)
+  VALUES (%s, %s, %s, %s, %s)
   """
-  return mysql_db.execute(sql, (uid, phone, salt, device_list))
+  return mysql_db.execute(sql, (uid, phone, salt, device_list, _signup_trial_end()))
 
 
 def get_or_create_wechat_user(openid: str, unionid: str | None,
@@ -617,10 +758,10 @@ def get_or_create_wechat_user(openid: str, unionid: str | None,
   salt = _os.urandom(16).hex()
   raw_uid = _hl.sha256((salt + openid).encode()).hexdigest()
   sql = """
-  INSERT INTO user_auth (uid, salt, wechat_openid, wechat_unionid, nickname, avatar_url, device_list)
-  VALUES (%s, %s, %s, %s, %s, %s, %s)
+  INSERT INTO user_auth (uid, salt, wechat_openid, wechat_unionid, nickname, avatar_url, device_list, signup_trial_end_at)
+  VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
   """
-  mysql_db.execute(sql, (raw_uid, salt, openid, unionid or None, nickname, avatar_url, "wechat"))
+  mysql_db.execute(sql, (raw_uid, salt, openid, unionid or None, nickname, avatar_url, "wechat", _signup_trial_end()))
   row = mysql_db.query_one(
     "SELECT uid, email, salt, status, device_list, register_time, update_time "
     "FROM user_auth WHERE uid=%s", (raw_uid,)
