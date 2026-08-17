@@ -11,6 +11,7 @@ import datetime
 import logging
 import time
 from typing import Any, Optional
+from zoneinfo import ZoneInfo
 
 from pydantic import ValidationError
 
@@ -20,6 +21,50 @@ from user_profile import (
   ANALYSIS_REPORT_KEYS, ANALYSIS_REPORT_RETENTION,
   compute_recent_sleep_stats,
 )
+
+
+def _resolve_tz(tz_name: Optional[str]) -> datetime.tzinfo:
+  """画像上记录的最近请求时区 → tzinfo；缺失/非法回退 UTC（不告警，读路径太吵）。"""
+  if tz_name:
+    try:
+      return ZoneInfo(tz_name)
+    except Exception:
+      pass
+  return datetime.timezone.utc
+
+
+def _today_in_tz(tz_name: Optional[str]) -> datetime.date:
+  return datetime.datetime.now(_resolve_tz(tz_name)).date()
+
+
+# LLM 层 _lang_instruction 认的语言码（llm/analysis.py）：zh-Hans/zh-Hant/en/ja/ko/de/fr/it/es/id
+_LANG_CANONICAL = {
+  "zh-hans": "zh-Hans", "zh-cn": "zh-Hans", "zh-sg": "zh-Hans", "zh": "zh-Hans",
+  "zh-hant": "zh-Hant", "zh-tw": "zh-Hant", "zh-hk": "zh-Hant", "zh-mo": "zh-Hant",
+  "en": "en", "ja": "ja", "ko": "ko", "de": "de", "fr": "fr",
+  "it": "it", "es": "es", "id": "id",
+}
+
+
+def _profile_language(profile: UserProfile) -> str:
+  """LLM 文案语言：优先 Profile 结构里的 language（用户资料显式设置），
+  没有再看最近一次请求的 language（last_request_language），最后兜底 en。
+
+  两个来源的写法都可能不标准（Profile.language 缺省 "zh-CN"，LLM 层认 "zh-Hans"），
+  统一归一化；归一化不了的值不猜，继续往后兜底（避免 "zh-CN" 静默变英文）。
+  """
+  candidates = [
+    getattr(profile.profile, "language", None) if profile.profile else None,
+    getattr(profile, "last_request_language", None),
+  ]
+  for raw in candidates:
+    if not raw:
+      continue
+    canon = _LANG_CANONICAL.get(raw.strip().lower())
+    if canon:
+      return canon
+    logging.warning("unrecognized profile language %r, trying next source", raw)
+  return "en"
 
 
 class AnalysisContentService:
@@ -44,33 +89,42 @@ class AnalysisContentService:
     """Generate the 6-module insight report (mindora_advice.md 模块0-5) via LLM
     and return it for storage in ``profile.sleep_insight``.
 
-    If the stored report is less than 7 days old, reuse it instead of calling
-    the LLM again.  Returns None when there is nothing to store (LLM disabled
-    and no existing report).
+    复用策略（醒后每日更新机制）：有比 generated_at 更新的 sleep_data 夜晚就重算；
+    没有新夜晚时 7 天内复用（慢速刷新兜底），超过 7 天也重算。
+    Returns None when there is nothing to store (LLM disabled and no existing report).
     """
     existing = profile.sleep_insight
     now = int(time.time())
-    if existing and existing.generated_at and now - existing.generated_at < 7 * 86400:
-      logging.info(f"sleep_insight still fresh for uid={uid}, skipping LLM")
-      return existing
+    if existing and existing.generated_at:
+      newest_sleep_ts = max(
+        (int(r.timestamp or 0) for r in (profile.sleep_data or [])), default=0,
+      )
+      has_new_night = newest_sleep_ts > existing.generated_at
+      if not has_new_night and now - existing.generated_at < 7 * 86400:
+        logging.info(f"sleep_insight still fresh for uid={uid}, skipping LLM")
+        return existing
 
     if not self.llm or not self.llm.enabled:
       return existing
 
+    # 文案语言：Profile.language 优先，其次最近请求语言，兜底 en
+    lang = _profile_language(profile)
+    report_tz = profile.last_request_timezone
+
     class _FakeData:
-      date = datetime.date.today().isoformat()
+      date = _today_in_tz(report_tz).isoformat()
       start_date = None
       end_date = None
-      language = "en"
+      language = lang
 
     ctx = extract_sleep_context(profile, _FakeData())
-    llm_result = self.llm.generate_sync("sleep_insight_report", ctx, "en", [])
+    llm_result = self.llm.generate_sync("sleep_insight_report", ctx, lang, [])
     if not llm_result:
       return existing
 
     report_data: dict[str, Any] = {
-      "date": datetime.date.today().isoformat(),
-      "language": "en",
+      "date": _today_in_tz(report_tz).isoformat(),
+      "language": lang,
       "generated_at": now,
       "llm_used": True,
     }
@@ -97,12 +151,13 @@ class AnalysisContentService:
     return report
 
   @staticmethod
-  def _analysis_specs_for_today() -> list:
+  def _analysis_specs_for_today(tz_name: Optional[str] = None) -> list:
     """5 个分析能力的当前周期定义：(request_type, start_date, end_date, date, modules)。
 
     日级能力 start_date/end_date 为 None、date=今日；周/月带起止日期。
+    "今日"按用户画像最近请求时区计算（缺省 UTC），与每日触发门同口径。
     """
-    today = datetime.date.today()
+    today = _today_in_tz(tz_name)
     today_str = today.isoformat()
     week_start = (today - datetime.timedelta(days=6)).isoformat()
     month_start = (today - datetime.timedelta(days=29)).isoformat()
@@ -130,22 +185,25 @@ class AnalysisContentService:
     kept.sort(key=lambda r: (r.end_date or r.date, r.generated_at))
     return kept[-retention:]
 
-  def calc_analysis_reports(self, uid: str, profile: UserProfile, language: str = "en") -> Optional[dict]:
+  def calc_analysis_reports(self, uid: str, profile: UserProfile, language: Optional[str] = None) -> Optional[dict]:
     """异步生成 5 个分析能力的当前周期文案报告，返回更新后的 analysis_reports。
 
     在 update_profile 的后台 LLM 更新中调用；/analysis 请求时只读库。
     当前周期已有报告则复用（每周期每能力至多一次 LLM 调用）。
+    语言：Profile.language 优先，其次最近请求语言，兜底 en；周期日期按画像最近请求时区（缺省 UTC）。
     LLM 不可用或全部失败时返回 None（调用方保留旧数据）。
     """
     if not self.llm or not self.llm.enabled:
       return None
 
+    language = language or _profile_language(profile)
+    tz_name = profile.last_request_timezone
     existing = profile.analysis_reports or {}
     reports: dict = {key: list(existing.get(key) or []) for key in ANALYSIS_REPORT_KEYS}
     now = int(time.time())
     changed = False
 
-    for request_type, start_date, end_date, date, modules in self._analysis_specs_for_today():
+    for request_type, start_date, end_date, date, modules in self._analysis_specs_for_today(tz_name):
       # 当前周期已有报告 → 复用，不重复调 LLM
       def _is_current(r: AnalysisTextReport) -> bool:
         if start_date is not None:
@@ -215,7 +273,11 @@ class AnalysisContentService:
         return r
 
     # 回退：请求的是当前周期（与生成时口径一致），直接用最新一条
-    current = {rt: (s, e, d) for rt, s, e, d, _m in AnalysisContentService._analysis_specs_for_today()}
+    profile_tz = getattr(profile, "last_request_timezone", None)
+    current = {
+      rt: (s, e, d)
+      for rt, s, e, d, _m in AnalysisContentService._analysis_specs_for_today(profile_tz)
+    }
     if request_type in current:
       c_start, c_end, c_date = current[request_type]
       is_current_period = (

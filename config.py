@@ -56,6 +56,18 @@ class Config:
   # 全局并发 LLM 后台任务上限
   MAX_LLM_BACKGROUND_TASKS = 8
 
+  # ── 醒后自动睡眠分析（方案A：app 零散上传，服务端按数据决定何时跑 LLM）──
+  # 总开关：有"比最新日级报告更新"的完整夜晚（sleep_data）时才调度后台 LLM，
+  # 否则碎片化上传不触发；False 时退化为仅客户端显式 skip=False 才触发。
+  LLM_ANALYSIS_AUTO_TRIGGER = os.getenv("LLM_ANALYSIS_AUTO_TRIGGER", "true").lower() == "true"
+  # 防抖：检测到新夜晚后延迟这么久再跑，等醒后的零散健康数据/修正包落地
+  LLM_ANALYSIS_DEBOUNCE_SECONDS = int(os.getenv("LLM_ANALYSIS_DEBOUNCE_SECONDS", "600"))
+  # 兜底扫描间隔：补触发"重启丢了防抖任务 / LLM 临时失败"漏掉的 uid
+  LLM_ANALYSIS_SWEEP_SECONDS = int(os.getenv("LLM_ANALYSIS_SWEEP_SECONDS", "3600"))
+  # 活跃门窗口：只有窗口内有活跃信号（/analysis 请求 或 plays 事件）的用户
+  # 才做醒后预生成——纯设备后台同步、app 不活跃的用户不烧 LLM
+  LLM_ANALYSIS_ACTIVITY_WINDOW_SECONDS = int(os.getenv("LLM_ANALYSIS_ACTIVITY_WINDOW_SECONDS", "86400"))
+
   # ---------------------------------------------------------------------------
   # 旧版 DELETE_USER 接口访问控制：JWT 直接删除风险较高，仅允许特定 IP/MAC 调用。
   # 支持环境变量 DELETE_USER_ALLOWED_IPS / DELETE_USER_ALLOWED_MACS 覆盖，

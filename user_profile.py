@@ -504,6 +504,13 @@ class UserProfile(BaseModel):
 
   profile: Optional[Profile] = None
 
+  # 最近一次请求的客户端环境（每次 update_profile 显式携带时刷新）：
+  # 每日 LLM 分析触发门的自然日口径用 last_request_timezone（缺省 UTC），
+  # sleep_insight/analysis_reports 文案语言用 last_request_language（缺省 en）
+  last_request_timezone: Optional[str] = Field(None, description="最近一次请求的客户端时区 ID，如 Asia/Shanghai")
+  last_request_language: Optional[str] = Field(None, description="最近一次请求的界面语言，如 zh-Hans / en")
+  last_request_at: Optional[int] = Field(None, description="最近一次带环境信息的请求时间戳（秒）")
+
   # 首页弹窗 / 站内消息 / 调查问卷 / 陪伴足迹（tanchuang_suvey.md, peibanzuji.md）
   popup_states: Dict[str, PopupState] = Field(
     default_factory=dict,
@@ -536,13 +543,15 @@ class ProfileData(BaseModel):
   # query_health_sync_state 对账窗口（§8.4）
   start_date: Optional[str] = Field(None, description="对账起始自然日 yyyy-MM-dd")
   end_date: Optional[str] = Field(None, description="对账结束自然日 yyyy-MM-dd")
-  skip_sleep_scenarios_reco_update: bool = Field(
-    True,
-    description="只跳过助眠场景推荐(sleep_scenarios_reco)的重算，不影响睡眠分析(insight/analysis cache)",
+  # 三态开关：None=由服务端按数据自动决策（有未分析的新夜晚则每天生成一次）；
+  # 显式 True=客户端要求跳过；显式 False=客户端要求立即强制生成
+  skip_sleep_scenarios_reco_update: Optional[bool] = Field(
+    None,
+    description="助眠场景推荐(sleep_scenarios_reco)开关：None=自动 / True=跳过 / False=强制，不影响睡眠分析",
   )
-  skip_sleep_analysis_update: bool = Field(
-    True,
-    description="只跳过睡眠分析(sleep_insight + analysis cache)的生成，不影响场景推荐",
+  skip_sleep_analysis_update: Optional[bool] = Field(
+    None,
+    description="睡眠分析(sleep_insight + analysis cache)开关：None=自动 / True=跳过 / False=强制，不影响场景推荐",
   )
 
 

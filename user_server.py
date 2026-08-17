@@ -82,10 +82,23 @@ class UserServer:
     self._llm_update_tracker: dict[str, float] = {}
     self._llm_tasks: set[asyncio.Task] = set()
     self._llm_semaphore = asyncio.Semaphore(Config.MAX_LLM_BACKGROUND_TASKS)
+    # 醒后自动触发（方案A）：uid -> 防抖中的调度任务 / 上次触发时最新 sleep_data ts。
+    # 判定所需的状态（最新报告日期、最新夜晚 ts）都在画像里，重启后可重建；
+    # 这两个内存结构只做"别重复烧 LLM"的节流，丢了最多多扫一次。
+    self._llm_pending: dict[str, asyncio.Task] = {}
+    self._llm_last_attempt: dict[str, int] = {}
+    # 活跃表：uid -> 最近一次活跃信号的时间戳（time.time()）。
+    # 收窄后的活跃信号只认两类：/analysis 请求（用户在看法分析页）、
+    # plays 事件（设备/场景真实使用）。query_profile 等纯打开不算。
+    self._activity: dict[str, float] = {}
     self.setup_routes()
 
   def close(self):
     self.user_serv.close()
+    for attr in ("_sweeper_task", "_activity_log_task"):
+      task = getattr(self, attr, None)
+      if task:
+        task.cancel()
     # Cancel pending LLM background tasks.
     for task in list(self._llm_tasks):
       task.cancel()
@@ -216,18 +229,28 @@ class UserServer:
         request.data.user_profile,
         request.data.health_schema_version,
         request.data.timezone,
+        request.data.language,
       )
     if not succ:
       return ProfileResponse(code=500, msg=f"update profile failed", request_type=request.request_type, data=None)
 
-    skip_reco = request.data.skip_sleep_scenarios_reco_update
-    skip_analysis = request.data.skip_sleep_analysis_update
-    if not (skip_reco and skip_analysis):
-      await self._schedule_llm_update_if_needed(uid, skip_reco, skip_analysis)
-
     # 个人资料同步约定 §2/§3：msg 回显 uid（不用 timestamp）；返回合并后的完整 profile，
     # 客户端用它更新本地快照基准（服务端归一化后两边才对得上）
     merged = await asyncio.to_thread(self.user_serv.get_profile, uid)
+
+    # 本批含 plays（场景/设备真实使用）→ 记活跃信号
+    up = request.data.user_profile
+    if up is not None and (up.behaviors or {}).get("plays"):
+      self._mark_activity(uid)
+
+    # LLM 触发（方案A：醒后每天一次）：客户端不传开关时由服务端按数据自动决策
+    await self._maybe_schedule_llm_update(
+      uid,
+      merged,
+      request.data.skip_sleep_scenarios_reco_update,
+      request.data.skip_sleep_analysis_update,
+    )
+
     return ProfileResponse(
       code=0,
       msg=f"update profile for '{uid}' succ",
@@ -235,14 +258,107 @@ class UserServer:
       data={"user_profile": merged.model_dump()} if merged else None,
     )
 
+  # -------------------- 活跃门（醒后预生成的成本闸门） --------------------
+  def _mark_activity(self, uid: str) -> None:
+    """记录一次活跃信号（/analysis 请求或 plays 批次）。"""
+    if uid:
+      self._activity[uid] = time.time()
+
+  def _is_active(self, uid: str, profile) -> bool:
+    """活跃门：窗口（LLM_ANALYSIS_ACTIVITY_WINDOW_SECONDS）内有活跃信号。
+
+    两个来源（只认这两类，query_profile 等纯打开不算）：
+      - 内存活跃表：/analysis 请求、含 plays 的 update 批次（实时，重启丢失）
+      - 持久化兜底：画像 behaviors.plays 的最新事件时间戳（重启后仍正确）
+    """
+    now = time.time()
+    window = Config.LLM_ANALYSIS_ACTIVITY_WINDOW_SECONDS
+    if now - self._activity.get(uid, 0) < window:
+      return True
+    plays = ((profile.behaviors or {}).get("plays")) if profile else None
+    if plays:
+      try:
+        latest = max(int(p[0]) for p in plays if p)
+        return now - latest < window
+      except (TypeError, ValueError, IndexError):
+        return False
+    return False
+
+  @staticmethod
+  def _newest_sleep_ts(profile) -> Optional[int]:
+    """画像中最新一晚 sleep_data 的时间戳（醒来的那一刻）；无数据返回 None。"""
+    if not profile or not profile.sleep_data:
+      return None
+    return max((int(r.timestamp or 0) for r in profile.sleep_data), default=0) or None
+
+  def _analysis_needed(self, profile) -> tuple[bool, Optional[int]]:
+    """每日触发门：最新一夜（按画像最近时区归日）是否还没有对应的日级分析报告。
+
+    返回 (是否需要, 最新夜晚 ts)。状态全部来自持久化画像，重启后判定不变：
+      - 有夜晚但从未生成过日报告 → 需要
+      - 最新夜晚日期 > 最新日报告日期 → 需要（醒来了新的一天）
+      - 最新夜晚日期 == 最新日报告日期 → 不需要（今天的已生成，零散包不重复烧 LLM）
+    """
+    newest_ts = self._newest_sleep_ts(profile)
+    if newest_ts is None:
+      return False, None
+    tz = UserProfileServ._resolve_tz(getattr(profile, "last_request_timezone", None), warn=False)
+    newest_night = datetime.datetime.fromtimestamp(newest_ts, tz).date().isoformat()
+    day_reports = (profile.analysis_reports or {}).get("analysis_sleep_day") or []
+    latest_report_date = max((r.date for r in day_reports if r.date), default=None)
+    if latest_report_date is None:
+      return True, newest_ts
+    return newest_night > latest_report_date, newest_ts
+
+  async def _maybe_schedule_llm_update(
+    self,
+    uid: str,
+    profile,
+    skip_reco: Optional[bool],
+    skip_analysis: Optional[bool],
+  ) -> None:
+    """三态开关 + 醒后自动触发的决策层。
+
+    skip_* 语义：True=客户端要求跳过；False=客户端要求立即强制（跳过防抖）；
+    None=服务端自动——有未分析的新夜晚且活跃门通过（窗口内有 /analysis 请求
+    或 plays 事件）才调度，带防抖等零散包落地。纯设备后台同步、app 不活跃的
+    用户不做预生成（他们打开分析页时由读路径懒触发兜底）。
+    """
+    auto_needed, newest_ts = False, None
+    if Config.LLM_ANALYSIS_AUTO_TRIGGER:
+      auto_needed, newest_ts = self._analysis_needed(profile)
+      if auto_needed and self._llm_last_attempt.get(uid) == newest_ts:
+        # 已经为这一夜尝试过一次（可能失败了）：同夜的零散包不再触发，
+        # 交给每小时兜底扫描重试，避免 LLM 故障时被碎片化上传反复点燃
+        auto_needed = False
+      if auto_needed and not self._is_active(uid, profile):
+        logging.info("skip auto llm for uid=%s: inactive (no /analysis or plays in window)", uid)
+        auto_needed = False
+
+    run_reco = skip_reco is False or (auto_needed and skip_reco is not True)
+    run_analysis = skip_analysis is False or (auto_needed and skip_analysis is not True)
+    if not (run_reco or run_analysis):
+      return
+
+    forced = skip_reco is False or skip_analysis is False
+    delay = 0 if forced else Config.LLM_ANALYSIS_DEBOUNCE_SECONDS
+    if auto_needed and newest_ts is not None:
+      self._llm_last_attempt[uid] = newest_ts
+    await self._schedule_llm_update_if_needed(uid, not run_reco, not run_analysis, delay=delay)
+
   async def _schedule_llm_update_if_needed(
     self,
     uid: str,
     skip_sleep_scenarios_reco_update: bool = False,
     skip_sleep_analysis_update: bool = False,
+    delay: float = 0,
   ) -> None:
-    """Schedule a background LLM update for uid unless one ran recently."""
+    """Schedule a background LLM update for uid unless one ran recently or is pending."""
     async with self._llm_tracker_lock:
+      pending = self._llm_pending.get(uid)
+      if pending is not None and not pending.done():
+        # 防抖窗口内已有任务：它运行时才读最新画像，后续零散包自动并入
+        return
       now = time.monotonic()
       last = self._llm_update_tracker.get(uid)
       if last is not None and now - last < Config.LLM_UPDATE_COOLDOWN_SECONDS:
@@ -250,24 +366,28 @@ class UserServer:
         return
       self._llm_update_tracker[uid] = now
 
-    task = asyncio.create_task(
-      self._run_llm_update(uid, skip_sleep_scenarios_reco_update, skip_sleep_analysis_update)
-    )
-    self._llm_tasks.add(task)
-    task.add_done_callback(self._llm_tasks.discard)
+      task = asyncio.create_task(
+        self._run_llm_update(uid, skip_sleep_scenarios_reco_update, skip_sleep_analysis_update, delay)
+      )
+      self._llm_pending[uid] = task
+      self._llm_tasks.add(task)
+      task.add_done_callback(self._llm_tasks.discard)
 
   async def _run_llm_update(
     self,
     uid: str,
     skip_sleep_scenarios_reco_update: bool = False,
     skip_sleep_analysis_update: bool = False,
+    delay: float = 0,
   ) -> None:
     """Run LLM work in a background task."""
     logging.info(
-      "start background llm update for uid=%s (skip_reco=%s skip_analysis=%s)",
-      uid, skip_sleep_scenarios_reco_update, skip_sleep_analysis_update,
+      "start background llm update for uid=%s (skip_reco=%s skip_analysis=%s delay=%.0fs)",
+      uid, skip_sleep_scenarios_reco_update, skip_sleep_analysis_update, delay,
     )
     try:
+      if delay > 0:
+        await asyncio.sleep(delay)  # 防抖：等醒后的零散健康数据/修正包落地
       async with self._llm_semaphore:
         await asyncio.to_thread(
           self.user_serv.update_profile_llm,
@@ -347,8 +467,23 @@ class UserServer:
       if isinstance(uid, BaseResponse):
         return web.json_response(uid.model_dump(), status=uid.code)
 
-      profile = self.user_serv.get_profile(uid)
+      # 用户在看法分析页 = 活跃信号（收窄后只认 /analysis 和 plays）
+      self._mark_activity(uid)
+
+      # 读路径登记请求环境（fill_only：只补缺，不覆盖 update 路径记下的真实值；
+      # 每日触发门的自然日口径与文案语言都以画像上的这个值为准）
+      await asyncio.to_thread(
+        self.user_serv.note_request_meta, uid, req.data.timezone, req.data.language,
+      )
+      profile = await asyncio.to_thread(self.user_serv.get_profile, uid)
       response_data = self._build_analysis_data(req, profile)
+
+      # 读路径懒触发：有未分析的新夜晚 → 立即后台生成（本次先回骨架，
+      # 文案下次刷新自然出现）。兜住活跃门漏判/预生成未覆盖的活跃用户。
+      needed, newest_ts = self._analysis_needed(profile)
+      if needed and newest_ts is not None:
+        self._llm_last_attempt[uid] = newest_ts
+        await self._schedule_llm_update_if_needed(uid, delay=0)
 
       # LLM 文案全部来自 update_profile 时异步生成、按日/周/月序列存储的报告，
       # 请求时纯查库，不再同步调用 LLM；未命中则只回数值骨架（文案为空/默认）
@@ -633,6 +768,50 @@ class UserServer:
     if not self.llm.enabled:
       logging.warning("[self-check] LLM disabled (ARK_API_KEY / KIMI_API_KEY 均未配置) — 分析/洞察文案使用默认模板")
 
+  async def _analysis_sweeper(self):
+    """每小时兜底扫描：给"有未分析新夜晚但没跑成"的 uid 补触发。
+
+    覆盖的漏网场景：服务器重启丢了内存中的防抖任务、后台 LLM 临时失败、
+    更新请求后一直没有新请求进来（自动触发只在 update 路径上做判定）。
+    LLM 未启用时直接空转（calc_* 会秒回，扫了也没意义）。
+    """
+    while True:
+      await asyncio.sleep(Config.LLM_ANALYSIS_SWEEP_SECONDS)
+      try:
+        if not Config.LLM_ANALYSIS_AUTO_TRIGGER or not self.llm or not self.llm.enabled:
+          continue
+        uids = await asyncio.to_thread(self.user_serv.list_uids)
+        for uid in uids:
+          profile = await asyncio.to_thread(self.user_serv.get_profile, uid)
+          needed, _ = self._analysis_needed(profile)
+          # 活跃门：app 不活跃（窗口内无 /analysis、无 plays）的用户不补烧 LLM
+          if needed and self._is_active(uid, profile):
+            logging.info("analysis sweeper: catch up uid=%s", uid)
+            await self._maybe_schedule_llm_update(uid, profile, None, None)
+      except asyncio.CancelledError:
+        raise
+      except Exception as e:
+        logging.error("analysis sweeper error: %s", e)
+
+  async def _activity_logger(self):
+    """每 5 分钟打印内存活跃表总数；顺手清掉窗口外的过期条目防膨胀。"""
+    while True:
+      await asyncio.sleep(300)
+      try:
+        now = time.time()
+        window = Config.LLM_ANALYSIS_ACTIVITY_WINDOW_SECONDS
+        stale = [uid for uid, ts in self._activity.items() if now - ts >= window]
+        for uid in stale:
+          del self._activity[uid]
+        logging.info(
+          "activity table: total=%d (window=%ds, pruned=%d)",
+          len(self._activity), window, len(stale),
+        )
+      except asyncio.CancelledError:
+        raise
+      except Exception as e:
+        logging.error("activity logger error: %s", e)
+
   async def start_http(self):
     """启动HTTP服务器"""
     runner = web.AppRunner(self.app)
@@ -641,6 +820,8 @@ class UserServer:
     await site.start()
     logging.info(f"UserServer (LevelDB) started on http://{self.host}:{self.port}")
     self._startup_self_check()
+    self._sweeper_task = asyncio.create_task(self._analysis_sweeper())
+    self._activity_log_task = asyncio.create_task(self._activity_logger())
     # 保持服务运行
     await asyncio.Event().wait()
 

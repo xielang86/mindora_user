@@ -102,7 +102,8 @@ class UserServerClient:
   def update_profile(
     self,
     user_profile: dict[str, Any] | None = None,
-    skip_sleep_scenarios_reco_update: bool = False,
+    skip_sleep_scenarios_reco_update: bool | None = None,
+    skip_sleep_analysis_update: bool | None = None,
     health_schema_version: int | None = None,
   ) -> dict[str, Any]:
     payload = {
@@ -114,9 +115,13 @@ class UserServerClient:
         "user_profile": user_profile or self.default_user_profile(),
         "language": self.language,
         "timezone": self.timezone,
-        "skip_sleep_scenarios_reco_update": skip_sleep_scenarios_reco_update,
       },
     }
+    # 三态开关：None=不带该字段（服务端自动决策）；True=跳过；False=强制
+    if skip_sleep_scenarios_reco_update is not None:
+      payload["data"]["skip_sleep_scenarios_reco_update"] = skip_sleep_scenarios_reco_update
+    if skip_sleep_analysis_update is not None:
+      payload["data"]["skip_sleep_analysis_update"] = skip_sleep_analysis_update
     if health_schema_version is not None:
       payload["data"]["health_schema_version"] = health_schema_version
     return self._post("/user_profile", payload)
@@ -327,7 +332,8 @@ def build_parser() -> argparse.ArgumentParser:
   parser.add_argument("--timezone", default=DEFAULT_TIMEZONE)
   parser.add_argument("--focus", nargs="*", default=None)
   parser.add_argument("--modules", nargs="*", default=None)
-  parser.add_argument("--skip-sleep-scenarios-reco-update", action="store_true")
+  parser.add_argument("--skip-sleep-scenarios-reco-update", action="store_const", const=True, default=None,
+                      help="显式要求跳过场景推荐重算；不带则交给服务端自动决策")
   return parser
 
 

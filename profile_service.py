@@ -90,7 +90,7 @@ class UserProfileServ:
   def calc_sleep_insight(self, uid: str, profile: UserProfile):
     return self.content.calc_sleep_insight(uid, profile)
 
-  def calc_analysis_reports(self, uid: str, profile: UserProfile, language: str = "en"):
+  def calc_analysis_reports(self, uid: str, profile: UserProfile, language: Optional[str] = None):
     return self.content.calc_analysis_reports(uid, profile, language)
 
   def query_popups(self, uid: str, language: str, placement: str = "home") -> dict:
@@ -273,16 +273,60 @@ class UserProfileServ:
     logging.info("after update behavior counts=%s", self._behavior_counts(old_behaviors))
     return old_behaviors
 
+  # -------------------- 最近请求环境（每日 LLM 触发门口径） --------------------
+  @staticmethod
+  def _note_request_meta(profile: UserProfile, timezone: Optional[str], language: Optional[str],
+                         fill_only: bool = False) -> bool:
+    """把请求携带的 timezone/language 记到画像上；返回是否有变化。
+
+    fill_only=True（/analysis 读路径）只补缺——AnalysisData 的 tz/lang 有默认值
+    （"UTC"/"en"），无法区分"客户端显式传 UTC"与"老客户端没传"，不能覆盖
+    update 路径记下的真实值。
+    """
+    changed = False
+    if timezone and (not fill_only or not profile.last_request_timezone) \
+        and profile.last_request_timezone != timezone:
+      profile.last_request_timezone = timezone
+      changed = True
+    if language and (not fill_only or not profile.last_request_language) \
+        and profile.last_request_language != language:
+      profile.last_request_language = language
+      changed = True
+    if changed:
+      profile.last_request_at = int(time.time())
+    return changed
+
+  def note_request_meta(self, uid: str, timezone: Optional[str], language: Optional[str],
+                        fill_only: bool = True) -> None:
+    """读路径（/analysis）登记请求环境：只在画像缺省时补缺，有变化才落盘。"""
+    with self.lock:
+      profile = self.get_profile(uid)
+      if profile is None:
+        return
+      if self._note_request_meta(profile, timezone, language, fill_only=fill_only):
+        self.save_profile(uid, profile)
+
+  def list_uids(self) -> list:
+    """全部用户 uid（兜底扫描用）；排除 "_meta:" 前缀的全局 KV。"""
+    with self.lock:
+      if self.storage_mode == "leveldb":
+        return [
+          k.decode("utf-8") for k, _v in self.db.iterator()
+          if not k.startswith(b"_meta:")
+        ]
+      return [k for k in self.text_profiles if not k.startswith("_meta:")]
+
   # -------------------- 健康数据口径版本（健康数据同步接口_0814.md §8）--------------------
   @staticmethod
-  def _resolve_tz(tz_name: Optional[str]) -> datetime.tzinfo:
-    """请求携带的 timezone → tzinfo；缺失/非法时回退 UTC 并告警。"""
+  def _resolve_tz(tz_name: Optional[str], warn: bool = True) -> datetime.tzinfo:
+    """请求携带的 timezone → tzinfo；缺失/非法时回退 UTC。warn=False 用于高频读路径（不刷日志）。"""
     if tz_name:
       try:
         return ZoneInfo(tz_name)
       except Exception:
-        logging.warning("invalid timezone %r, fallback to UTC", tz_name)
-    else:
+        if warn:
+          logging.warning("invalid timezone %r, fallback to UTC", tz_name)
+    elif warn:
       logging.warning("health sync without timezone, fallback to UTC")
     return datetime.timezone.utc
 
@@ -736,14 +780,23 @@ class UserProfileServ:
     profile: Optional[UserProfile],
     health_schema_version: Optional[int] = None,
     timezone: Optional[str] = None,
+    language: Optional[str] = None,
   ) -> UserProfile:
     """Apply non-LLM profile updates. Must be called while holding self.lock.
 
     Returns the profile object that should be saved.
     """
+    # 记录最近请求环境：每日 LLM 触发门的自然日口径 + 分析文案语言
+    self._note_request_meta(new_profile, timezone, language)
+    if profile is not None:
+      self._note_request_meta(profile, timezone, language)
+
     if profile is None:
       new_profile.profile = self._merge_personal_profile(None, new_profile.profile)
       self._apply_health_schema_update(new_profile, new_profile, health_schema_version, timezone)
+      # 新画像也要把本批 plays 的 sop_start 聚合进 mindora_record，
+      # 否则首包场景事件丢失，most_used_scene 永远为空
+      self._update_mindora_record(new_profile, new_profile)
       self._update_scene_stats(new_profile)
       self._update_best_scene_by_sleep_quality(new_profile)
       self._update_night_hr_range(new_profile)
@@ -804,6 +857,7 @@ class UserProfileServ:
     skip_sleep_analysis_update: bool = False,
     health_schema_version: Optional[int] = None,
     timezone: Optional[str] = None,
+    language: Optional[str] = None,
   ) -> bool:
     """写入用户行为（仅更新单个用户数据）.
 
@@ -820,7 +874,7 @@ class UserProfileServ:
       profile = self.get_profile(uid)
       old_profile = profile
       profile = self._apply_basic_update(
-        uid, new_profile, profile, health_schema_version, timezone,
+        uid, new_profile, profile, health_schema_version, timezone, language,
       )
       # For newly created profiles there is no old profile; use the new profile
       # object as the old-profile reference so calc_* helpers can read defaults.
@@ -848,6 +902,7 @@ class UserProfileServ:
     new_profile: UserProfile,
     health_schema_version: Optional[int] = None,
     timezone: Optional[str] = None,
+    language: Optional[str] = None,
   ) -> bool:
     """Persist basic profile changes without LLM work. Fast path for HTTP update_profile."""
     if new_profile is None or uid is None or not isinstance(uid, str):
@@ -856,7 +911,7 @@ class UserProfileServ:
 
     with self.lock:
       profile = self.get_profile(uid)
-      profile = self._apply_basic_update(uid, new_profile, profile, health_schema_version, timezone)
+      profile = self._apply_basic_update(uid, new_profile, profile, health_schema_version, timezone, language)
       self.save_profile(uid, profile)
       logging.info("Profile basic updated uid=%s", uid)
       return True
