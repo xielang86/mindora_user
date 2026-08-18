@@ -15,6 +15,7 @@ from zoneinfo import ZoneInfo
 
 from pydantic import ValidationError
 
+from analysis_fallback import build_fallback_insight, build_fallback_report
 from llm import extract_sleep_context
 from user_profile import (
   UserProfile, SleepInsightReport, AnalysisTextReport,
@@ -95,7 +96,16 @@ class AnalysisContentService:
     """
     existing = profile.sleep_insight
     now = int(time.time())
-    if existing and existing.generated_at:
+    if not profile.sleep_data:
+      # 零睡眠记录：模板兜底（通用建议 + Mindora 引导，不烧 LLM）。
+      # 已有内容（兜底或真实报告）一律保留——幂等；真实数据到达后由下方 LLM 分支替换兜底。
+      if existing is not None:
+        return existing
+      return build_fallback_insight(
+        profile, _profile_language(profile),
+        _today_in_tz(profile.last_request_timezone).isoformat(), now,
+      )
+    if existing and existing.generated_at and existing.llm_used:
       newest_sleep_ts = max(
         (int(r.timestamp or 0) for r in (profile.sleep_data or [])), default=0,
       )
@@ -103,6 +113,7 @@ class AnalysisContentService:
       if not has_new_night and now - existing.generated_at < 7 * 86400:
         logging.info(f"sleep_insight still fresh for uid={uid}, skipping LLM")
         return existing
+    # existing 是兜底（llm_used=False）→ 有真实夜晚了，继续走 LLM 替换之
 
     if not self.llm or not self.llm.enabled:
       return existing
@@ -193,24 +204,47 @@ class AnalysisContentService:
     语言：Profile.language 优先，其次最近请求语言，兜底 en；周期日期按画像最近请求时区（缺省 UTC）。
     LLM 不可用或全部失败时返回 None（调用方保留旧数据）。
     """
-    if not self.llm or not self.llm.enabled:
-      return None
-
     language = language or _profile_language(profile)
     tz_name = profile.last_request_timezone
     existing = profile.analysis_reports or {}
     reports: dict = {key: list(existing.get(key) or []) for key in ANALYSIS_REPORT_KEYS}
     now = int(time.time())
     changed = False
+    specs = self._analysis_specs_for_today(tz_name)
 
-    for request_type, start_date, end_date, date, modules in self._analysis_specs_for_today(tz_name):
-      # 当前周期已有报告 → 复用，不重复调 LLM
-      def _is_current(r: AnalysisTextReport) -> bool:
+    def _current_report(request_type: str, start_date, end_date, date) -> Optional[AnalysisTextReport]:
+      for r in reports[request_type]:
         if start_date is not None:
-          return r.start_date == start_date and r.end_date == end_date
-        return r.date == date and r.start_date is None
+          if r.start_date == start_date and r.end_date == end_date:
+            return r
+        elif r.date == date and r.start_date is None:
+          return r
+      return None
 
-      if any(_is_current(r) for r in reports[request_type]):
+    if not profile.sleep_data:
+      # 零睡眠记录：为缺失的当前周期 upsert 模板兜底报告（llm_used=False），不调用 LLM。
+      # 幂等只补缺；数据到达后由下方分支（兜底不视为可复用的当前报告）替换为真实报告。
+      for request_type, start_date, end_date, date, _m in specs:
+        if _current_report(request_type, start_date, end_date, date) is not None:
+          continue
+        report = build_fallback_report(
+          request_type, profile, language,
+          date=date, start_date=start_date, end_date=end_date, now=now,
+        )
+        reports[request_type] = self._upsert_analysis_report(
+          reports[request_type], report, ANALYSIS_REPORT_RETENTION[request_type],
+        )
+        changed = True
+      return reports if changed else None
+
+    if not self.llm or not self.llm.enabled:
+      return None
+
+    for request_type, start_date, end_date, date, modules in specs:
+      # 当前周期已有真实报告 → 复用，不重复调 LLM；
+      # 兜底报告（llm_used=False）不算——有数据了就生成真报告替换之（同周期 upsert 覆盖）
+      current = _current_report(request_type, start_date, end_date, date)
+      if current is not None and current.llm_used:
         continue
 
       class _FakeData:
@@ -249,6 +283,25 @@ class AnalysisContentService:
       changed = True
 
     return reports if changed else None
+
+  def ensure_fallback_content(self, uid: str, profile: UserProfile) -> bool:
+    """读路径（/analysis）零睡眠记录用户：即时补齐缺失的兜底内容（模板，无 LLM 成本），
+    让首次请求就能见到建议；有真实数据后由 calc_* 的 LLM 分支自然替换。
+
+    幂等只补缺：已有兜底/真实内容一概不动。返回是否有改动（调用方决定是否落库）。
+    """
+    if profile.sleep_data:
+      return False
+    changed = False
+    insight = self.calc_sleep_insight(uid, profile)
+    if insight is not None and insight is not profile.sleep_insight:
+      profile.sleep_insight = insight
+      changed = True
+    reports = self.calc_analysis_reports(uid, profile)
+    if reports is not None:
+      profile.analysis_reports = reports
+      changed = True
+    return changed
 
   @staticmethod
   def _find_analysis_report(

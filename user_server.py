@@ -302,7 +302,9 @@ class UserServer:
     返回 (是否需要, 最新夜晚 ts)。状态全部来自持久化画像，重启后判定不变：
       - 有夜晚但从未生成过日报告 → 需要
       - 最新夜晚日期 > 最新日报告日期 → 需要（醒来了新的一天）
-      - 最新夜晚日期 == 最新日报告日期 → 不需要（今天的已生成，零散包不重复烧 LLM）
+      - 最新夜晚日期 == 最新日报告日期，但最新报告是零数据兜底（llm_used=False）
+        → 需要（第一晚到达同日，兜底应被真分析替换）
+      - 最新夜晚日期 == 最新真实日报告日期 → 不需要（今天的已生成，零散包不重复烧 LLM）
     """
     newest_ts = self._newest_sleep_ts(profile)
     if newest_ts is None:
@@ -310,10 +312,18 @@ class UserServer:
     tz = UserProfileServ._resolve_tz(getattr(profile, "last_request_timezone", None), warn=False)
     newest_night = datetime.datetime.fromtimestamp(newest_ts, tz).date().isoformat()
     day_reports = (profile.analysis_reports or {}).get("analysis_sleep_day") or []
-    latest_report_date = max((r.date for r in day_reports if r.date), default=None)
-    if latest_report_date is None:
+    latest_report = max(
+      (r for r in day_reports if r.date),
+      key=lambda r: (r.date, r.generated_at or 0),
+      default=None,
+    )
+    if latest_report is None:
       return True, newest_ts
-    return newest_night > latest_report_date, newest_ts
+    if newest_night > latest_report.date:
+      return True, newest_ts
+    if not latest_report.llm_used:
+      return True, newest_ts
+    return False, newest_ts
 
   async def _maybe_schedule_llm_update(
     self,
@@ -481,6 +491,16 @@ class UserServer:
         self.user_serv.note_request_meta, uid, req.data.timezone, req.data.language,
       )
       profile = await asyncio.to_thread(self.user_serv.get_profile, uid)
+
+      # 零睡眠记录用户：读路径即时补齐兜底建议（模板，无 LLM 成本），
+      # 首次请求就能见到内容；有真实数据后由后台 LLM 更新自然替换（兜底 llm_used=False）
+      if profile is not None and not profile.sleep_data:
+        fallback_changed = await asyncio.to_thread(
+          self.user_serv.content.ensure_fallback_content, uid, profile,
+        )
+        if fallback_changed:
+          await asyncio.to_thread(self.user_serv.save_profile, uid, profile)
+
       response_data = self._build_analysis_data(req, profile)
 
       # 读路径懒触发：有未分析的新夜晚 → 立即后台生成（本次先回骨架，
