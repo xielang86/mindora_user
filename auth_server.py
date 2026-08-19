@@ -3,6 +3,8 @@ import hashlib
 import secrets
 import jwt
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from auth import AuthRequest, AuthResponse, AuthRequestType, JWTTokenData, AuthData
@@ -772,21 +774,20 @@ def redeem_redemption_code_handler(data: AuthData) -> AuthResponse:
 
 
 def report_subscription_handler(data: AuthData) -> AuthResponse:
-  """report_subscription（高级会员体验期接口.md §4 方案A）：
-  客户端 StoreKit 购买成功后上报；仅 Basic 档 product_id 触发第②段体验期盖章。"""
+  """report_subscription（高级会员体验期接口.md §4 方案A + §5.1）：
+
+  - 客户端不过滤档位，Premium/未知 product_id 同样上报（§5.1③）：一律归档
+    subscription_reports 供 Apple 对账，仅 Basic 档触发第②段体验期盖章；
+  - ⚠️ 客户端对 4xx / 业务码非 0 的处理是「出队不再重试」（§5.1②）：参数/业务错误
+    必须返回 HTTP 200 + code != 0，绝不能回 4xx（这笔上报会永久丢失）；db 内部错误
+    （5xx）仍回 HTTP 500——客户端会保留队列重试，不该丢。
+  """
   payload = decode_access_token(data.jwt_token)
   uid = payload.get("uid")
   product_id = (data.product_id or "").strip()
-
-  if product_id not in Config.BASIC_SUBSCRIPTION_PRODUCT_IDS:
-    # Premium 档（已是 Premium）或未知产品：不触发体验期，原样返回当前会员状态
+  grant_trial = product_id in Config.BASIC_SUBSCRIPTION_PRODUCT_IDS
+  if not grant_trial:
     logging.info("report_subscription: product_id=%s not eligible for trial, uid=%s", product_id, uid)
-    return AuthResponse(
-      request_type=AuthRequestType.REPORT_SUBSCRIPTION,
-      code=0,
-      msg="product not eligible for premium trial",
-      data=get_user_rights_info(uid),
-    )
 
   purchased_at = datetime.fromtimestamp(data.purchased_at) if data.purchased_at else None
   result = report_subscription(
@@ -795,9 +796,19 @@ def report_subscription_handler(data: AuthData) -> AuthResponse:
     product_id=product_id,
     original_transaction_id=data.original_transaction_id,
     purchased_at=purchased_at,
+    grant_trial=grant_trial,
   )
   if result["code"] != 0:
-    raise HTTPException(status_code=result["code"], detail=result["msg"])
+    if result["code"] >= 500:
+      # 服务端内部错误：回 5xx 让客户端保留队列、下次登录/回前台重试
+      raise HTTPException(status_code=result["code"], detail=result["msg"])
+    # 参数/业务错误（400/403/404）：HTTP 200 + code != 0——重试无意义，但绝不回 4xx
+    return AuthResponse(
+      request_type=AuthRequestType.REPORT_SUBSCRIPTION,
+      code=result["code"],
+      msg=result["msg"],
+      data=None,
+    )
   logging.info(
     "report_subscription: uid=%s product_id=%s txn=%s trial_granted=%s",
     uid, product_id, data.original_transaction_id,
@@ -945,6 +956,29 @@ async def unhandled_exception_handler(request, exc):
     status_code=500,
     content={"code": 500, "msg": "internal server error", "detail": str(exc)},
   )
+
+
+@app.exception_handler(RequestValidationError)
+async def request_validation_exception_handler(request: Request, exc: RequestValidationError):
+  """参数校验失败默认 422；report_subscription 例外（高级会员体验期接口.md §5.1②）：
+  客户端对 4xx 的处理是「出队不再重试」——422 会让这笔购买上报永久丢失、
+  该用户第②段体验期再也不会触发，统一改回 HTTP 200 + code=400。"""
+  try:
+    body = await request.json()
+  except Exception:
+    body = None
+  if isinstance(body, dict) and body.get("request_type") == AuthRequestType.REPORT_SUBSCRIPTION.value:
+    logging.warning("report_subscription param validation failed: %s", exc)
+    return JSONResponse(
+      status_code=200,
+      content=AuthResponse(
+        request_type=AuthRequestType.REPORT_SUBSCRIPTION,
+        code=400,
+        msg="invalid request params",
+        data=None,
+      ).model_dump(mode="json"),
+    )
+  return JSONResponse(status_code=422, content=jsonable_encoder({"detail": exc.errors()}))
 
 @app.get("/auth/wechat/qrcode")
 async def wechat_qrcode():

@@ -624,14 +624,16 @@ def report_subscription(
   product_id: str,
   original_transaction_id: str,
   purchased_at: datetime | None,
+  *,
+  grant_trial: bool = True,
 ) -> dict:
-  """report_subscription（高级会员体验期接口.md §4）：客户端首次购买 Basic 后上报。
+  """report_subscription（高级会员体验期接口.md §4 方案A + §5.1③）：客户端购买成功后上报。
 
   - basic_purchase_trial_end_at IS NULL 才写 NOW()+PREMIUM_TRIAL_DAYS（第②段体验期，
     幂等全靠 NULL 守卫，客户端重复上报无害，与第①段是否有效无关、不做衔接）；
-  - 每次上报都留档 subscription_reports（original_transaction_id 供 Apple 对账）。
-
-  product_id 档位校验在调用方（auth_server）完成，这里假定已是 Basic 档。
+  - **每次上报都留档** subscription_reports（original_transaction_id 供 Apple 对账）——
+    客户端不过滤档位，Premium/未知 product_id 同样上报（§5.1③），一律归档；
+  - grant_trial=False（非 Basic 档）时只归档、不盖章。
   """
   if not uid or not product_id or not original_transaction_id:
     return {"code": 400, "msg": "uid/product_id/original_transaction_id are required", "data": None}
@@ -662,7 +664,7 @@ def report_subscription(
         return {"code": 403, "msg": "user is not active", "data": None}
 
       trial_granted = False
-      if user_row.get("basic_purchase_trial_end_at") is None:
+      if grant_trial and user_row.get("basic_purchase_trial_end_at") is None:
         new_trial_end = now + timedelta(days=PREMIUM_TRIAL_DAYS)
         cursor.execute(
           """
@@ -691,7 +693,12 @@ def report_subscription(
       user_row.get("user_level"), user_row.get("level_end_at"), now=now, trial_end_at=trial_end_at,
     )
     rights_payload["trial_granted"] = trial_granted
-    msg = "premium trial granted" if trial_granted else "subscription reported (trial already granted before)"
+    if not grant_trial:
+      msg = "product not eligible for premium trial (report archived)"
+    elif trial_granted:
+      msg = "premium trial granted"
+    else:
+      msg = "subscription reported (trial already granted before)"
     return {"code": 0, "msg": msg, "data": rights_payload}
   except Exception as e:
     if conn:

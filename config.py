@@ -58,10 +58,10 @@ class Config:
   ARK_MODEL = "doubao-seed-2-0-lite-260215"
   # kimi 方向：key=KIMI_API_KEY（env），model 可用 KIMI_MODEL（env）覆盖
   KIMI_API_BASE = "https://api.moonshot.cn/v1/chat/completions"
-  KIMI_MODEL = "moonshot-v1-8k"
+  KIMI_MODEL = "kimi-k2-0905-preview"
   # 模型路由：request_type → 方向名，"default" 兜底；
   # 所选方向不可用（缺 key）时自动降级到第一个可用方向（见 llm/router.py）
-  LLM_ROUTING = {"default": "volc_ark"}
+  LLM_ROUTING = {"default": "kimi"}
 
   # 同一用户两次 LLM 后台更新之间的最小间隔（秒）
   LLM_UPDATE_COOLDOWN_SECONDS = 300

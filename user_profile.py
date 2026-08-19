@@ -20,10 +20,19 @@ class BaseResponse(BaseModel):
 class Address(BaseModel):
   id: str = Field(..., description="地址唯一 ID")
   is_default: bool = Field(..., description="是否默认地址")
-  region: str = Field(..., description="省市区或区域信息")
-  detail: str = Field(..., description="详细地址")
+  region: str = Field(..., description="兼容字段：国家名+state+city+district 拼出的展示串，勿用于发货、勿解析")
+  detail: str = Field(..., description="兼容字段：street1+street2+zip 拼出的展示串，勿用于发货")
   name: str = Field(..., description="收件人姓名")
-  phone: str = Field(..., description="收件人电话")
+  phone: str = Field(..., description="收件人电话，E.164 格式（带 + 与国际区号）")
+  # 结构化字段（同步商城发货用；存量地址/老客户端可能缺失，全部选填）
+  country_code: Optional[str] = Field(None, description="国家/地区，ISO 3166-1 alpha-2（US/CN/GB）")
+  state_code: Optional[str] = Field(None, description="州/省代码：美/加两位字母码（CA），中国民政部数字省级码（33）")
+  state: Optional[str] = Field(None, description="州/省显示名（面单打印值）")
+  city: Optional[str] = Field(None, description="城市")
+  district: Optional[str] = Field(None, description="区/县（仅中国等三级行政区划国家填）")
+  street1: Optional[str] = Field(None, description="街道地址（门牌号 + 街道名）")
+  street2: Optional[str] = Field(None, description="门牌/套间/单元，选填")
+  zip: Optional[str] = Field(None, description="邮编（美国必填 \\d{5} 或 \\d{5}-\\d{4}；无邮编国家为空）")
 
 class Profile(BaseModel):
   nickname: Optional[str] = Field("", description="昵称")
@@ -377,10 +386,19 @@ class GiftDelivery(BaseModel):
   type: str = Field(..., description="physical（实体寄地址）/ virtual（发邮箱）")
   address_id: Optional[str] = Field(None, description="客户端本地地址簿 ID，服务端不认识，仅作日志参考")
   name: Optional[str] = Field(None, description="收件人姓名（physical）")
-  phone: Optional[str] = Field(None, description="收件人电话（physical）")
-  region: Optional[str] = Field(None, description="省市区，可能为空串（physical）")
-  detail: Optional[str] = Field(None, description="详细地址（physical）")
+  phone: Optional[str] = Field(None, description="收件人电话，E.164 格式（physical）")
+  region: Optional[str] = Field(None, description="兼容展示串：国家名+state+city+district，勿用于发货（physical）")
+  detail: Optional[str] = Field(None, description="兼容展示串：street1+street2+zip，勿用于发货（physical）")
   email: Optional[str] = Field(None, description="接收邮箱（virtual）")
+  # 结构化字段（physical，与 address_list 元素一致；发货以这些为准，老客户端快照可能缺失）
+  country_code: Optional[str] = Field(None, description="国家/地区，ISO 3166-1 alpha-2（physical）")
+  state_code: Optional[str] = Field(None, description="州/省代码：美/加字母码，中国数字省级码（physical）")
+  state: Optional[str] = Field(None, description="州/省显示名（physical）")
+  city: Optional[str] = Field(None, description="城市（physical）")
+  district: Optional[str] = Field(None, description="区/县，仅中国填（physical）")
+  street1: Optional[str] = Field(None, description="街道地址（physical）")
+  street2: Optional[str] = Field(None, description="门牌/套间，选填（physical）")
+  zip: Optional[str] = Field(None, description="邮编（physical）")
 
 class SurveySubmission(BaseModel):
   """一次问卷提交记录；同一 uid+survey_id 幂等，存于 UserProfile.survey_submissions"""
