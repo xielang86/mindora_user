@@ -56,9 +56,10 @@ class Config:
   # volc_ark 方向：key=ARK_API_KEY（env），endpoint=ARK_ENDPOINT_ID（env）
   ARK_API_BASE = "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
   ARK_MODEL = "doubao-seed-2-0-lite-260215"
-  # kimi 方向：key=KIMI_API_KEY（env），model 可用 KIMI_MODEL（env）覆盖
-  KIMI_API_BASE = "https://api.moonshot.cn/v1/chat/completions"
-  KIMI_MODEL = "kimi-k2-0905-preview"
+  # kimi 方向（Anthropic Messages 协议）：Kimi 编程订阅端点，key=KIMI_API_KEY（env）
+  # base/model 可用 KIMI_API_BASE / KIMI_MODEL（env）覆盖；base 不含 /v1/messages（SDK 自动拼）
+  KIMI_API_BASE = "https://api.kimi.com/coding"
+  KIMI_MODEL = "kimi-k3"
   # 模型路由：request_type → 方向名，"default" 兜底；
   # 所选方向不可用（缺 key）时自动降级到第一个可用方向（见 llm/router.py）
   LLM_ROUTING = {"default": "kimi"}

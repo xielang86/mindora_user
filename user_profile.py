@@ -17,6 +17,20 @@ class BaseResponse(BaseModel):
   msg: str = ""
 
 # -------------------------- 子模型定义（对应data下一级字段的嵌套结构） --------------------------
+# 播放统计（behaviors.plays → mindora_record）支持的内容 cmd 前缀：
+# 引导式场景 SOP（sleep.scene.）+ 纯音乐（sleep.pure_music.；裸 pure_music. 兼容端上早期上报）。
+# 推荐侧（llm/reco.py）仍只推引导式场景，不受此影响。
+SCENE_CMD_PREFIXES = ("sleep.scene.", "sleep.pure_music.", "pure_music.")
+
+
+def short_scene_id(scene_id: str) -> str:
+  """播放 cmd（可带 SCENE_CMD_PREFIXES 前缀）→ 短 id，用于展示名与统计键归一。"""
+  for prefix in SCENE_CMD_PREFIXES:
+    if scene_id.startswith(prefix):
+      return scene_id[len(prefix):]
+  return scene_id
+
+
 class Address(BaseModel):
   id: str = Field(..., description="地址唯一 ID")
   is_default: bool = Field(..., description="是否默认地址")
@@ -134,6 +148,11 @@ class SleepResult(BaseModel):
   # 无法归属到具体阶段的整晚事件（如卧床前的环境光、夜间离床等）
   night_events: List[NightEvent] = Field(default_factory=list, description="整晚环境/设备事件（噪音、对话、屏幕、光感、干预、离床等）")
 
+  # 来源标记：None=客户端（Mindora 设备/App）直接上报；"healthkit"=服务端从健康
+  # behaviors 序列合成（sleep_session_builder）。合成行在同晚修正值到达时被重算覆盖，
+  # 且与同晚设备上报行共存时让位（设备数据更准）
+  source: Optional[str] = Field(None, description="记录来源：None=客户端上报；healthkit=服务端合成")
+
   @property
   def sequence_summaries(self):
     awake_types = {}
@@ -240,7 +259,7 @@ def compute_recent_sleep_stats(profile: "UserProfile", days: int = 7) -> Dict[st
   for scene_key, records in (profile.mindora_record or {}).items():
     if not isinstance(records, list) or not records:
       continue
-    title = scene_key.replace("sleep.scene.", "").replace("_", " ").title()
+    title = short_scene_id(scene_key).replace("_", " ").title()
     for entry in records:
       if isinstance(entry, (list, tuple)) and len(entry) >= 1:
         try:
@@ -560,6 +579,13 @@ class UserProfile(BaseModel):
   # update_profile 时按请求 timezone 把 behaviors 时间戳归日写入；缺省/老数据按 1 处理。
   # 对账接口 query_health_sync_state 据此回答版本，"有哪些天"则按 behaviors 实际数据现算。
   health_sync_days: Dict[str, int] = Field(default_factory=dict)
+
+  # 画像变更版本号：服务端维护、单调递增，每次 save_profile 落盘前 +1（谁改的都会
+  # 触发：App update、设备 update、后台 LLM 写回、读路径补缺）。设备端用
+  # query_revision 做 3s 轻量探测，变了才全量 query_profile；自己推云成功后记下响应
+  # 里的新 revision 做回显过滤。客户端只读——update 时客户端携带的值被忽略
+  # （合并分支不拷贝此字段，新建分支重置为 0，见 _apply_basic_update）。
+  revision: int = Field(0, description="画像版本号（服务端维护，单调递增；query_revision 探测用）")
 
   # only the recent 7 days sleep data will be returned to app, and used for sleep analysis and advice generation, such as the data of yestoday night
   sleep_data:  List[SleepResult] = Field(default_factory=list)

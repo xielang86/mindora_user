@@ -11,7 +11,7 @@ import datetime
 from typing import Optional
 
 from analysis_content import AnalysisContentService
-from user_profile import UserProfile, compute_recent_sleep_stats
+from user_profile import UserProfile, compute_recent_sleep_stats, short_scene_id
 
 
 def get_overall_score(profile: UserProfile) -> Optional[float]:
@@ -58,7 +58,7 @@ def _scene_stats(days: int, profile: Optional[UserProfile]) -> dict:
 
 def _scene_display(scene_id: str) -> tuple[str, str]:
   """scene_id（可带 sleep.scene. 前缀）→ (short_id, 展示名)。"""
-  short_id = scene_id.replace("sleep.scene.", "")
+  short_id = short_scene_id(scene_id)
   return short_id, short_id.replace("_", " ").title()
 
 

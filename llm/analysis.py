@@ -131,23 +131,51 @@ def deep_merge(base: dict, updates: dict) -> None:
 # Prompt templates  (text fields only — no numeric placeholders)
 # ──────────────────────────────────────────────────────────────
 
-_SYSTEM = (
+_SYSTEM_TEMPLATE = (
     "You are a professional sleep health analyst for the Mindora app. "
     "Analyze the provided sleep data and return ONLY a JSON object — "
     "no markdown fences, no explanation, no trailing text. "
-    "All string values must be written in the language specified. "
+    "All string values must be written in {lang}. "
+    "This overrides the language of the prompt itself. "
     "Keep every description to 1–2 sentences, warm and encouraging in tone."
 )
 
+_LANG_NAMES = {
+    "zh-Hans": "简体中文", "zh-Hant": "繁體中文",
+    "en": "English", "ja": "日本語", "ko": "한국어",
+    "de": "Deutsch", "fr": "Français", "it": "Italiano",
+    "es": "Español", "id": "Bahasa Indonesia",
+}
+
+def _lang_name(language: str) -> str:
+    return _LANG_NAMES.get(language, "English")
+
 def _lang_instruction(language: str) -> str:
-    names = {
-        "zh-Hans": "简体中文", "zh-Hant": "繁體中文",
-        "en": "English", "ja": "日本語", "ko": "한국어",
-        "de": "Deutsch", "fr": "Français", "it": "Italiano",
-        "es": "Español", "id": "Bahasa Indonesia",
-    }
-    lang_name = names.get(language, "English")
-    return f"Language for all text values: {lang_name} ({language})."
+    return f"Language for all text values: {_lang_name(language)} ({language})."
+
+def _system_prompt(language: str) -> str:
+    """system prompt 里点名具体语言（比泛泛的 'the language specified' 约束力强）。"""
+    return _SYSTEM_TEMPLATE.format(lang=f"{_lang_name(language)} ({language})")
+
+def _lang_closing(language: str) -> str:
+    """prompt 末尾重申输出语言：prompt 主体（数据/规则/schema 示例）全是英文，
+    仅靠开头一行指令模型偶尔会整篇漂成英文，利用近因效应在末尾再压一次。"""
+    return (
+        f"\n\nIMPORTANT: Write ALL text values in {_lang_name(language)} ({language}), "
+        "including titles, content and evidence."
+    )
+
+_CJK_RE = re.compile(r"[一-鿿぀-ヿ가-힯]")
+
+def _language_matches(result: dict, language: str) -> bool:
+    """输出语言校验：CJK 语言请求的结果必须含 CJK 字符。
+
+    K3 在英文主导的 prompt 下会随机整篇漂成英文（prompt 加固只能降低概率），
+    服务端校验 + 重试兜底；非 CJK 语言不校验（拉丁/英文之间漂移不判）。
+    """
+    if not language.startswith(("zh", "ja", "ko")):
+        return True
+    return bool(_CJK_RE.search(json.dumps(result, ensure_ascii=False)))
 
 
 def _prompt_overview(ctx: dict) -> str:
@@ -427,7 +455,7 @@ class SleepAnalysisLLM:
 
     # ── internal ──────────────────────────────────────────────
 
-    async def _call(self, user_prompt: str, request_type: str = "default") -> Optional[str]:
+    async def _call(self, user_prompt: str, request_type: str = "default", language: str = "en") -> Optional[str]:
         """Run a blocking LLM call in a thread pool."""
         if not self.enabled:
             return None
@@ -437,7 +465,7 @@ class SleepAnalysisLLM:
 
         def _invoke() -> str:
             resp = model.invoke([
-                SystemMessage(content=_SYSTEM),
+                SystemMessage(content=_system_prompt(language)),
                 HumanMessage(content=user_prompt),
             ])
             return resp.content
@@ -496,8 +524,17 @@ class SleepAnalysisLLM:
         if prompt_fn is None:
             return None
 
-        raw = await self._call(prompt_fn(), request_type)
-        return self._parse(raw)
+        prompt = prompt_fn() + _lang_closing(language)
+        for attempt in (1, 2):
+            raw = await self._call(prompt, request_type, language)
+            result = self._parse(raw)
+            if result is None:
+                return None  # 调用失败/非 JSON：不重试，走兜底
+            if _language_matches(result, language):
+                return result
+            logging.warning("LLM output not in %s (request_type=%s), retry %d/2", language, request_type, attempt)
+        logging.error("LLM output language mismatch (%s, request_type=%s) after retry, using fallback", language, request_type)
+        return None
 
     def generate_sync(
         self,
@@ -533,12 +570,21 @@ class SleepAnalysisLLM:
         if model is None:
             return None
 
-        try:
-            resp = model.invoke([
-                SystemMessage(content=_SYSTEM),
-                HumanMessage(content=prompt_fn()),
-            ])
-            return self._parse(resp.content)
-        except Exception as e:
-            logging.error("LLM sync call error: %s", e)
-            return None
+        prompt = prompt_fn() + _lang_closing(language)
+        for attempt in (1, 2):
+            try:
+                resp = model.invoke([
+                    SystemMessage(content=_system_prompt(language)),
+                    HumanMessage(content=prompt),
+                ])
+                result = self._parse(resp.content)
+            except Exception as e:
+                logging.error("LLM sync call error: %s", e)
+                return None
+            if result is None:
+                return None  # 非 JSON：不重试，走兜底
+            if _language_matches(result, language):
+                return result
+            logging.warning("LLM output not in %s (request_type=%s), retry %d/2", language, request_type, attempt)
+        logging.error("LLM output language mismatch (%s, request_type=%s) after retry, using fallback", language, request_type)
+        return None

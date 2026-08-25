@@ -16,6 +16,7 @@ from pydantic import BaseModel, ValidationError
 from aiohttp import ClientSession, web
 
 import analysis_builders
+import profile_query_gate
 from analysis_content import AnalysisContentService
 from config import Config
 from common.jwt_keys import verify_token
@@ -69,6 +70,29 @@ class UserServer:
         k: len(v) if isinstance(v, list) else v for k, v in up["behaviors"].items()
       }
     return data
+
+  @staticmethod
+  def _update_summary_for_log(up) -> str:
+    """update_profile 请求体的一行结构摘要：只看客户端实际传了哪些键
+    （model_fields_set，决定合并语义"键不出现→保持原值"）和数据规模，
+    不打原始内容（心率序列、个人资料属隐私）。"""
+    if up is None:
+      return "user_profile=None"
+    parts = [f"keys={sorted(up.model_fields_set)}"]
+    behaviors = up.behaviors or {}
+    if behaviors:
+      parts.append("behaviors={" + ",".join(
+        f"{k}:{len(v)}" if isinstance(v, list) else str(k)
+        for k, v in behaviors.items()
+      ) + "}")
+    sd = up.sleep_data or []
+    if sd:
+      latest = max((int(r.timestamp or 0) for r in sd), default=0)
+      parts.append(f"sleep_data={len(sd)}晚 latest_ts={latest}")
+    prof = getattr(up, "profile", None)
+    if prof is not None:
+      parts.append(f"profile_keys={sorted(prof.model_fields_set)}")
+    return " ".join(parts)
 
   def __init__(self):
     self.server_semaphore = asyncio.Semaphore(Config.MaxServerConcurrent)
@@ -173,6 +197,15 @@ class UserServer:
     if uid is None:
       return InvalidOrExpiredTokenResp()
 
+    # uid 时段黑名单（profile_query_gate）：名单内的 uid 只在允许时段可拉全量画像，
+    # 时段外直接 403；update_profile / query_revision 不受影响
+    if not profile_query_gate.is_query_allowed(uid):
+      logging.warning("query_profile denied by time gate uid=%s", uid)
+      return ProfileResponse(
+        code=403, msg="query_profile is not allowed for this uid at this time",
+        request_type=request.request_type, data=None,
+      )
+
     profile = self.user_serv.get_profile(uid)
     if profile:
       logging.info("profile found uid=%s summary=%s", uid, self.user_serv._profile_for_log(profile))
@@ -182,6 +215,24 @@ class UserServer:
       return ProfileResponse(code=0, msg=f"User with uid '{uid}' not found", request_type=request.request_type, data=None)
 
     # incr update the behaviors by time, and update long term weight
+  def handle_query_revision(self, request: ProfileRequest) -> BaseResponse:
+    """轻量变更探测：只返回画像当前 revision（几十字节）。
+
+    设备端两级刷新：3s 探测本接口，revision 与本地基线一致则不动作，变了才全量
+    query_profile + LWW 合并；300s 强制全量兜底。设备自己推云成功后以 update_profile
+    响应里的新 revision 为基线（回显过滤）。未知用户返回 revision=0。
+    """
+    if request.data is None:
+      return InvalidOrExpiredTokenResp()
+    uid = self._parse_for_uid(request.data)
+    if uid is None:
+      return InvalidOrExpiredTokenResp()
+    profile = self.user_serv.get_profile(uid)
+    return ProfileResponse(
+      code=0, msg="success", request_type=request.request_type,
+      data={"revision": profile.revision if profile else 0},
+    )
+
   def handle_query_health_sync_state(self, request: ProfileRequest) -> BaseResponse:
     """健康数据对账（健康数据同步接口_0814.md §8.4）：返回窗口内已有数据的天+口径版本。"""
     if request.data is None:
@@ -222,7 +273,16 @@ class UserServer:
       return InvalidOrExpiredTokenResp()
 
     uid = self._parse_for_uid(request.data)
-    logging.info(f"uid for update: {uid}")
+    logging.info(
+      "update_profile request uid=%s skip_reco=%s skip_analysis=%s hs_ver=%s tz=%s lang=%s | %s",
+      uid,
+      request.data.skip_sleep_scenarios_reco_update,
+      request.data.skip_sleep_analysis_update,
+      request.data.health_schema_version,
+      request.data.timezone,
+      request.data.language,
+      self._update_summary_for_log(request.data.user_profile),
+    )
 
     if uid is None:
       return InvalidOrExpiredTokenResp()
@@ -431,12 +491,16 @@ class UserServer:
         response_obj = await self.handle_update_profile(req)
         return web.json_response(response_obj.model_dump(), status=get_http_status(response_obj))
 
+      elif req.request_type == "query_revision":
+        response_obj = self.handle_query_revision(req)
+        return web.json_response(response_obj.model_dump(), status=get_http_status(response_obj))
+
       elif req.request_type == "query_health_sync_state":
         response_obj = self.handle_query_health_sync_state(req)
         return web.json_response(response_obj.model_dump(), status=get_http_status(response_obj))
 
       # client_request.md：/user_profile 只承载 query_profile / update_profile /
-      # query_health_sync_state，分析类请求统一走 /analysis，洞察报告由 analysis_explore 出口
+      # query_revision / query_health_sync_state，分析类请求统一走 /analysis，洞察报告由 analysis_explore 出口
       else:
         return web.json_response(InvalidReqFormatResp().model_dump(), status=400)
 

@@ -4,7 +4,8 @@
 api_base / model 放 config.py，api_key 一律从环境变量读取（不落地配置文件）：
 
   - volc_ark  火山方舟：key=ARK_API_KEY，endpoint=ARK_ENDPOINT_ID
-  - kimi      Kimi / Moonshot：key=KIMI_API_KEY，model 可用 KIMI_MODEL 覆盖
+  - kimi      Kimi 编程订阅（Anthropic Messages 协议）：key=KIMI_API_KEY，
+              base/model 可用 KIMI_API_BASE / KIMI_MODEL 覆盖
 
 路由规则来自 Config.LLM_ROUTING：request_type → 方向名，"default" 兜底。
 所选方向不可用（缺 key）时按注册顺序降级到第一个可用方向；全不可用返回 None，
@@ -99,12 +100,73 @@ class OpenAICompatibleChat(BaseChatModel):
         return "openai-compatible-chat"
 
 
+class AnthropicCompatibleChat(BaseChatModel):
+    """Anthropic Messages 协议客户端（Kimi 编程订阅端点 api.kimi.com/coding 等）。
+
+    与 OpenAI 协议的差异：system 是顶层字段而非一条 message；max_tokens 必填；
+    鉴权用 Authorization: Bearer（与 Claude Code 的 ANTHROPIC_AUTH_TOKEN 一致）。
+    """
+
+    api_key: str = Field(..., description="API key（Authorization: Bearer）")
+    api_base: str = Field(..., description="Anthropic base URL（SDK 自动拼 /v1/messages）")
+    model: str = Field(..., description="模型名")
+    temperature: float = Field(0.7, description="采样温度")
+    max_tokens: int = Field(8192, description="最大生成 token 数（Anthropic 协议必填）")
+
+    def _generate(
+        self,
+        messages: List[BaseMessage],
+        stop: Optional[List[str]] = None,
+        run_manager: Optional[CallbackManagerForLLMRun] = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        import anthropic
+
+        system_parts: List[str] = []
+        anthropic_messages = []
+        for msg in messages:
+            if isinstance(msg, SystemMessage):
+                system_parts.append(str(msg.content))
+            elif isinstance(msg, HumanMessage):
+                anthropic_messages.append({"role": "user", "content": msg.content})
+            elif isinstance(msg, AIMessage):
+                anthropic_messages.append({"role": "assistant", "content": msg.content})
+
+        timeout_seconds = int(os.getenv("LLM_TIMEOUT", "120"))
+        client = anthropic.Anthropic(
+            auth_token=self.api_key,  # Bearer，与 Claude Code 订阅端点约定一致
+            base_url=self.api_base,
+            timeout=timeout_seconds,
+        )
+        try:
+            resp = client.messages.create(
+                model=self.model,
+                system="\n\n".join(system_parts) if system_parts else anthropic.NOT_GIVEN,
+                messages=anthropic_messages,
+                temperature=self.temperature,
+                max_tokens=self.max_tokens,
+                stop_sequences=stop if stop else anthropic.NOT_GIVEN,
+            )
+            answer = "".join(b.text for b in resp.content if b.type == "text").strip()
+        except Exception as e:
+            status = getattr(e, "status_code", None)
+            raise RuntimeError(
+                f"调用 Anthropic 兼容 API 失败({self.api_base}): {type(e).__name__}: {e}; status_code={status}"
+            ) from e
+
+        return ChatResult(generations=[ChatGeneration(message=AIMessage(content=answer))])
+
+    @property
+    def _llm_type(self) -> str:
+        return "anthropic-compatible-chat"
+
+
 @dataclass(frozen=True)
 class LLMRoute:
     """一个请求方向：一组 key + url + model（+ 可选 endpoint_id）。"""
 
     name: str                                   # 方向名，如 volc_ark / kimi
-    kind: str                                   # "volc_ark" | "openai"（OpenAI 兼容协议）
+    kind: str                                   # "volc_ark" | "openai"（OpenAI 兼容协议）| "anthropic"（Anthropic Messages 协议）
     api_key: Optional[str]                      # 来自环境变量
     api_base: str                               # 来自 config.py
     model: str                                  # 来自 config.py（可被环境变量覆盖）
@@ -138,9 +200,9 @@ class ModelRouter:
             ),
             "kimi": LLMRoute(
                 name="kimi",
-                kind="openai",
+                kind="anthropic",  # Kimi 编程订阅端点是 Anthropic Messages 协议
                 api_key=os.getenv("KIMI_API_KEY"),
-                api_base=Config.KIMI_API_BASE,
+                api_base=os.getenv("KIMI_API_BASE") or Config.KIMI_API_BASE,
                 model=os.getenv("KIMI_MODEL") or Config.KIMI_MODEL,
             ),
         }
@@ -193,6 +255,13 @@ class ModelRouter:
                 endpoint_id=route.endpoint_id or "",
                 model=route.model,
                 api_base=route.api_base,
+                temperature=temp,
+            )
+        if route.kind == "anthropic":
+            return AnthropicCompatibleChat(
+                api_key=route.api_key,
+                api_base=route.api_base,
+                model=route.model,
                 temperature=temp,
             )
         return OpenAICompatibleChat(

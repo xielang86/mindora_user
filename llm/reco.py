@@ -13,7 +13,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from llm.ark_chat import VolcEngineArkChat
 from llm.router import ModelRouter
-from user_profile import UserProfile, SleepScenario
+from user_profile import UserProfile, SleepScenario, short_scene_id
 
 
 # 仓库根目录（本文件在 llm/ 包内，db/ 和 data/ 在仓库根）
@@ -325,7 +325,7 @@ def _fallback_scenarios() -> List[SleepScenario]:
 
 def _default_sop_candidates() -> List[str]:
     profile_candidates = [
-        key.replace("sleep.scene.", "")
+        short_scene_id(key)
         for key in UserProfile().mindora_record.keys()
     ]
     return list(dict.fromkeys(profile_candidates))

@@ -31,7 +31,7 @@ from common import util
 from config import Config
 from engagement_service import EngagementService
 from llm import SleepAnalysisLLM
-from user_profile import UserProfile, SleepScenario, Profile
+from user_profile import UserProfile, SleepScenario, Profile, SCENE_CMD_PREFIXES, short_scene_id
 
 run_dir = os.getenv("RUN_DIR") or os.path.dirname(os.path.abspath(__file__))
 
@@ -43,13 +43,19 @@ class UserProfileServ:
   MAX_SLEEP_DATA_LEN = 30
 
   # ── 健康数据口径版本（健康数据同步接口_0814.md §8）─────────────────────
-  # v2 新增/改名的 key：一晚只有几~几十个点（已裁剪到睡眠跨度），上限对齐
-  # md 客户端单切片上限 5000（约覆盖 100 晚），否则对账窗口稍长就被截断失真。
-  # 未列出的 key（v1 全天序列、plays/clicks 等）沿用 MAX_BEHAVIOR_LEN。
+  # md §3 字段表全集（v2 现役口径）：一晚只有几~几十个点（已裁剪到睡眠跨度），
+  # 上限对齐 md 客户端单切片上限 5000（约覆盖 100 晚），否则对账窗口稍长就被截断
+  # 失真——deep/rem/light 一晚 5~30 段，100 上限连 30 天首同步窗口都装不下，
+  # 截断后 §8.4 对账会谎报"这些天没数据"（天从 behaviors 现算）导致客户端无限重传，
+  # 服务端合成 SleepResult 也会丢阶段。v1 废弃 key（heart_rate 等）与 plays/clicks
+  # 等交互行为沿用 MAX_BEHAVIOR_LEN。
+  # 注意 sleep_stage_light 同时属于 HEALTH_V1_DEPRECATED_KEYS（v1 语义混入
+  # unspecified，v2 批次覆盖当天要 purge 旧样本）——两个集合职责不同，不冲突。
   HEALTH_V2_BEHAVIOR_KEYS = {
     "sleep_heart_rate_min", "sleep_heart_rate_max",
     "sleep_heart_rate_variability_sdnn", "sleep_respiratory_rate",
-    "sleep_body_temperature",
+    "resting_heart_rate", "sleeping_wrist_temperature", "sleep_body_temperature",
+    "sleep_stage_deep", "sleep_stage_rem", "sleep_stage_light",
     "sleep_stage_unspecified", "sleep_stage_awake", "sleep_in_bed",
   }
   HEALTH_V2_BEHAVIOR_CAP = 5000
@@ -60,11 +66,7 @@ class UserProfileServ:
     "body_temperature", "sleep_stage_light",
   }
   # 参与自然日登记/对账的健康指标 key（v1+v2；plays/clicks 等交互行为不算健康数据）。
-  # deep/rem/resting/wrist 在 v1/v2 名字与语义均未变，两个版本都算。
-  HEALTH_BEHAVIOR_KEYS = HEALTH_V2_BEHAVIOR_KEYS | HEALTH_V1_DEPRECATED_KEYS | {
-    "resting_heart_rate", "sleeping_wrist_temperature",
-    "sleep_stage_deep", "sleep_stage_rem",
-  }
+  HEALTH_BEHAVIOR_KEYS = HEALTH_V2_BEHAVIOR_KEYS | HEALTH_V1_DEPRECATED_KEYS
 
   # -------------------- 门面：委托给拆分后的子服务 --------------------
   _INSIGHT_MODULE_KEYS = AnalysisContentService._INSIGHT_MODULE_KEYS
@@ -189,8 +191,9 @@ class UserProfileServ:
       return None
 
   def save_profile(self, uid: str, profile: UserProfile):
-    """将单个用户的画像写入持久化存储"""
+    """将单个用户的画像写入持久化存储；落盘前 revision +1（query_revision 变更探测版本号）。"""
     with self.lock:
+      profile.revision = (profile.revision or 0) + 1
       if self.storage_mode == "leveldb":
         data = json.dumps(self._profile_to_json_data(profile)).encode('utf-8')
         self.db.put(uid.encode('utf-8'), data)
@@ -344,12 +347,16 @@ class UserProfileServ:
     new_profile: UserProfile,
     health_schema_version: Optional[int],
     timezone: Optional[str],
+    purge: bool = True,
   ) -> None:
     """按本批 behaviors 覆盖的自然日登记口径版本；v2 批次清除当天 v1 废弃 key 的旧样本。
 
     版本语义（md §8.4）：某天现存数据的版本，多版本取最低。v2 批次 purge 后该天
     现存数据只剩 v2，故直接登记本批版本；v1 批次（缺省=1）只登记，不 purge——
     若该天已有 v2 数据，v1 样本混入后版本回落 1，下次 v2 批次再 purge 收敛。
+
+    purge=False 用于全新画像分支：存量就是本批数据自己，purge 会把本批的
+    sleep_stage_light（同时在 v1 废弃 key 集合里）误清掉。
     """
     version = health_schema_version if health_schema_version else 1
     if version > Config.HEALTH_SCHEMA_VERSION:
@@ -371,7 +378,7 @@ class UserProfileServ:
     if not days:
       return
 
-    if version >= 2:
+    if version >= 2 and purge:
       for key in self.HEALTH_V1_DEPRECATED_KEYS:
         samples = profile.behaviors.get(key)
         if not samples:
@@ -385,6 +392,15 @@ class UserProfileServ:
 
     for day in days:
       profile.health_sync_days[day] = version
+
+  def backfill_sleep_data_inplace(self, profile: UserProfile) -> dict:
+    """存量画像回填（tool/backfill_sleep_data.py 调用）：从 behaviors 合成
+    sleep_data（device 上报行优先，见 _synthesize_sleep_data）并配对当夜心率区间。
+    不动 behaviors、不动版本登记。幂等；返回统计供调用方决定是否落盘。
+    """
+    stats: dict = {"synthesized": self._synthesize_sleep_data(profile)}
+    self._update_night_hr_range(profile)
+    return stats
 
   def query_health_sync_days(
     self,
@@ -421,6 +437,9 @@ class UserProfileServ:
   def _extract_sop_start_events(plays: list) -> list[tuple[str, int, dict]]:
     """Extract SOP start events from a plays list.
 
+    引导式场景（sleep.scene.）与纯音乐（sleep.pure_music. / 裸 pure_music.）都计入；
+    纯音乐不进推荐候选（reco.py 另有过滤），但播放统计与场景同口径。
+
     Returns tuples of (cmd, timestamp, event_dict).
     """
     events: list[tuple[str, int, dict]] = []
@@ -434,7 +453,7 @@ class UserProfileServ:
         continue
       cmd = event.get("cmd")
       event_type = event.get("event")
-      if isinstance(cmd, str) and cmd.startswith("sleep.scene.") and event_type == "sop_start":
+      if isinstance(cmd, str) and cmd.startswith(SCENE_CMD_PREFIXES) and event_type == "sop_start":
         events.append((cmd, int(ts), event))
     return events
 
@@ -506,7 +525,7 @@ class UserProfileServ:
       profile.sleep_analysis.pop("most_used_scene", None)
     else:
       scene_id, scene_stats = most_used
-      short_id = scene_id.replace("sleep.scene.", "")
+      short_id = short_scene_id(scene_id)
       profile.sleep_analysis["most_used_scene"] = {
         "scene_id": short_id,
         "scene_name": short_id.replace("_", " ").title(),
@@ -521,7 +540,7 @@ class UserProfileServ:
       profile.sleep_analysis.pop("most_used_scene_7d", None)
     else:
       scene_id, scene_stats = most_used_7d
-      short_id = scene_id.replace("sleep.scene.", "")
+      short_id = short_scene_id(scene_id)
       profile.sleep_analysis["most_used_scene_7d"] = {
         "scene_id": short_id,
         "scene_name": short_id.replace("_", " ").title(),
@@ -553,7 +572,7 @@ class UserProfileServ:
     for scene_id, records in profile.mindora_record.items():
       if not isinstance(records, list) or not records:
         continue
-      short_id = scene_id.replace("sleep.scene.", "")
+      short_id = short_scene_id(scene_id)
       scene_name = short_id.replace("_", " ").title()
       for entry in records:
         if isinstance(entry, (list, tuple)) and len(entry) >= 1:
@@ -745,19 +764,15 @@ class UserProfileServ:
   def _update_night_hr_range(self, profile: UserProfile) -> None:
     """计算各条 SleepResult 的当夜心率区间 hr_min/hr_max，update_profile 时调用。
 
-    两个口径（健康数据同步接口_0814.md §8.2）：
-      - v2：客户端直接上传 sleep_heart_rate_min/max（一晚一对，时间戳同为该晚
-        睡眠会话起点），按会话起点落入当夜窗口配对写入；
-      - v1 fallback：从 behaviors.heart_rate 全天序列按睡眠窗口取 min/max。
-        behaviors 有截断，截断前窗口数据最全；每次 update 幂等重算。
+    口径（健康数据同步接口_0814.md §3/§8.2）：客户端直接上传 sleep_heart_rate_min/max
+    （一晚一对，时间戳同为该晚睡眠会话起点），按会话起点落入当夜窗口配对写入；
+    每次 update 幂等重算。v1 的 heart_rate 全天序列不再兜底。
     """
     v2_min = self._hr_pairs_from_points(profile.behaviors.get("sleep_heart_rate_min"))
     v2_max = self._hr_pairs_from_points(profile.behaviors.get("sleep_heart_rate_max"))
     v2_pairs = [(ts, v2_min[ts], v2_max[ts]) for ts in v2_min.keys() & v2_max.keys()]
 
-    v1_points = sorted(self._hr_pairs_from_points(profile.behaviors.get("heart_rate")).items())
-
-    if not v2_pairs and not v1_points:
+    if not v2_pairs:
       return
     for record in profile.sleep_data:
       window = self._night_window(record)
@@ -767,11 +782,42 @@ class UserProfileServ:
       if matched:
         record.hr_min = min(mn for mn, _mx in matched)
         record.hr_max = max(mx for _mn, mx in matched)
-        continue
-      values = [v for ts, v in v1_points if window[0] <= ts <= window[1]]
-      if values:
-        record.hr_min = min(values)
-        record.hr_max = max(values)
+
+  def _synthesize_sleep_data(self, profile: UserProfile) -> int:
+    """从 v2 健康 behaviors 合成每晚 SleepResult（sleep_session_builder，source="healthkit"）。
+    返回本次新增（替换）的行数。
+
+    iOS 健康同步只传 behaviors 阶段/体征序列、从不上报 sleep_data；分析链路全读
+    sleep_data，不合成的话纯 HealthKit 用户分析页永远空。规则：
+      - 合成行时间戳落在某当前会话窗口内 → 丢弃，由本次重算的新行替换
+        （§4.2 同晚修正值时间戳不变、时长变长，重算自然覆盖）；
+      - 会话窗口内已有设备上报行（source 非 healthkit）→ 跳过该晚，设备数据优先；
+      - behaviors 截断导致老会话消失时，其合成行保留（sleep_data 保留 30 晚，
+        比 behaviors 窗口长是特性不是泄漏）。
+    必须在 _update_night_hr_range 之前调用（它给合成行配对当夜心率区间）。
+    """
+    from sleep_session_builder import derive_sleep_results, SOURCE_HEALTHKIT
+    derived = derive_sleep_results(
+      profile.behaviors or {},
+      self._resolve_tz(getattr(profile, "last_request_timezone", None), warn=False),
+    )
+    if not derived:
+      return 0
+    kept = []
+    for row in profile.sleep_data or []:
+      if row.source == SOURCE_HEALTHKIT and any(s <= row.timestamp <= e for s, e, _r in derived):
+        continue  # 同晚合成行：被本次重算替换
+      kept.append(row)
+    added = 0
+    for s, e, row in derived:
+      if any(r.source != SOURCE_HEALTHKIT and s <= r.timestamp <= e for r in kept):
+        continue  # 该晚已有设备上报行，设备数据优先
+      kept.append(row)
+      added += 1
+    if added:
+      logging.info("synthesized %d healthkit sleep_data rows (total %d)", added, len(kept))
+    profile.sleep_data = sorted(kept, key=lambda r: r.timestamp)[-UserProfileServ.MAX_SLEEP_DATA_LEN:]
+    return added
 
   def _apply_basic_update(
     self,
@@ -792,13 +838,16 @@ class UserProfileServ:
       self._note_request_meta(profile, timezone, language)
 
     if profile is None:
+      # 新建画像：客户端携带的 revision 一律作废，从 0 起（save 时 +1 变 1）
+      new_profile.revision = 0
       new_profile.profile = self._merge_personal_profile(None, new_profile.profile)
-      self._apply_health_schema_update(new_profile, new_profile, health_schema_version, timezone)
+      self._apply_health_schema_update(new_profile, new_profile, health_schema_version, timezone, purge=False)
       # 新画像也要把本批 plays 的 sop_start 聚合进 mindora_record，
       # 否则首包场景事件丢失，most_used_scene 永远为空
       self._update_mindora_record(new_profile, new_profile)
       self._update_scene_stats(new_profile)
       self._update_best_scene_by_sleep_quality(new_profile)
+      self._synthesize_sleep_data(new_profile)
       self._update_night_hr_range(new_profile)
       return new_profile
 
@@ -812,6 +861,7 @@ class UserProfileServ:
     self._apply_health_schema_update(profile, new_profile, health_schema_version, timezone)
     profile.behaviors = self._merge_behavior(profile.behaviors, new_profile.behaviors)
     profile.sleep_data = self._merge_sleep_data(profile.sleep_data, new_profile.sleep_data)
+    self._synthesize_sleep_data(profile)
 
     # aggregate SOP play events into mindora_record so we can keep behaviors small
     self._update_mindora_record(profile, new_profile)

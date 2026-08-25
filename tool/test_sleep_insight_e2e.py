@@ -83,7 +83,7 @@ def test_llm_direct():
           f"avg_onset={ctx.get('avg_onset_min')}, top_scene={ctx.get('weekly_top_scene_title')}")
 
     llm = SleepAnalysisLLM()
-    assert llm.enabled, "LLM 未启用（检查 ARK_API_KEY 环境变量）"
+    assert llm.enabled, "LLM 未启用（检查 KIMI_API_KEY 环境变量）"
 
     print("[llm] 真实请求 LLM (sleep_insight_report)...")
     t0 = time.time()
@@ -123,7 +123,7 @@ def run_server():
 
     import user_server
     srv = user_server.UserServer()
-    assert srv.llm.enabled, "LLM 未启用（检查 ARK_API_KEY）"
+    assert srv.llm.enabled, "LLM 未启用（检查 KIMI_API_KEY）"
     print(f"[server] 测试服务器启动: 127.0.0.1:{TEST_PORT}, storage=txt_json")
     web.run_app(srv.app, host="127.0.0.1", port=TEST_PORT, print=None)
 
