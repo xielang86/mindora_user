@@ -15,7 +15,11 @@ from zoneinfo import ZoneInfo
 
 from pydantic import ValidationError
 
-from analysis_fallback import build_fallback_insight, build_fallback_report
+from analysis_fallback import (
+  _canonical_lang as _fallback_lang,
+  build_fallback_insight,
+  build_fallback_report,
+)
 from llm import extract_sleep_context
 from user_profile import (
   UserProfile, SleepInsightReport, AnalysisTextReport,
@@ -48,15 +52,17 @@ _LANG_CANONICAL = {
 
 
 def _profile_language(profile: UserProfile) -> str:
-  """LLM 文案语言：优先 Profile 结构里的 language（用户资料显式设置），
-  没有再看最近一次请求的 language（last_request_language），最后兜底 en。
+  """LLM 文案语言：以 last_request_language（请求信封 data.language，App 每次请求
+  显式上送的当前界面语言，健康同步 v2 必填）为单一事实源；没有再看 Profile 结构里的
+  language（用户资料显式设置；注意其默认值 "zh-CN" 不代表显式设置，只能作参考位），
+  最后兜底 en。
 
   两个来源的写法都可能不标准（Profile.language 缺省 "zh-CN"，LLM 层认 "zh-Hans"），
   统一归一化；归一化不了的值不猜，继续往后兜底（避免 "zh-CN" 静默变英文）。
   """
   candidates = [
-    getattr(profile.profile, "language", None) if profile.profile else None,
     getattr(profile, "last_request_language", None),
+    getattr(profile.profile, "language", None) if profile.profile else None,
   ]
   for raw in candidates:
     if not raw:
@@ -96,16 +102,22 @@ class AnalysisContentService:
     """
     existing = profile.sleep_insight
     now = int(time.time())
+    # 文案语言：last_request_language（请求信封）优先，Profile.language 参考，兜底 en
+    lang = _profile_language(profile)
     if not profile.sleep_data:
       # 零睡眠记录：模板兜底（通用建议 + Mindora 引导，不烧 LLM）。
-      # 已有内容（兜底或真实报告）一律保留——幂等；真实数据到达后由下方 LLM 分支替换兜底。
-      if existing is not None:
+      # 已有内容且语言未漂移一律保留——幂等；兜底（llm_used=False）语言漂移则按新语言
+      # 重建（模板零成本，切语言即时生效）；LLM 报告无数据无法重建，保留旧语言内容。
+      if existing is not None and (
+        existing.llm_used or existing.language == _fallback_lang(lang)
+      ):
         return existing
       return build_fallback_insight(
-        profile, _profile_language(profile),
+        profile, lang,
         _today_in_tz(profile.last_request_timezone).isoformat(), now,
       )
-    if existing and existing.generated_at and existing.llm_used:
+    if existing and existing.generated_at and existing.llm_used \
+        and existing.language == lang:
       newest_sleep_ts = max(
         (int(r.timestamp or 0) for r in (profile.sleep_data or [])), default=0,
       )
@@ -113,13 +125,11 @@ class AnalysisContentService:
       if not has_new_night and now - existing.generated_at < 7 * 86400:
         logging.info(f"sleep_insight still fresh for uid={uid}, skipping LLM")
         return existing
-    # existing 是兜底（llm_used=False）→ 有真实夜晚了，继续走 LLM 替换之
+    # existing 是兜底（llm_used=False）或语言已漂移 → 有真实夜晚了，继续走 LLM 替换之
 
     if not self.llm or not self.llm.enabled:
       return existing
 
-    # 文案语言：Profile.language 优先，其次最近请求语言，兜底 en
-    lang = _profile_language(profile)
     report_tz = profile.last_request_timezone
 
     class _FakeData:
@@ -201,7 +211,7 @@ class AnalysisContentService:
 
     在 update_profile 的后台 LLM 更新中调用；/analysis 请求时只读库。
     当前周期已有报告则复用（每周期每能力至多一次 LLM 调用）。
-    语言：Profile.language 优先，其次最近请求语言，兜底 en；周期日期按画像最近请求时区（缺省 UTC）。
+    语言：last_request_language（请求信封）优先，Profile.language 参考，兜底 en；周期日期按画像最近请求时区（缺省 UTC）。
     LLM 不可用或全部失败时返回 None（调用方保留旧数据）。
     """
     language = language or _profile_language(profile)
@@ -223,9 +233,13 @@ class AnalysisContentService:
 
     if not profile.sleep_data:
       # 零睡眠记录：为缺失的当前周期 upsert 模板兜底报告（llm_used=False），不调用 LLM。
-      # 幂等只补缺；数据到达后由下方分支（兜底不视为可复用的当前报告）替换为真实报告。
+      # 幂等只补缺；兜底报告语言漂移则按新语言重建（模板零成本，切语言即时生效）；
+      # 真实 LLM 报告无数据无法重建，保留。数据到达后由下方分支替换为真实报告。
       for request_type, start_date, end_date, date, _m in specs:
-        if _current_report(request_type, start_date, end_date, date) is not None:
+        current = _current_report(request_type, start_date, end_date, date)
+        if current is not None and (
+          current.llm_used or current.language == _fallback_lang(language)
+        ):
           continue
         report = build_fallback_report(
           request_type, profile, language,
@@ -241,10 +255,10 @@ class AnalysisContentService:
       return None
 
     for request_type, start_date, end_date, date, modules in specs:
-      # 当前周期已有真实报告 → 复用，不重复调 LLM；
+      # 当前周期已有同语言真实报告 → 复用，不重复调 LLM；语言漂移视为过期，重生成。
       # 兜底报告（llm_used=False）不算——有数据了就生成真报告替换之（同周期 upsert 覆盖）
       current = _current_report(request_type, start_date, end_date, date)
-      if current is not None and current.llm_used:
+      if current is not None and current.llm_used and current.language == language:
         continue
 
       class _FakeData:

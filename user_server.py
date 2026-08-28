@@ -144,6 +144,8 @@ class UserServer:
     # 运营后台接口（管理员校验：JWT + auth_server 查 ops_role）
     self.app.router.add_post('/ops/push', self.handle_ops_push_http)
     self.app.router.add_post('/ops/survey_records', self.handle_ops_survey_records_http)
+    self.app.router.add_post('/ops/publish_logs', self.handle_ops_publish_logs_http)
+    self.app.router.add_post('/ops/popup_meta', self.handle_ops_popup_meta_http)
 
   # -------------------- 鉴权 --------------------
   def _check_token(self, jwt_token: str)-> dict | None:
@@ -888,6 +890,10 @@ class UserServer:
       if not ok:
         return web.json_response(BaseResponse(code=400, msg=msg).model_dump(), status=400)
 
+      # 发布审计日志（append-only，ops 后台"发布记录"页可查）
+      payload = self._check_token(body.get("jwt_token") or "") or {}
+      self.user_serv.record_publish(popup, uid, payload.get("email") or "")
+
       logging.info("ops push published by uid=%s popup_id=%s", uid, popup.get("popup_id"))
       resp = BaseResponse(code=0, msg=msg)
       return web.json_response({**resp.model_dump(), "data": {"popup_id": popup.get("popup_id")}})
@@ -914,6 +920,48 @@ class UserServer:
       return web.json_response(InvalidReqFormatResp().model_dump(), status=400)
     except Exception as e:
       logging.exception("ops survey_records error: %s", e)
+      return web.json_response(BaseResponse(code=500, msg="Internal server error").model_dump(), status=500)
+
+  async def handle_ops_publish_logs_http(self, request: web.Request) -> web.Response:
+    """消息发布审计日志（_meta:publish:*），运营后台"发布记录"页；按发布时间倒序。"""
+    try:
+      body = await request.json()
+      uid = await self._check_ops_admin(body.get("jwt_token") or "")
+      if uid is None:
+        return web.json_response(BaseResponse(code=403, msg="not an ops admin").model_dump(), status=403)
+
+      limit = body.get("limit") or 200
+      records = await asyncio.to_thread(self.user_serv.list_publish_records, limit)
+      resp = BaseResponse(code=0, msg="ok")
+      return web.json_response({**resp.model_dump(), "data": {"records": records, "total": len(records)}})
+    except (json.JSONDecodeError, TypeError) as e:
+      logging.error(f"ops publish_logs format error: {e}")
+      return web.json_response(InvalidReqFormatResp().model_dump(), status=400)
+    except Exception as e:
+      logging.exception("ops publish_logs error: %s", e)
+      return web.json_response(BaseResponse(code=500, msg="Internal server error").model_dump(), status=500)
+
+  async def handle_ops_popup_meta_http(self, request: web.Request) -> web.Response:
+    """运营发布表单的辅助数据：现有 survey_ids（问卷选择器）+ popup_ids（ID 查重/建议）。"""
+    try:
+      body = await request.json()
+      uid = await self._check_ops_admin(body.get("jwt_token") or "")
+      if uid is None:
+        return web.json_response(BaseResponse(code=403, msg="not an ops admin").model_dump(), status=403)
+
+      from ops_config import _load_ops_config
+      popups, surveys, _nqa = await asyncio.to_thread(_load_ops_config)
+      data = {
+        "survey_ids": sorted(surveys.keys()),
+        "popup_ids": sorted(p.get("popup_id") for p in popups if p.get("popup_id")),
+      }
+      resp = BaseResponse(code=0, msg="ok")
+      return web.json_response({**resp.model_dump(), "data": data})
+    except (json.JSONDecodeError, TypeError) as e:
+      logging.error(f"ops popup_meta format error: {e}")
+      return web.json_response(InvalidReqFormatResp().model_dump(), status=400)
+    except Exception as e:
+      logging.exception("ops popup_meta error: %s", e)
       return web.json_response(BaseResponse(code=500, msg="Internal server error").model_dump(), status=500)
 
   # -------------------- 启动 --------------------

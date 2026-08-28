@@ -113,6 +113,12 @@ class UserProfileServ:
   def list_survey_records(self, survey_id=None) -> list:
     return self.engagement.list_survey_records(survey_id)
 
+  def record_publish(self, popup: dict, operator_uid: str, operator_email: str = "") -> dict:
+    return self.engagement.record_publish(popup, operator_uid, operator_email)
+
+  def list_publish_records(self, limit: int = 200) -> list:
+    return self.engagement.list_publish_records(limit)
+
   def merge_footprint_days(self, uid: str, days: list) -> int:
     return self.engagement.merge_footprint_days(uid, days)
 
