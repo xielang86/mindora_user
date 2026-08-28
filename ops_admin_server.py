@@ -67,6 +67,17 @@ def _user_server_call(path: str, body: dict) -> dict:
   return resp.json()
 
 
+def _user_server_upload(filename: str, data: bytes, jwt_token: str) -> dict:
+  """multipart 上传弹窗主图到 user_server，返回 {"code":0, "data":{"url":...}}。"""
+  resp = requests.post(
+    f"{USER_SERVER}/ops/upload_image",
+    data={"jwt_token": jwt_token},
+    files={"image": (filename or "image", data)},
+    timeout=30,
+  )
+  return resp.json()
+
+
 # -------------------- 会话 --------------------
 
 def _new_session(jwt_token: str, email: str, uid: str, role: str) -> str:
@@ -536,7 +547,7 @@ fieldset {{ margin: 12px 0; border: 1px solid #ccc; padding: 10px 14px; }}
 legend {{ font-weight: bold; }}
 .hint {{ color: #888; font-size: 12px; }}
 </style>
-<form method="post" action="/publish">
+<form method="post" action="/publish" enctype="multipart/form-data">
 <fieldset><legend>基本信息</legend>
   <p>消息类型：{type_radios}<br>
   <span class="hint">survey=参与调研（点按钮打开问卷，恒落站内消息）；mall=商城活动（建议落站内消息）；ad=纯广告/品牌推荐（建议不落）</span></p>
@@ -576,7 +587,10 @@ legend {{ font-weight: bold; }}
   <p>最多展示次数：<input type="number" name="max_show_count" size="6" min="1">
   两次展示最小间隔（秒）：<input type="number" name="cooldown_seconds" size="8" min="0">
   <label><input type="checkbox" name="dismiss_stops" checked> 用户手动关闭后不再展示</label></p>
-  <p>主图 URL：<input type="url" name="image_url" size="60" placeholder="约 590×286；留空用客户端按类型内置底图"></p>
+  <p>主图 URL：<input type="url" name="image_url" size="60"
+     value="{_esc(v.get('image_url', ''))}" placeholder="约 590×286；留空用客户端按类型内置底图"></p>
+  <p>或上传图片：<input type="file" name="image_file" accept="image/png,image/jpeg,image/webp">
+  <span class="hint">png / jpg / webp，≤2MB；上传后存服务端并生成公网 URL（两者都填时以上传文件为准）</span></p>
 </fieldset>
 <p><button type="submit">发布</button></p>
 </form>
@@ -642,6 +656,16 @@ async def handle_publish_post(request: web.Request) -> web.Response:
     if error:
       tip = f'<div class="err">表单校验失败：{_esc(error)}</div>'
       return _html_response("消息发布", await _publish_form_body(session, tip, dict(form)), session, status=400)
+    # 图片：上传文件优先于手填 URL（先传到 user_server 拿公网 URL，再随 popup 发布）
+    image_file = form.get("image_file")
+    if image_file is not None and getattr(image_file, "filename", ""):
+      up = await asyncio.to_thread(
+        _user_server_upload, image_file.filename, image_file.file.read(), session["jwt"],
+      )
+      if up.get("code") != 0:
+        tip = f'<div class="err">图片上传失败：{_esc(up.get("msg"))}</div>'
+        return _html_response("消息发布", await _publish_form_body(session, tip, dict(form)), session, status=400)
+      popup["image_url"] = (up.get("data") or {}).get("url") or popup.get("image_url", "")
 
   result = await asyncio.to_thread(_user_server_call, "/ops/push", {"jwt_token": session["jwt"], "popup": popup})
   if result.get("code") == 0:

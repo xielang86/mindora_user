@@ -17,6 +17,8 @@ class Config:
   AUTH_SERVER_URL = os.getenv("AUTH_SERVER_URL", f"http://127.0.0.1:{AUTH_PORT}")
   # 运营后台服务端口（ops_admin_server.py）
   OPS_ADMIN_PORT = int(os.getenv("OPS_ADMIN_PORT", "9200"))
+  # 公网 API 域名（拼接上传图片等资源的可公开访问 URL，如弹窗主图）
+  PUBLIC_API_BASE = os.getenv("PUBLIC_API_BASE", "https://api.mindora316.com")
   DB_PATH = "data/userprofile_level_db"
   USER_PROFILE_STORAGE_MODE = "leveldb"  # "leveldb" | "txt_json"
   USER_PROFILE_JSON_PATH = "data/user_profiles.txt"

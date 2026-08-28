@@ -8,7 +8,7 @@
   - engagement_service.py  弹窗 / 问卷 / 陪伴足迹
   - ops_config.py          弹窗问卷运营配置加载
 """
-import asyncio,copy,datetime,json,logging,os,time
+import asyncio,copy,datetime,hashlib,json,logging,os,re,time
 from typing import Any, Optional
 from dotenv import load_dotenv
 import jwt
@@ -47,6 +47,49 @@ def get_http_status(resp: BaseResponse):
   if resp.code != 0:
     status = resp.code
   return status
+
+
+# -------------------- 弹窗主图上传（ops 后台） --------------------
+# 运营在发布页可贴 URL 或直接上传图片；上传的文件按内容哈希命名存
+# data/popup_images/，经 GET /popup_images/<name> 公开访问（App 按完整 URL 拉取）。
+POPUP_IMAGE_MAX_BYTES = 2 * 1024 * 1024  # 弹窗主图约 590×286，2MB 上限足够
+
+# 魔数 → (扩展名, Content-Type)；不信任上传文件名里的扩展名
+_POPUP_IMAGE_MAGIC = (
+  (b"\x89PNG\r\n\x1a\n", "png", "image/png"),
+  (b"\xff\xd8\xff", "jpg", "image/jpeg"),
+  (b"RIFF", "webp", "image/webp"),  # 需再确认偏移 8 处为 WEBP
+)
+_POPUP_IMAGE_NAME_RE = re.compile(r"^[a-f0-9]{16}\.(png|jpg|webp)$")
+
+
+def _popup_image_dir() -> str:
+  d = os.path.join(run_dir, "data", "popup_images")
+  os.makedirs(d, exist_ok=True)
+  return d
+
+
+def save_popup_image(data: bytes) -> tuple[Optional[str], Optional[str]]:
+  """校验并保存弹窗主图，返回 (公开 URL, 错误信息)。同名内容幂等（哈希命名）。"""
+  if not data:
+    return None, "空文件"
+  if len(data) > POPUP_IMAGE_MAX_BYTES:
+    return None, f"图片超过 {POPUP_IMAGE_MAX_BYTES // 1024 // 1024}MB 上限"
+  ext = mime = None
+  for magic, e, m in _POPUP_IMAGE_MAGIC:
+    if data.startswith(magic):
+      ext, mime = e, m
+      break
+  if ext == "webp" and data[8:12] != b"WEBP":
+    ext = None
+  if ext is None:
+    return None, "仅支持 png / jpg / webp 图片"
+  name = hashlib.sha1(data).hexdigest()[:16] + "." + ext
+  path = os.path.join(_popup_image_dir(), name)
+  if not os.path.exists(path):
+    with open(path, "wb") as f:
+      f.write(data)
+  return f"{Config.PUBLIC_API_BASE}/popup_images/{name}", None
 
 
 class UserServer:
@@ -146,6 +189,9 @@ class UserServer:
     self.app.router.add_post('/ops/survey_records', self.handle_ops_survey_records_http)
     self.app.router.add_post('/ops/publish_logs', self.handle_ops_publish_logs_http)
     self.app.router.add_post('/ops/popup_meta', self.handle_ops_popup_meta_http)
+    self.app.router.add_post('/ops/upload_image', self.handle_ops_upload_image_http)
+    # 弹窗主图公开访问（文件名是内容哈希，长缓存；路径即 ops/upload_image 返回的 URL）
+    self.app.router.add_get('/popup_images/{name}', self.handle_popup_image_http)
 
   # -------------------- 鉴权 --------------------
   def _check_token(self, jwt_token: str)-> dict | None:
@@ -963,6 +1009,44 @@ class UserServer:
     except Exception as e:
       logging.exception("ops popup_meta error: %s", e)
       return web.json_response(BaseResponse(code=500, msg="Internal server error").model_dump(), status=500)
+
+  async def handle_ops_upload_image_http(self, request: web.Request) -> web.Response:
+    """运营上传弹窗主图（multipart，字段名 image），返回公开 URL；仅 ops admin。"""
+    try:
+      form = await request.post()
+      # multipart 里 jwt_token 作为普通表单字段携带；也兼容 header 传法
+      token = form.get("jwt_token") or request.headers.get("X-Ops-Token") or ""
+      uid = await self._check_ops_admin(token)
+      if uid is None:
+        return web.json_response(BaseResponse(code=403, msg="not an ops admin").model_dump(), status=403)
+
+      field = form.get("image")
+      if field is None or not getattr(field, "filename", None):
+        return web.json_response(BaseResponse(code=400, msg="缺少图片文件（字段 image）").model_dump(), status=400)
+      data = field.file.read()
+      url, err = await asyncio.to_thread(save_popup_image, data)
+      if err:
+        return web.json_response(BaseResponse(code=400, msg=err).model_dump(), status=400)
+      resp = BaseResponse(code=0, msg="ok")
+      return web.json_response({**resp.model_dump(), "data": {"url": url}})
+    except Exception as e:
+      logging.exception("ops upload_image error: %s", e)
+      return web.json_response(BaseResponse(code=500, msg="Internal server error").model_dump(), status=500)
+
+  async def handle_popup_image_http(self, request: web.Request) -> web.Response:
+    """弹窗主图公开访问：/popup_images/<hash>.<ext>，内容寻址 → 长缓存。"""
+    name = request.match_info.get("name") or ""
+    if not _POPUP_IMAGE_NAME_RE.match(name):
+      return web.Response(status=404, text="not found")
+    path = os.path.join(_popup_image_dir(), name)
+    if not os.path.isfile(path):
+      return web.Response(status=404, text="not found")
+    mime = {"png": "image/png", "jpg": "image/jpeg", "webp": "image/webp"}[name.rsplit(".", 1)[1]]
+    return web.Response(
+      body=await asyncio.to_thread(lambda: open(path, "rb").read()),
+      content_type=mime,
+      headers={"Cache-Control": "public, max-age=31536000, immutable"},
+    )
 
   # -------------------- 启动 --------------------
   def _startup_self_check(self) -> None:
