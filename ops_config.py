@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import threading
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -236,3 +237,115 @@ def append_popup(popup: dict) -> tuple[bool, str]:
   # 立即触发一次热加载（不等下一次请求），让消息目录同步与新消息即刻生效
   _load_ops_config()
   return True, f"published {popup.get('popup_id')}"
+
+
+# -------------------- 问卷编辑（运营后台 → user_server /ops/save_survey） ----------------
+
+_SURVEY_QUESTION_TYPES = ("single_choice", "multi_choice", "text")
+_SURVEY_GIFT_TYPES = ("physical", "virtual", "none")
+
+
+def _validate_survey_content(lang: str, content: dict) -> Optional[str]:
+  """校验单一语言的问卷内容（结构同 query_survey 响应 data：title/questions/reward）。"""
+  if not isinstance(content, dict):
+    return f"i18n.{lang} 必须是 object"
+  if not (content.get("title") or "").strip():
+    return f"i18n.{lang}.title 问卷标题必填"
+  questions = content.get("questions")
+  if not isinstance(questions, list) or not questions:
+    return f"i18n.{lang}.questions 至少要有一道题目"
+  seen_q = set()
+  for i, q in enumerate(questions, 1):
+    if not isinstance(q, dict):
+      return f"i18n.{lang} 第 {i} 题必须是 object"
+    qid = q.get("question_id")
+    if not qid:
+      return f"i18n.{lang} 第 {i} 题 question_id 必填"
+    if qid in seen_q:
+      return f"i18n.{lang} question_id 重复: {qid}"
+    seen_q.add(qid)
+    qtype = q.get("type")
+    if qtype not in _SURVEY_QUESTION_TYPES:
+      return f"i18n.{lang}.{qid} type 必须是 single_choice/multi_choice/text"
+    if not (q.get("title") or "").strip():
+      return f"i18n.{lang}.{qid} 题干 title 必填"
+    if qtype in ("single_choice", "multi_choice"):
+      options = q.get("options")
+      if not isinstance(options, list) or len(options) < 2:
+        return f"i18n.{lang}.{qid} 选择题至少要 2 个选项"
+      seen_o = set()
+      for o in options:
+        oid = (o or {}).get("option_id")
+        if not oid:
+          return f"i18n.{lang}.{qid} 选项 option_id 必填"
+        if oid in seen_o:
+          return f"i18n.{lang}.{qid} option_id 重复: {oid}"
+        seen_o.add(oid)
+        if not (o.get("text") or "").strip():
+          return f"i18n.{lang}.{qid}.{oid} 选项文案 text 必填"
+  reward = content.get("reward")
+  if reward is not None:
+    if not isinstance(reward, dict):
+      return f"i18n.{lang}.reward 必须是 object"
+    gift_type = reward.get("gift_type")
+    if gift_type not in _SURVEY_GIFT_TYPES:
+      return f"i18n.{lang}.reward.gift_type 必须是 physical/virtual/none"
+    if gift_type in ("physical", "virtual") and not (reward.get("gift_name") or "").strip():
+      return f"i18n.{lang}.reward.gift_name 礼品名称必填"
+    if gift_type == "physical" and not (reward.get("contact_email") or "").strip():
+      return f"i18n.{lang}.reward.contact_email 实体礼品必填（客户端无兜底，不下发客服邮箱行不展示）"
+  return None
+
+
+def validate_new_survey(survey: dict, existing_ids: set) -> Optional[str]:
+  """校验一份待保存的问卷，返回错误信息（None 表示合法）。
+
+  存储结构：{survey_id, i18n: {<language>: {title, questions[], reward?}}}，
+  每个语言的内容与 query_survey 响应 data 同构（tanchuang_suvey.md 5.）。
+  """
+  if not isinstance(survey, dict):
+    return "survey must be a JSON object"
+  survey_id = survey.get("survey_id")
+  if not survey_id or not isinstance(survey_id, str):
+    return "survey_id 必填且为 string"
+  if survey_id in existing_ids:
+    return f"survey_id 已存在: {survey_id}"
+  i18n = survey.get("i18n")
+  if not isinstance(i18n, dict) or not i18n:
+    return "i18n 必填且至少有一种语言的问卷内容"
+  for lang, content in i18n.items():
+    error = _validate_survey_content(lang, content)
+    if error:
+      return error
+  return None
+
+
+def save_survey(survey: dict) -> tuple[bool, str]:
+  """把一份新问卷写入运营配置 JSON 的 surveys 字典（read-modify-write，原子替换）。
+
+  写入后 mtime 变化触发热加载 → 问卷即刻可被 query_survey 拉取、
+  发布页的问卷下拉框（/ops/popup_meta）也会包含它。返回 (是否成功, 信息)。
+  """
+  path = _ops_config_path()
+  with _ops_config_lock:
+    try:
+      raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+      return False, f"ops config unreadable: {e}"
+
+    surveys = raw.get("surveys") or {}
+    error = validate_new_survey(survey, set(surveys.keys()))
+    if error:
+      return False, error
+
+    # 创建时间落地：问卷列表页按它筛选/排序（老配置里没该字段的按"未知"处理）
+    survey.setdefault("created_at", int(time.time()))
+    surveys[survey["survey_id"]] = survey
+    raw["surveys"] = surveys
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp_path.replace(path)
+
+  logging.info("survey saved: %s -> %s", survey.get("survey_id"), path)
+  _load_ops_config()
+  return True, f"saved {survey.get('survey_id')}"

@@ -28,7 +28,7 @@ from user_profile import (
   PopupRequest, SurveyRequest, FootprintRequest,
 )
 from auth import AuthRequest, AuthData
-from ops_config import append_popup
+from ops_config import append_popup, save_survey
 from uid.uuid import get_or_create_uuid
 from llm import SleepAnalysisLLM, deep_merge
 import sleep_plan_service
@@ -189,6 +189,8 @@ class UserServer:
     self.app.router.add_post('/ops/survey_records', self.handle_ops_survey_records_http)
     self.app.router.add_post('/ops/publish_logs', self.handle_ops_publish_logs_http)
     self.app.router.add_post('/ops/popup_meta', self.handle_ops_popup_meta_http)
+    self.app.router.add_post('/ops/save_survey', self.handle_ops_save_survey_http)
+    self.app.router.add_post('/ops/survey_list', self.handle_ops_survey_list_http)
     self.app.router.add_post('/ops/upload_image', self.handle_ops_upload_image_http)
     # 弹窗主图公开访问（文件名是内容哈希，长缓存；路径即 ops/upload_image 返回的 URL）
     self.app.router.add_get('/popup_images/{name}', self.handle_popup_image_http)
@@ -1000,6 +1002,8 @@ class UserServer:
       data = {
         "survey_ids": sorted(surveys.keys()),
         "popup_ids": sorted(p.get("popup_id") for p in popups if p.get("popup_id")),
+        # 完整问卷内容：发布页「预览」按钮按 survey_id 本地渲染题目流程
+        "surveys": surveys,
       }
       resp = BaseResponse(code=0, msg="ok")
       return web.json_response({**resp.model_dump(), "data": data})
@@ -1008,6 +1012,58 @@ class UserServer:
       return web.json_response(InvalidReqFormatResp().model_dump(), status=400)
     except Exception as e:
       logging.exception("ops popup_meta error: %s", e)
+      return web.json_response(BaseResponse(code=500, msg="Internal server error").model_dump(), status=500)
+
+  async def handle_ops_survey_list_http(self, request: web.Request) -> web.Response:
+    """全部问卷定义（含 created_at / i18n 内容），运营后台问卷列表页；按创建时间倒序。"""
+    try:
+      body = await request.json()
+      uid = await self._check_ops_admin(body.get("jwt_token") or "")
+      if uid is None:
+        return web.json_response(BaseResponse(code=403, msg="not an ops admin").model_dump(), status=403)
+
+      from ops_config import _load_ops_config
+      _popups, surveys, _nqa = await asyncio.to_thread(_load_ops_config)
+      items = [
+        {"survey_id": sid, "created_at": (s or {}).get("created_at"), "i18n": (s or {}).get("i18n") or {}}
+        for sid, s in surveys.items()
+      ]
+      # 创建时间倒序；老配置缺 created_at 的排最后
+      items.sort(key=lambda s: s["created_at"] or 0, reverse=True)
+      resp = BaseResponse(code=0, msg="ok")
+      return web.json_response({**resp.model_dump(), "data": {"surveys": items, "total": len(items)}})
+    except (json.JSONDecodeError, TypeError) as e:
+      logging.error(f"ops survey_list format error: {e}")
+      return web.json_response(InvalidReqFormatResp().model_dump(), status=400)
+    except Exception as e:
+      logging.exception("ops survey_list error: %s", e)
+      return web.json_response(BaseResponse(code=500, msg="Internal server error").model_dump(), status=500)
+
+  async def handle_ops_save_survey_http(self, request: web.Request) -> web.Response:
+    """运营保存新问卷（写入运营配置 surveys 字典）；仅 ops admin。
+
+    结构与 query_survey 响应 data 同构的内容按语言收进 i18n（tanchuang_suvey.md 5.），
+    校验（survey_id 查重、题目/选项/奖励字段）在 ops_config.save_survey 内完成。
+    """
+    try:
+      body = await request.json()
+      uid = await self._check_ops_admin(body.get("jwt_token") or "")
+      if uid is None:
+        return web.json_response(BaseResponse(code=403, msg="not an ops admin").model_dump(), status=403)
+
+      survey = body.get("survey")
+      if not isinstance(survey, dict):
+        return web.json_response(BaseResponse(code=400, msg="survey 必须是 JSON object").model_dump(), status=400)
+      ok, msg = await asyncio.to_thread(save_survey, survey)
+      if not ok:
+        return web.json_response(BaseResponse(code=400, msg=msg).model_dump(), status=400)
+      resp = BaseResponse(code=0, msg=msg)
+      return web.json_response(resp.model_dump())
+    except (json.JSONDecodeError, TypeError) as e:
+      logging.error(f"ops save_survey format error: {e}")
+      return web.json_response(InvalidReqFormatResp().model_dump(), status=400)
+    except Exception as e:
+      logging.exception("ops save_survey error: %s", e)
       return web.json_response(BaseResponse(code=500, msg="Internal server error").model_dump(), status=500)
 
   async def handle_ops_upload_image_http(self, request: web.Request) -> web.Response:
