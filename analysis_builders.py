@@ -39,6 +39,26 @@ def _window_avg_score(profile: Optional[UserProfile], start: str, end: str) -> O
   return int(round(sum(scores) / len(scores))) if scores else None
 
 
+def _window_avg_onset(profile: Optional[UserProfile], start: str, end: str) -> Optional[int]:
+  """窗口 [start, end]（yyyy-MM-dd 闭区间）内的平均入睡用时（分钟）；无数据返回 None。
+
+  onset 只在一部分夜晚可测（会话首段为 awake 才可测，见 sleep_session_builder），
+  只对可测夜晚取平均；全部不可测时省略该字段（客户端显示 --）。
+  """
+  if not profile or not profile.sleep_data:
+    return None
+  try:
+    start_d = datetime.date.fromisoformat(start)
+    end_d = datetime.date.fromisoformat(end)
+  except ValueError:
+    return None
+  onsets = [
+    s.onset for s in profile.sleep_data
+    if s.onset is not None and start_d <= datetime.date.fromtimestamp(s.timestamp) <= end_d
+  ]
+  return int(round(sum(onsets) / len(onsets))) if onsets else None
+
+
 def _score_label(score: int) -> str:
   """评分评价文案（md：由服务端统一返回，不做客户端本地阈值映射）。"""
   return "Excellent" if score >= 80 else "Good" if score >= 60 else "Fair"
@@ -155,18 +175,20 @@ def build_sleep_week(d, profile: Optional[UserProfile]) -> dict:
   # sleep_trends：纯文案模块（LLM 报告覆盖）
   result["sleep_trends"] = {"body": "", "description": "", "start_date": start, "end_date": end}
 
-  # onset_efficiency：本周最常用场景；效果分取 best_sleep_quality_scene_7d
+  # onset_efficiency：本周最常用场景 + 周平均入睡用时（两者独立填充，任一存在即返回模块）；
+  # 场景效果分取 best_sleep_quality_scene_7d
   scene = _most_used_scene_entry(profile)
-  if scene:
-    onset = {
-      "scenario_name": scene["scene_name"],
-      "used_times": scene["count"],
-      "start_date": start,
-      "end_date": end,
-    }
-    best_score = _best_scene_score(profile)
-    if best_score is not None:
-      onset["score"] = best_score
+  avg_onset = _window_avg_onset(profile, start, end)
+  if scene or avg_onset is not None:
+    onset: dict = {"start_date": start, "end_date": end}
+    if scene:
+      onset["scenario_name"] = scene["scene_name"]
+      onset["used_times"] = scene["count"]
+      best_score = _best_scene_score(profile)
+      if best_score is not None:
+        onset["score"] = best_score
+    if avg_onset is not None:
+      onset["avg_onset_minutes"] = avg_onset
     result["onset_efficiency"] = onset
   return filter_modules(result, d.modules)
 
@@ -208,15 +230,17 @@ def build_sleep_month(d, profile: Optional[UserProfile]) -> dict:
     "end_date": end,
   }
 
-  # onset_efficiency：月窗口使用次数 top3 场景；无场景数据省略模块
+  # onset_efficiency：月窗口使用次数 top3 场景 + 月平均入睡用时（任一存在即返回模块）
   top = _top_scenes(profile, days=30, limit=3)
-  if top:
-    result["onset_efficiency"] = {
-      "scenario_list": [name for _sid, name, _c in top],
-      "description": "",
-      "start_date": start,
-      "end_date": end,
-    }
+  avg_onset = _window_avg_onset(profile, start, end)
+  if top or avg_onset is not None:
+    onset: dict = {"start_date": start, "end_date": end}
+    if top:
+      onset["scenario_list"] = [name for _sid, name, _c in top]
+      onset["description"] = ""
+    if avg_onset is not None:
+      onset["avg_onset_minutes"] = avg_onset
+    result["onset_efficiency"] = onset
   return filter_modules(result, d.modules)
 
 

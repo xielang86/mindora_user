@@ -8,8 +8,8 @@ def play(ts, scene, duration=1800):
     return [ts, {"cmd": f"sleep.scene.{scene}", "event": "sop_start", "duration": duration}]
 
 client = UserServerClient(
-    # base_url="https://api.mindora316.com/user_server",
-    base_url="http://192.168.0.116:9001",
+    base_url="https://api.mindora316.com/user_server",
+    # base_url="http://192.168.0.116:9001",
     # jwt_token=os.environ["JWT_TOKEN"],
     jwt_token = sys.argv[1]
 )

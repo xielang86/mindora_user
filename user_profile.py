@@ -117,6 +117,23 @@ class SleepElement(BaseModel):
   vitals: Optional[StageVitals] = Field(None, description="该阶段内的平均体征（心率/呼吸/体温）")
   events: List[NightEvent] = Field(default_factory=list, description="该阶段内发生的环境/设备事件（噪音、屏幕、语音、干预等）")
 
+def _classify_awake_type(awake_count: int, awake_minutes: float) -> Optional[str]:
+  """夜间觉醒类型（统计派生标签）。
+
+  上游（HealthKit sleep_stage_awake / 设备上报）只有 awake 段+时长，没有子类型，
+  因此按当夜觉醒次数与总时长分级；多语言由 explore 的 LLM 报告本地化覆盖。
+  """
+  if awake_count <= 0:
+    return None
+  if awake_count <= 2 and awake_minutes <= 10:
+    return "Brief awakening"        # 偶发短暂觉醒
+  if awake_count >= 5:
+    return "Frequent awakenings"    # 频繁觉醒
+  if awake_minutes >= 30:
+    return "Prolonged awakening"    # 长时间觉醒
+  return "Moderate awakening"       # 中等
+
+
 class SleepResult(BaseModel):
   timestamp: int = Field(..., description="数据 update 时间戳（秒级）")
   sleep_quality: Optional[float] = Field(None, description="睡眠得分，范围0-100") 
