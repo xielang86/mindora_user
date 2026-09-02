@@ -64,7 +64,16 @@ def _auth_call(request_type: str, data: dict) -> dict:
 
 def _user_server_call(path: str, body: dict) -> dict:
   resp = requests.post(f"{USER_SERVER}{path}", json=body, timeout=10)
-  return resp.json()
+  try:
+    return resp.json()
+  except ValueError:
+    # 非 JSON 响应（典型：user_server 未重启到带该端点的版本，404 返回纯文本）——
+    # 不上抛 500，按调用失败返回，页面降级为错误提示
+    logging.error("user_server %s non-JSON response (HTTP %s): %.200s", path, resp.status_code, resp.text)
+    return {
+      "code": resp.status_code or 502,
+      "msg": f"user_server 响应异常（HTTP {resp.status_code}），请确认 user_server 已重启到最新版本",
+    }
 
 
 def _user_server_upload(filename: str, data: bytes, jwt_token: str) -> dict:
@@ -1134,7 +1143,9 @@ async def handle_survey_list(request: web.Request) -> web.Response:
   surveys = (result.get("data") or {}).get("surveys") or [] if result.get("code") == 0 else []
 
   tip = ""
-  if "invalid" in (start_at, end_at):
+  if result.get("code") != 0:
+    tip = f'<div class="err">拉取问卷列表失败：{_esc(result.get("msg"))}</div>'
+  elif "invalid" in (start_at, end_at):
     tip = '<div class="err">时间格式不正确，未按时间筛选</div>'
     start_at = end_at = None
   # 按创建时间筛选；老配置缺 created_at 的问卷在时间筛选时不显示（无法判断归属）
