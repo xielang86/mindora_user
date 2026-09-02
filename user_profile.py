@@ -61,7 +61,21 @@ class Profile(BaseModel):
   weight: Optional[float] = Field(None, description="体重，单位 kg")
   height: Optional[float] = Field(None, description="身高，单位 cm")
   language: str = Field("zh-CN", description="语言")
-  wechat: Optional[str] = Field(None, description="微信号")
+  religion: Optional[str] = Field("", description="宗教信仰")
+  coacher: Optional[str] = Field("", description="导师/风格偏好")
+
+
+# 睡眠健康问卷（onboarding/设置页收集的睡眠相关字段）
+class SleepHealthProfile(BaseModel):
+  sleep_quality: Optional[str] = Field(None, description="自评睡眠质量")
+  health_problems: Optional[str] = Field(None, description="健康问题")
+  weekly_sleep_duration: Optional[str] = Field(None, description="周睡眠时长")
+  weekly_sleep_status: Optional[str] = Field(None, description="周睡眠状态")
+  weekly_exercise_volume: Optional[str] = Field(None, description="周运动量")
+  improvement_goal: Optional[str] = Field(None, description="睡眠改善目标")
+  meditation_experience: Optional[str] = Field(None, description="冥想经验")
+  stress_type: Optional[str] = Field(None, description="压力类型")
+  medication_status: Optional[str] = Field(None, description="用药情况")
 
 
 # 建议新增：环境与敏感度
@@ -119,7 +133,6 @@ class SleepResult(BaseModel):
 
   hrv: Optional[float] = Field(None, description="心率波动，单位bpm")
   respiratory_var: Optional[float] = Field(None, description="呼吸频率波动，单位次/分钟")
-
   # 当夜心率范围（update_profile 时从 behaviors.heart_rate 按睡眠窗口算出并持久化；
   # behaviors 序列有 MAX_BEHAVIOR_LEN 截断，请求时再算会丢历史窗口数据）
   hr_min: Optional[float] = Field(None, description="当夜睡眠窗口内心率最小值，单位bpm")
@@ -526,6 +539,9 @@ class UserProfile(BaseModel):
     description="按 request_type 分组的分析文案报告序列",
   )
 
+  # 睡眠健康问卷（onboarding/设置页收集的睡眠相关字段）
+  sleep_health: Optional[SleepHealthProfile] = Field(None, description="睡眠健康问卷")
+
   # 新增：存储推荐的助眠候选方案
   sleep_scenarios_reco: Optional[List[SleepScenario]] = Field(default_factory=list, description="推荐的候选助眠流程列表")
   standard_sop_reco: List[SleepScenario] = Field(default_factory=list, description="推荐的标准SOP流程列表")
@@ -665,6 +681,11 @@ class ProfileData(BaseModel):
     None,
     description="睡眠分析(sleep_insight + analysis cache)开关：None=自动 / True=跳过 / False=强制，不影响场景推荐",
   )
+  # query_profile 响应裁剪开关：sleep_data 和 behaviors 是画像的体积大头，
+  # 不需要时可要求服务端不携带，减小响应包；不携带 behaviors 时连同
+  # health_sync_days（健康数据对账状态）一起去掉
+  include_sleep_data: bool = Field(True, description="query_profile 响应是否携带 sleep_data，默认 True")
+  include_behaviors: bool = Field(True, description="query_profile 响应是否携带 behaviors，默认 True；为 False 时同时剔除 health_sync_days")
 
 
 class ProfileRequest(BaseModel):

@@ -259,7 +259,14 @@ class UserServer:
     profile = self.user_serv.get_profile(uid)
     if profile:
       logging.info("profile found uid=%s summary=%s", uid, self.user_serv._profile_for_log(profile))
-      return ProfileResponse(code=0, msg="succ", request_type=request.request_type, data={"user_profile": profile.model_dump()})
+      profile_dict = profile.model_dump()
+      # 按请求开关裁剪体积大头：sleep_data / behaviors（不携带 behaviors 时同时去掉 health_sync_days）
+      if not request.data.include_sleep_data:
+        profile_dict.pop("sleep_data", None)
+      if not request.data.include_behaviors:
+        profile_dict.pop("behaviors", None)
+        profile_dict.pop("health_sync_days", None)
+      return ProfileResponse(code=0, msg="succ", request_type=request.request_type, data={"user_profile": profile_dict})
     else:
       logging.warning("uid=%s query not found request=%s", uid, self._request_for_log(request))
       return ProfileResponse(code=0, msg=f"User with uid '{uid}' not found", request_type=request.request_type, data=None)

@@ -42,6 +42,12 @@ class UserProfileServ:
   # sleep_data 保留条数：与分析报告日级保留一致（日级 30）
   MAX_SLEEP_DATA_LEN = 30
 
+  # 场景使用 ↔ 睡眠记录的对齐窗口（"使用当晚"口径）：
+  # sleep_data 时间戳实测为次日早晨上传（约 04:47–09:14），场景使用发生在
+  # 前一晚（实测 15:00–18:30），两者间隔实测约 12.7–16 小时；取睡眠记录
+  # 时间戳往前回溯该窗口内的最近一次使用作为当晚生效场景
+  USAGE_SLEEP_LOOKBACK_SEC = 16 * 3600
+
   # ── 健康数据口径版本（健康数据同步接口_0814.md §8）─────────────────────
   # md §3 字段表全集（v2 现役口径）：一晚只有几~几十个点（已裁剪到睡眠跨度），
   # 上限对齐 md 客户端单切片上限 5000（约覆盖 100 晚），否则对账窗口稍长就被截断
@@ -557,13 +563,20 @@ class UserProfileServ:
 
   @staticmethod
   def _pick_best_sleep_quality_scene(profile: UserProfile, days: int = 7) -> Optional[dict]:
-    """Return the scene whose usage before sleep onset produced the highest avg sleep_quality.
+    """Return the scene whose usage before sleep produced the highest avg sleep_quality.
 
     For each sleep night in the last ``days`` days:
-      - Compute sleep onset datetime from sleep_data.timestamp + first_sleep_time.
-      - Look at scene usages in the 4-hour wind-down window before onset.
-      - Pick the scene usage closest to onset as the "effective" scene for that night.
+      - Look at scene usages within USAGE_SLEEP_LOOKBACK_SEC before the sleep
+        record's timestamp (real data: sleep records are uploaded the next
+        morning ~04:47–09:14, scene usage happens the previous evening
+        ~15:00–18:30, an observed gap of ~12.7–16 h).
+      - Pick the scene usage closest to (but not after) the record timestamp
+        as the "effective" scene for that night.
       - Attribute that night's sleep_quality to that scene.
+
+    Note: first_sleep_time is NOT used for alignment — in real data it is None
+    for most records, which previously caused every night to be skipped and
+    best_sleep_quality_scene_7d to never be produced (weekly_best.score missing).
 
     The returned dict contains the scene with the highest average sleep_quality.
     """
@@ -598,33 +611,23 @@ class UserProfileServ:
       return None
 
     # Attribute sleep_quality to the effective scene per night.
+    # 不按记录条数切片（一晚可能多条记录，条数切片会缩短实际天数窗口），
+    # 窗口完全由上面的 cutoff_ts（自然时间）控制
     scene_qualities: dict[str, list[float]] = {}
-    for record in profile.sleep_data[-days:]:
+    for record in profile.sleep_data:
       if record.timestamp < cutoff_ts:
         continue
-      if record.sleep_quality is None or not record.first_sleep_time:
+      if record.sleep_quality is None:
         continue
 
-      try:
-        sleep_dt = datetime.datetime.fromtimestamp(record.timestamp)
-        hour, minute = record.first_sleep_time.split(":")
-        onset_dt = sleep_dt.replace(hour=int(hour), minute=int(minute), second=0, microsecond=0)
-        if onset_dt > sleep_dt:
-          onset_dt -= datetime.timedelta(days=1)
-      except Exception:
-        continue
-
-      onset_ts = int(onset_dt.timestamp())
-      window_start_ts = onset_ts - 4 * 3600  # 4-hour wind-down window
-
-      # Pick the scene usage closest to onset but not after it.
+      # Pick the scene usage closest to (but not after) the record timestamp,
+      # within the lookback window — i.e. the usage from "that night".
       best_usage = None
       best_delta = None
       for usage in usages:
-        ts = usage["timestamp"]
-        if ts < window_start_ts or ts > onset_ts:
+        delta = record.timestamp - usage["timestamp"]
+        if delta < 0 or delta > UserProfileServ.USAGE_SLEEP_LOOKBACK_SEC:
           continue
-        delta = onset_ts - ts
         if best_delta is None or delta < best_delta:
           best_delta = delta
           best_usage = usage
