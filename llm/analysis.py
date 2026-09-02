@@ -298,6 +298,7 @@ def _prompt_explore(ctx: dict, modules: list) -> str:
     if "night_fluctuation" in wanted:
         schema["night_fluctuation"] = {
             "label":       "<status phrase: e.g. Normal | Moderate | High Fluctuation>",
+            "awake_type":  "<short localized label for the awakening pattern, based on the given awake count/minutes; e.g. Brief awakening | Frequent awakenings | Prolonged awakening>",
             "description": "<1 sentence about disturbances and system response>",
         }
     if "scene_preference" in wanted:

@@ -185,20 +185,17 @@ class SleepResult(BaseModel):
 
   @property
   def sequence_summaries(self):
-    awake_types = {}
-    for seq in self.sleep_status:
-      if seq.sleep_type == "awake":
-        awake_types[seq.sleep_type] = awake_types.get(seq.sleep_type, 0) + 1
-
-    max_awake_type = max(awake_types, key=awake_types.get) if awake_types else None
+    # 觉醒类型由次数+总时长统计派生（原实现按 sleep_type 取众数，key 恒为 "awake"，恒返回 "awake"）
+    awake_count = sum(1 for seq in self.sleep_status if seq.sleep_type == "awake")
+    awake_duration = sum(seq.duration for seq in self.sleep_status if seq.sleep_type == "awake")
 
     return {
       "rem_sleep_duration": sum(seq.duration for seq in self.sleep_status if seq.sleep_type == "rem"),
       "core_sleep_duration": sum(seq.duration for seq in self.sleep_status if seq.sleep_type == "core"),
       "deep_sleep_duration": sum(seq.duration for seq in self.sleep_status if seq.sleep_type == "deep"),
-      "night_awake_duration": sum(seq.duration for seq in self.sleep_status if seq.sleep_type == "awake"),
-      "night_awake_count": sum(1 for seq in self.sleep_status if seq.sleep_type == "awake"),
-      "night_awake_type": max_awake_type,
+      "night_awake_duration": awake_duration,
+      "night_awake_count": awake_count,
+      "night_awake_type": _classify_awake_type(awake_count, awake_duration),
       "time_in_bed": sum(seq.duration for seq in self.sleep_status)
     }
 

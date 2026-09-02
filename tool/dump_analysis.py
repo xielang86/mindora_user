@@ -33,6 +33,7 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from tool.user_server_client import UserServerClient
+from user_profile import short_scene_id
 
 ANALYSIS_TYPES = [
   "analysis_overview",
@@ -62,7 +63,8 @@ def _top_scenes(mindora_record: dict, days: int, limit: int) -> list[str]:
   cutoff = int(time.time()) - days * 86400
   counts = {}
   for scene_id, records in (mindora_record or {}).items():
-    name = scene_id.replace("sleep.scene.", "").replace("_", " ").title()
+    # 与服务端 short_scene_id 同口径：strip 所有已知前缀（sleep.scene. / sleep.pure_music. 等）
+    name = short_scene_id(scene_id).replace("_", " ").title()
     cnt = sum(
       1 for e in (records or [])
       if isinstance(e, (list, tuple)) and e and int(e[0]) >= cutoff
