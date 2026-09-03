@@ -352,7 +352,14 @@ class AnalysisContentService:
         or (start_date is None and end_date is None and (date is None or date == c_date))
       )
       if is_current_period:
-        return reports[-1]
+        latest = reports[-1]
+        # 报告自身也必须属于当前周期：否则过期的兜底报告会盖住最新骨架
+        # （如 9/2 的请求合并进 8/21 生成的"还没有睡眠数据"兜底文案）
+        if latest.start_date is not None:
+          if latest.start_date == c_start and latest.end_date == c_end:
+            return latest
+        elif latest.date == c_date:
+          return latest
     return None
 
   @staticmethod

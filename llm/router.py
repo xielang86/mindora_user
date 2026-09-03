@@ -139,11 +139,13 @@ class AnthropicCompatibleChat(BaseChatModel):
             timeout=timeout_seconds,
         )
         try:
+            # 新版 anthropic SDK（kimi coding 端点同构）已移除 messages.create 的
+            # temperature 参数（采样档位挪到 output_config.effort），传了会 TypeError，
+            # 这里不再传，用服务端默认采样
             resp = client.messages.create(
                 model=self.model,
                 system="\n\n".join(system_parts) if system_parts else anthropic.NOT_GIVEN,
                 messages=anthropic_messages,
-                temperature=self.temperature,
                 max_tokens=self.max_tokens,
                 stop_sequences=stop if stop else anthropic.NOT_GIVEN,
             )
