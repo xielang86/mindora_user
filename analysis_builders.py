@@ -64,8 +64,46 @@ def _score_label(score: int) -> str:
   return "Excellent" if score >= 80 else "Good" if score >= 60 else "Fair"
 
 
+# ── 骨架文案本地化（md 文本返回约定：文本字段优先按 data.language 返回）──────
+# 只覆盖骨架里的确定性标签枚举；LLM 报告文案按请求语言生成后由 deep_merge 覆盖。
+# key 为英文枚举值，value 为各语言译文。
+# 翻译策略：目前只配置已确认的中文（简/繁）与英文；其余语言（de/es/fr/it/ja/ko/id）
+# 暂不凑机器翻译，由 _localize 统一降级英文（md 允许降级英文、结构不变），
+# 待翻译确认后按同样格式补进对应条目即可。
+_LABEL_I18N: dict[str, dict[str, str]] = {
+  "Excellent": {"zh-Hans": "优秀", "zh-Hant": "優秀", "en": "Excellent"},
+  "Good":      {"zh-Hans": "良好", "zh-Hant": "良好", "en": "Good"},
+  "Fair":      {"zh-Hans": "一般", "zh-Hant": "一般", "en": "Fair"},
+  "Sleep Score": {"zh-Hans": "睡眠得分", "zh-Hant": "睡眠得分", "en": "Sleep Score"},
+  "Normal":    {"zh-Hans": "正常", "zh-Hant": "正常", "en": "Normal"},
+  "High Fluctuation": {"zh-Hans": "波动较大", "zh-Hant": "波動較大", "en": "High Fluctuation"},
+  "Brief awakening":      {"zh-Hans": "短暂觉醒", "zh-Hant": "短暫覺醒", "en": "Brief awakening"},
+  "Frequent awakenings":  {"zh-Hans": "频繁觉醒", "zh-Hant": "頻繁覺醒", "en": "Frequent awakenings"},
+  "Prolonged awakening":  {"zh-Hans": "长时间觉醒", "zh-Hant": "長時間覺醒", "en": "Prolonged awakening"},
+  "Moderate awakening":   {"zh-Hans": "中度觉醒", "zh-Hant": "中度覺醒", "en": "Moderate awakening"},
+}
+
+
+def _localize(text: Optional[str], language: str) -> Optional[str]:
+  """骨架标签按请求语言取译文；无译文降级英文（md：降级英文但结构不变）。"""
+  if not text:
+    return text
+  entry = _LABEL_I18N.get(text)
+  if not entry:
+    return text
+  return entry.get(language) or entry.get("en", text)
+
+
+# 响应级 meta 字段：不属于可请求模块，modules 过滤时始终保留。
+# data_ready：探索页空态开关（md 的 modules 列表不含它，按列表过滤会把它误删）；
+# insight：6 模块洞察报告，/analysis 是其唯一客户端出口，同样不在 md 模块列表里
+RESPONSE_META_KEYS = {"data_ready", "insight"}
+
+
 def filter_modules(data: dict, modules: list) -> dict:
-  return {k: v for k, v in data.items() if k in modules} if modules else data
+  if not modules:
+    return data
+  return {k: v for k, v in data.items() if k in modules or k in RESPONSE_META_KEYS}
 
 
 def _scene_stats(days: int, profile: Optional[UserProfile]) -> dict:
@@ -169,7 +207,7 @@ def build_sleep_week(d, profile: Optional[UserProfile]) -> dict:
   score = _window_avg_score(profile, start, end)
   if score is not None:
     result["score_summary"] = {
-      "score": score, "label": _score_label(score), "start_date": start, "end_date": end,
+      "score": score, "label": _localize(_score_label(score), d.language), "start_date": start, "end_date": end,
     }
 
   # sleep_trends：纯文案模块（LLM 报告覆盖）
@@ -204,7 +242,7 @@ def build_sleep_month(d, profile: Optional[UserProfile]) -> dict:
   score = _window_avg_score(profile, start, end)
   if score is not None:
     result["score_summary"] = {
-      "score": score, "label": _score_label(score), "start_date": start, "end_date": end,
+      "score": score, "label": _localize(_score_label(score), d.language), "start_date": start, "end_date": end,
     }
 
   # sleep_trends：body/description 为 LLM 文案；score_series 取窗口内真实逐日评分，无数据为空序列
@@ -292,7 +330,7 @@ def build_explore(d, profile: Optional[UserProfile]) -> dict:
   result["header_summary"] = {"intro_text": "", "intro_detail_text": "", "date": date}
 
   # 顶部总分环：总分=当夜得分；三段分值 = soe / sleep_arch_index / night_var_index（缺哪个省哪个）
-  score_summary: dict = {"title": "Sleep Score", "date": date}
+  score_summary: dict = {"title": _localize("Sleep Score", d.language), "date": date}
   if latest.sleep_quality is not None:
     score_summary["score"] = int(latest.sleep_quality)
   if latest.soe is not None:
@@ -334,7 +372,7 @@ def build_explore(d, profile: Optional[UserProfile]) -> dict:
   # Night Fluctuation 卡
   awake_count = summaries.get("night_awake_count", 0)
   fluctuation: dict = {
-    "label": "High Fluctuation" if awake_count > 3 else "Normal",
+    "label": _localize("High Fluctuation" if awake_count > 3 else "Normal", d.language),
     "description": "",
     "date": date,
   }
@@ -347,7 +385,7 @@ def build_explore(d, profile: Optional[UserProfile]) -> dict:
     fluctuation["awake_count"] = awake_count
     fluctuation["awake_duration_minutes"] = int(summaries.get("night_awake_duration", 0))
     if summaries.get("night_awake_type"):
-      fluctuation["awake_type"] = summaries["night_awake_type"]
+      fluctuation["awake_type"] = _localize(summaries["night_awake_type"], d.language)
   if latest.hr_min is not None and latest.hr_max is not None:
     fluctuation["heart_rate_range"] = f"{int(latest.hr_min)}-{int(latest.hr_max)}bpm"
   if latest.respiratory_var is not None:

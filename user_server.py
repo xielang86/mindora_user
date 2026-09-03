@@ -636,6 +636,15 @@ class UserServer:
       report = UserProfileServ._find_analysis_report(
         profile, req.request_type, req.data.date, req.data.start_date, req.data.end_date,
       )
+      if report is not None and (report.language or "en") != (req.data.language or "en"):
+        # 文本返回约定：文案必须按 data.language 返回。语言不匹配的库存报告不合并
+        # （回退骨架/客户端本地默认），并按新语言触发后台重生成
+        logging.info(
+          "skip report merge: language mismatch report=%s req=%s rt=%s uid=%s",
+          report.language, req.data.language, req.request_type, uid,
+        )
+        report = None
+        await self._schedule_llm_update_if_needed(uid, delay=0)
       if report:
         # 只合并客户端请求的模块，保持 modules 分字段查询语义不被库存报告击穿
         updates = report.modules

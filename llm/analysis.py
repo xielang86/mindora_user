@@ -115,13 +115,16 @@ def extract_sleep_context(profile, data) -> dict:
 def deep_merge(base: dict, updates: dict) -> None:
     """
     Recursively merge `updates` into `base`, overwriting only non-empty string
-    values.  Numeric / boolean / list values in `base` are never overwritten.
+    values.  Numeric / boolean values in `base` are never overwritten.
+    Non-empty lists (e.g. LLM-localized scenario_list) overwrite list values.
     """
     for k, v in updates.items():
         if k not in base:
             base[k] = v
         elif isinstance(v, dict) and isinstance(base.get(k), dict):
             deep_merge(base[k], v)
+        elif isinstance(v, list) and v and isinstance(base.get(k), list):
+            base[k] = v
         elif isinstance(v, str) and v.strip():
             base[k] = v
         # skip None, empty strings, and non-string overrides of existing data
@@ -186,12 +189,16 @@ Sleep data summary:
 - 7-day average sleep quality: {ctx.get('avg_sleep_quality','—')} / 100
 - Last night's quality: {ctx.get('latest_score','—')} / 100
 - Most-used scene (7 days): {ctx.get('scene_name','—')} × {ctx.get('used_times','—')} times
+- Weekly-best audio (raw name): {ctx.get('weekly_best_audio_name') or ctx.get('scene_name','—')}
 
 Return JSON with exactly these keys:
 {{
   "sleep_insight": {{
     "title": "<8 words or fewer>",
     "description": "<1–2 sentences>"
+  }},
+  "weekly_best": {{
+    "audio_name": "<the given weekly-best audio name, localized into the target language; keep it a short display name>"
   }}
 }}"""
 
@@ -231,6 +238,7 @@ def _prompt_sleep_week(ctx: dict) -> str:
 Weekly sleep summary ({ctx.get('start_date')} – {ctx.get('end_date')}):
 - Average quality score: {score} / 100  (baseline label: {label})
 - Most-used scene: {ctx.get('scene_name','—')} × {ctx.get('used_times','—')} times
+- Best onset-efficiency scene this week (raw name): {ctx.get('onset_scenario_name') or ctx.get('scene_name','—')}
 - Typical first-sleep time: {ctx.get('typical_first_sleep_time','—')}
 - Deep sleep proportion: {ctx.get('avg_deep_pct','—')}%  REM: {ctx.get('avg_rem_pct','—')}%
 
@@ -242,6 +250,9 @@ Return JSON with exactly these keys:
   "sleep_trends": {{
     "body":        "<headline ≤8 words>",
     "description": "<1–2 sentences summarising the week's pattern>"
+  }},
+  "onset_efficiency": {{
+    "scenario_name": "<the given best onset-efficiency scene name, localized into the target language; keep it a short display name>"
   }}
 }}"""
 
@@ -249,12 +260,14 @@ Return JSON with exactly these keys:
 def _prompt_sleep_month(ctx: dict) -> str:
     score = ctx.get('avg_sleep_quality')
     scene_name = ctx.get('scene_name') or '—'
+    scene_list = ctx.get('onset_scenario_list') or '—'
     score = score if score is not None else '—'
     return f"""{_lang_instruction(ctx.get('language','en'))}
 
 Monthly sleep summary ({ctx.get('start_date')} – {ctx.get('end_date')}):
 - Average quality score: {score} / 100
 - Top sleep scene: {scene_name}
+- Top scenes this month (raw names, keep this order): {scene_list}
 - Average deep sleep: {ctx.get('avg_deep_pct','—')}%  REM: {ctx.get('avg_rem_pct','—')}%
 
 Return JSON with exactly these keys:
@@ -267,6 +280,7 @@ Return JSON with exactly these keys:
     "description": "<1–2 sentences about the month's sleep trend>"
   }},
   "onset_efficiency": {{
+    "scenario_list": ["<the given top scene names, each localized into the target language, same order, same count>"],
     "description": "<1 sentence about the best-performing scene(s)>"
   }}
 }}"""
@@ -303,6 +317,8 @@ def _prompt_explore(ctx: dict, modules: list) -> str:
         }
     if "scene_preference" in wanted:
         schema["scene_preference"] = {
+            "scene_name":  "<the preferred scene display name, localized into the target language>",
+            "scene_type":  "<scene type description, e.g. Ocean / Forest / Rain / Wind, localized>",
             "description": "<1 sentence why this scene matched the sleep rhythm>",
         }
     if "sleep_advice" in wanted:
@@ -432,6 +448,8 @@ class SleepAnalysisLLM:
     def __init__(self, router: Optional["ModelRouter"] = None):
         self._router = router or ModelRouter.from_env()
         self._model = self._router.chat_model_for("default")
+        # request_type → 最近成功方向名：下次优先用它，避免每次都先撞失败方向
+        self._last_good: dict[str, str] = {}
         if self._model is None:
             logging.warning(
                 "no available LLM route (set ARK_API_KEY or KIMI_API_KEY) — LLM analysis disabled, using default text"
@@ -443,6 +461,25 @@ class SleepAnalysisLLM:
         if router is None:
             return self._model
         return router.chat_model_for(request_type) or self._model
+
+    def _candidate_models(self, request_type: str) -> list[tuple[str, "VolcEngineArkChat"]]:
+        """按优先级返回 [(方向名, model)]：最近成功方向优先，其余按路由表注册顺序。
+
+        调用级故障转移的候选序列：首选方向调用失败/超时/非 JSON 时按序切换。
+        """
+        router = getattr(self, "_router", None)
+        if router is None:
+            return [("default", self._model)] if self._model is not None else []
+        routes = router.available_routes(request_type)
+        last = getattr(self, "_last_good", {}).get(request_type)
+        if last:
+            routes = sorted(routes, key=lambda r: 0 if r.name == last else 1)
+        out = []
+        for route in routes:
+            model = router.chat_model_for_route(route)
+            if model is not None:
+                out.append((route.name, model))
+        return out
 
     @property
     def enabled(self) -> bool:
@@ -456,12 +493,9 @@ class SleepAnalysisLLM:
 
     # ── internal ──────────────────────────────────────────────
 
-    async def _call(self, user_prompt: str, request_type: str = "default", language: str = "en") -> Optional[str]:
-        """Run a blocking LLM call in a thread pool."""
-        if not self.enabled:
-            return None
-        model = self._model_for(request_type)
-        if model is None:
+    async def _call(self, user_prompt: str, model, route_name: str, language: str = "en") -> Optional[str]:
+        """Run a blocking LLM call in a thread pool（指定方向；失败由调用方切换方向）。"""
+        if not self.enabled or model is None:
             return None
 
         def _invoke() -> str:
@@ -480,9 +514,9 @@ class SleepAnalysisLLM:
                 timeout=130,
             )
         except asyncio.TimeoutError:
-            logging.warning("LLM call timed out")
+            logging.warning("LLM call timed out (route=%s)", route_name)
         except Exception as e:
-            logging.error("LLM call error: %s", e)
+            logging.error("LLM call error (route=%s): %s", route_name, e)
         return None
 
     def _parse(self, text: Optional[str]) -> Optional[dict]:
@@ -526,15 +560,19 @@ class SleepAnalysisLLM:
             return None
 
         prompt = prompt_fn() + _lang_closing(language)
-        for attempt in (1, 2):
-            raw = await self._call(prompt, request_type, language)
-            result = self._parse(raw)
-            if result is None:
-                return None  # 调用失败/非 JSON：不重试，走兜底
-            if _language_matches(result, language):
-                return result
-            logging.warning("LLM output not in %s (request_type=%s), retry %d/2", language, request_type, attempt)
-        logging.error("LLM output language mismatch (%s, request_type=%s) after retry, using fallback", language, request_type)
+        # 调用级故障转移：首选方向失败（异常/超时/非 JSON/语言校验不过）→ 切换下一个方向
+        for route_name, model in self._candidate_models(request_type):
+            for attempt in (1, 2):
+                raw = await self._call(prompt, model, route_name, language)
+                result = self._parse(raw)
+                if result is None:
+                    break  # 调用失败/非 JSON：换下一个方向
+                if _language_matches(result, language):
+                    self._last_good[request_type] = route_name
+                    return result
+                logging.warning("LLM output not in %s (route=%s, request_type=%s), retry %d/2", language, route_name, request_type, attempt)
+            logging.warning("llm route %s failed for request_type=%s, trying next route", route_name, request_type)
+        logging.error("all llm routes failed (request_type=%s), using fallback", request_type)
         return None
 
     def generate_sync(
@@ -567,25 +605,26 @@ class SleepAnalysisLLM:
         if prompt_fn is None:
             return None
 
-        model = self._model_for(request_type)
-        if model is None:
-            return None
-
         prompt = prompt_fn() + _lang_closing(language)
-        for attempt in (1, 2):
-            try:
-                resp = model.invoke([
-                    SystemMessage(content=_system_prompt(language)),
-                    HumanMessage(content=prompt),
-                ])
-                result = self._parse(resp.content)
-            except Exception as e:
-                logging.error("LLM sync call error: %s", e)
-                return None
-            if result is None:
-                return None  # 非 JSON：不重试，走兜底
-            if _language_matches(result, language):
-                return result
-            logging.warning("LLM output not in %s (request_type=%s), retry %d/2", language, request_type, attempt)
-        logging.error("LLM output language mismatch (%s, request_type=%s) after retry, using fallback", language, request_type)
+        # 调用级故障转移：首选方向失败（异常/超时/非 JSON/语言校验不过）→ 切换下一个方向
+        for route_name, model in self._candidate_models(request_type):
+            for attempt in (1, 2):
+                try:
+                    resp = model.invoke([
+                        SystemMessage(content=_system_prompt(language)),
+                        HumanMessage(content=prompt),
+                    ])
+                    result = self._parse(resp.content)
+                except Exception as e:
+                    logging.error("LLM sync call error (route=%s): %s", route_name, e)
+                    break  # 换下一个方向
+                if result is None:
+                    logging.warning("LLM returned non-JSON (route=%s, request_type=%s)", route_name, request_type)
+                    break  # 换下一个方向
+                if _language_matches(result, language):
+                    self._last_good[request_type] = route_name
+                    return result
+                logging.warning("LLM output not in %s (route=%s, request_type=%s), retry %d/2", language, route_name, request_type, attempt)
+            logging.warning("llm route %s failed for request_type=%s, trying next route", route_name, request_type)
+        logging.error("all llm routes failed (request_type=%s), using fallback", request_type)
         return None

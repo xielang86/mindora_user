@@ -8,8 +8,12 @@ api_base / model 放 config.py，api_key 一律从环境变量读取（不落地
               base/model 可用 KIMI_API_BASE / KIMI_MODEL 覆盖
 
 路由规则来自 Config.LLM_ROUTING：request_type → 方向名，"default" 兜底。
-所选方向不可用（缺 key）时按注册顺序降级到第一个可用方向；全不可用返回 None，
-调用方按「LLM 未启用」处理（用默认文案/兜底策略）。
+两级兜底：
+  1. 选路时：所选方向不可用（缺 key）按注册顺序降级到第一个可用方向；
+  2. 调用时（available_routes）：首选方向调用失败/超时/返回非 JSON 时，
+     调用方按该列表顺序自动切换到其他可用方向（新增 LLM 来源只需在
+     from_env 的注册表里加一个 LLMRoute + config.py 配 base/model + 环境变量给 key）。
+全不可用返回空列表/None，调用方按「LLM 未启用」处理（用默认文案/兜底策略）。
 """
 
 import logging
@@ -229,6 +233,36 @@ class ModelRouter:
                 )
                 return fallback
         return None
+
+    def available_routes(self, request_type: str) -> list["LLMRoute"]:
+        """按优先级返回 request_type 的所有可用方向（首选在前，其余按注册顺序）。
+
+        调用方据此做调用级故障转移：首选方向调用失败/超时/非 JSON 时按列表顺序
+        切换到下一个方向。空列表 = 全不可用（按 LLM 未启用处理）。
+        """
+        wanted = self._rules.get(request_type) or self._rules.get("default")
+        ordered: list[LLMRoute] = []
+        if wanted and wanted in self._routes:
+            ordered.append(self._routes[wanted])
+        ordered.extend(r for name, r in self._routes.items() if name != wanted)
+        return [r for r in ordered if r.available]
+
+    def chat_model_for_route(
+        self,
+        route: "LLMRoute",
+        temperature: Optional[float] = None,
+    ) -> Optional[BaseChatModel]:
+        """返回指定方向的 chat model（按 方向+温度 缓存）；方向不可用返回 None。"""
+        if not route.available:
+            return None
+        key = (route.name, temperature)
+        if key not in self._models:
+            self._models[key] = self._build_chat_model(route, temperature)
+            logging.info(
+                "llm chat model created: route=%s model=%s api_base=%s",
+                route.name, route.model, route.api_base,
+            )
+        return self._models[key]
 
     def chat_model_for(
         self,

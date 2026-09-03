@@ -272,6 +272,18 @@ class AnalysisContentService:
       fake.modules = modules
 
       ctx = extract_sleep_context(profile, fake)
+      # 场景/音频名注入 ctx：LLM 只负责把这些名称按 language 本地化（输入语言不重要）
+      sleep_analysis = profile.sleep_analysis or {}
+      most_used = sleep_analysis.get("most_used_scene_7d") or sleep_analysis.get("most_used_scene")
+      if request_type == "analysis_overview" and most_used:
+        ctx["weekly_best_audio_name"] = most_used.get("scene_name")
+      elif request_type == "analysis_sleep_week" and most_used:
+        ctx["onset_scenario_name"] = most_used.get("scene_name")
+      elif request_type == "analysis_sleep_month":
+        from analysis_builders import _top_scenes  # 延迟 import 避免循环依赖
+        ctx["onset_scenario_list"] = [name for _sid, name, _c in _top_scenes(profile, days=30, limit=3)]
+      elif request_type == "analysis_explore" and most_used:
+        ctx["explore_scene_name"] = most_used.get("scene_name")
       try:
         llm_result = self.llm.generate_sync(request_type, ctx, language, modules)
       except Exception as e:

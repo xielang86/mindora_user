@@ -75,12 +75,21 @@ class UserServerClient:
     }
     return self._post("/login", payload)
 
-  def query_profile(self) -> dict[str, Any]:
+  def query_profile(
+    self,
+    include_sleep_data: bool = True,
+    include_behaviors: bool = True,
+  ) -> dict[str, Any]:
+    # sleep_data / behaviors 是画像体积大头；不携带 behaviors 时服务端会同时去掉 health_sync_days
     payload = {
       "request_type": "query_profile",
       "timestamp": int(time.time()),
       "version": "1.0",
-      "data": self._auth_data(),
+      "data": {
+        **self._auth_data(),
+        "include_sleep_data": include_sleep_data,
+        "include_behaviors": include_behaviors,
+      },
     }
     return self._post("/user_profile", payload)
 
