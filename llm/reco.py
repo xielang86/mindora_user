@@ -1,7 +1,6 @@
 import json
 import logging
 import os
-import random
 import re
 import time
 from functools import lru_cache
@@ -194,6 +193,9 @@ def _build_prompt(profile: UserProfile) -> str:
 User profile JSON:
 {_summarize_profile_for_prompt(profile)}
 
+Current sleep analysis and advice (rule-computed from the user's own data; last night vs their 7-day baseline):
+{_sleep_analysis_summary(profile, getattr(profile, "last_request_language", None) or "en")}
+
 Sleep intervention knowledge base:
 {knowledge}
 
@@ -204,8 +206,8 @@ Scenario candidates:
 {json.dumps(_SCENARIO_CANDIDATES, ensure_ascii=False, indent=2)}
 
 Task:
-1. Read the user profile and infer the most likely sleep issue pattern, preferences, and suitable intervention style.
-2. Select the best 2 scenario candidates from the provided candidate list.
+1. Read the user's CURRENT sleep analysis and advice above (onset / structure / night fluctuations / scene association). Pick scenarios that best match their current sleep pattern and the advice already given.
+2. Select the best 2 scenario candidates from the provided candidate list, ordered by fit (first = best).
 3. You may reorder candidates, but every returned scenario and every stage field value must come from the candidate list.
 4. Keep the output schema exactly compatible with this Python model:
 {{
@@ -226,8 +228,72 @@ Task:
     }}
   ]
 }}
-5. Return exactly 2 scenarios.
+5. Return exactly 2 scenarios in ranked order.
 """
+
+
+def _sleep_analysis_summary(profile: UserProfile, lang: str) -> str:
+    """把当前睡眠分析与建议汇总成 prompt 段落（规则结论 + 7d/当夜聚合 + 场景使用 +
+    已存洞察报告），让推荐随睡眠状态变化。
+
+    之前推荐恒定的根因：prompt 里的 sleep_analysis 只有永远为空的
+    sleep_trend_week/month（死字段），LLM 看不到任何真实睡眠数据。
+    """
+    try:
+        import insight_rules as ir
+    except Exception as e:
+        logging.warning("insight_rules unavailable for reco prompt: %s", e)
+        return ""
+    lines: list[str] = []
+    try:
+        tz = ir.resolve_tz(getattr(profile, "last_request_timezone", None))
+        state = ir.compute_data_state(profile, tz)
+        base = ir.compute_baselines(profile, tz)
+        lines.append(
+            f"data_state={state}; valid nights: 7d={len(base.nights_7d)}, 30d={len(base.nights_30d)}"
+        )
+        if base.latest is not None:
+            parts = []
+            if base.latest.sleep_quality is not None:
+                parts.append(f"score={base.latest.sleep_quality:.0f}/100")
+            if base.latest.onset is not None:
+                parts.append(f"onset={base.latest.onset:.0f}min")
+            summ = base.latest.sequence_summaries if base.latest.sleep_status else {}
+            if summ:
+                tst = (summ.get("time_in_bed") or 0) - (summ.get("night_awake_duration") or 0)
+                parts.append(f"TST={tst:.0f}min")
+                parts.append(f"WASO={summ.get('night_awake_duration', 0):.0f}min")
+                parts.append(f"awakenings={summ.get('night_awake_count', 0)}")
+            lines.append("last night: " + ", ".join(parts))
+        # 规则结论（入睡/结构/波动/场景 + 建议），含与近7日个人基线的比较
+        _, _, conclusions = ir.build_night_conclusions(profile, lang)
+        for c in conclusions:
+            if c.text:
+                lines.append(f"insight[{c.key}|{c.state}] {c.title}: {c.text}")
+        # 场景使用与关联表现
+        top = ir.top_scenes_in_window(profile.mindora_record, end_ts=int(time.time()), days=7, limit=3)
+        if top:
+            lines.append("scene usage last 7d: " + ", ".join(f"{s}×{n}" for s, n in top))
+        sa = profile.sleep_analysis or {}
+        best = sa.get("best_sleep_quality_scene_7d")
+        if best:
+            lines.append(
+                f"best associated scene 7d: {best.get('scene_name')} "
+                f"(avg score {best.get('avg_sleep_quality')}, {best.get('nights')} nights)"
+            )
+        # 已存洞察报告（LLM 润色版，若已有）与建议动作
+        si = getattr(profile, "sleep_insight", None)
+        if si is not None:
+            for key in ("onset", "architecture", "intervention", "scene_preference"):
+                m = getattr(si, key, None)
+                if m is not None and getattr(m, "content", ""):
+                    lines.append(f"stored insight[{key}]: {m.content}")
+            onset_m = getattr(si, "onset", None)
+            if onset_m is not None and getattr(onset_m, "action", ""):
+                lines.append(f"current advice action: {onset_m.action}")
+    except Exception as e:
+        logging.warning("sleep analysis summary build failed: %s", e)
+    return "\n".join(lines)
 
 
 def _build_sop_reco_prompt(profile: UserProfile, candidates: List[str]) -> str:
@@ -236,6 +302,9 @@ def _build_sop_reco_prompt(profile: UserProfile, candidates: List[str]) -> str:
     return f"""
 User profile JSON:
 {_summarize_profile_for_prompt(profile)}
+
+Current sleep analysis and advice (rule-computed from the user's own data; last night vs their 7-day baseline):
+{_sleep_analysis_summary(profile, getattr(profile, "last_request_language", None) or "en")}
 
 Sleep intervention knowledge base:
 {knowledge}
@@ -247,8 +316,8 @@ Standard SOP process candidates:
 {json.dumps(candidates, ensure_ascii=False, indent=2)}
 
 Task:
-1. Read the user profile and infer the most likely sleep issue pattern, preferences, and suitable intervention style.
-2. Select the best 3 SOP process candidates from the provided candidate list.
+1. Read the user's CURRENT sleep analysis and advice above (onset / structure / night fluctuations / scene association). Pick SOP processes that best match their current sleep pattern and the advice already given — e.g. slow onset → stronger relaxation/induction; frequent awakenings → steadier deep-stage sound; a well-associated scene → keep its acoustic style.
+2. Select the best 3 SOP process candidates from the provided candidate list, ordered by fit (first = best).
 3. You may reorder candidates, but every returned value must come from the candidate list.
 4. Do not return any `sleep.pure_music.*` candidate. Restrict the result to guided `sleep.scene.*` candidates only.
 5. Keep the output schema exactly compatible with this JSON structure:
@@ -271,7 +340,7 @@ Task:
   ]
 }}
 6. Only set `cmd_name`; all other fields should be null.
-7. Return exactly 3 SOP process ids.
+7. Return exactly 3 SOP process ids in ranked order.
 """
 
 
@@ -436,12 +505,6 @@ def _fallback_sop_reco(candidates: List[SleepScenario]) -> List[SleepScenario]:
     return [_build_sop_reco_scenario(item) for item in _default_sop_candidates()[:3]]
 
 
-def _pick_random_sop_reco(scenarios: List[SleepScenario]) -> List[SleepScenario]:
-    if not scenarios:
-        return []
-    return [random.choice(scenarios)]
-
-
 class RecommendationEngine:
     """根据用户画像生成 Sleep Scenarios 的引擎"""
 
@@ -515,7 +578,7 @@ class RecommendationEngine:
         model = _get_model()
         if model is None:
             logging.warning("no available LLM route (ARK_API_KEY/KIMI_API_KEY unset), using fallback SOP candidates")
-            return _pick_random_sop_reco(fallback)
+            return fallback[:3]
 
         prompt = _build_sop_reco_prompt(profile, normalized_candidates)
         _append_llm_trace("request", "sleep_sop_reco", prompt)
@@ -529,10 +592,11 @@ class RecommendationEngine:
             parsed = _extract_json(response.content)
             reco = _validate_sop_reco(parsed, candidate_scenarios)
             if len(reco) == min(3, len(normalized_candidates)):
-                return _pick_random_sop_reco(reco)
+                # 按 LLM 排序整体返回（第一位=最匹配），不再随机丢弃排序
+                return reco
             logging.warning("sleep sop recommendation llm returned %s valid candidates, using fallback", len(reco))
         except Exception as e:
             _append_llm_trace("error", "sleep_sop_reco", prompt, error_text=str(e))
             logging.error("sleep sop recommendation llm call failed: %s", e)
 
-        return _pick_random_sop_reco(fallback)
+        return fallback[:3]
