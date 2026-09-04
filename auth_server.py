@@ -66,8 +66,10 @@ mock_db = {
 
 # 加载配置（JWT 签名密钥改为 RS256 私钥文件，见 common/jwt_keys.py；
 # JWT_SECRET_KEY 仅作为旧 HS256 token 的验签回退，不再用于签发）
-JWT_EXPIRE_SECONDS = int(os.getenv("JWT_EXPIRE_SECONDS"))
-VERIFY_CODE_EXPIRE_SECONDS = int(os.getenv("VERIFY_CODE_EXPIRE_SECONDS"))
+# 加载配置（JWT 签名密钥改为 RS256 私钥文件，见 common/jwt_keys.py；
+# JWT_SECRET_KEY 仅作为旧 HS256 token 的验签回退，不再用于签发）
+JWT_EXPIRE_SECONDS = int(os.getenv("JWT_EXPIRE_SECONDS", "2592000"))  # token 有效期，默认 30 天
+VERIFY_CODE_EXPIRE_SECONDS = int(os.getenv("VERIFY_CODE_EXPIRE_SECONDS", "300"))  # 验证码有效期，默认 5 分钟
 REDEMPTION_ADMIN_SECRET = os.getenv("REDEMPTION_ADMIN_SECRET", "")
 
 # Apple 审核专用账号：env AUTH_REVIEW_CODES="email:code,email2:code2"
