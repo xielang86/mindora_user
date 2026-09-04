@@ -174,6 +174,17 @@ def run_checks(profile: dict, responses: dict[str, dict], date: str, has_sleep_s
     check_sleep_eq("探索 explore", "onset_efficiency.onset_minutes", (d.get("onset_efficiency") or {}).get("onset_minutes"), latest.get("onset") and int(latest["onset"]), "当夜 onset")
     sp = d.get("scene_preference") or {}
     c.add("探索 explore", "scene_preference.scene_name", sp.get("scene_name"), "📝 应对应 most_used_scene_7d")
+    # M27 洞察数据：三个展示指数（规则现算，不经过 LLM）
+    io_ = d.get("insight_overview") or {}
+    if io_:
+        idx_ok = all(io_.get(k) is None or 0 <= io_.get(k) <= 100
+                     for k in ("onset_index", "structure_index", "stability_index"))
+        c.add("探索 explore", "insight_overview",
+              {k: io_.get(k) for k in ("onset_index", "structure_index", "stability_index", "data_state")},
+              "✅ 指数在 0-100（规则现算）" if idx_ok else "❌ 指数越界")
+    else:
+        c.add("探索 explore", "insight_overview", "(缺省)",
+              "➖ 数据不足无指数" if not has_sleep_source else "❌ 有睡眠数据应返回 insight_overview")
     for mod in ("header_summary", "onset_efficiency", "sleep_structure", "night_fluctuation", "scene_preference", "sleep_advice"):
       c.check_text("探索 explore", f"{mod}.description/intro", json.dumps({k: v for k, v in (d.get(mod) or {}).items() if isinstance(v, str) and v}, ensure_ascii=False) or "(空)")
     insight = d.get("insight")

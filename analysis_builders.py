@@ -341,6 +341,25 @@ def build_explore(d, profile: Optional[UserProfile]) -> dict:
     score_summary["fluctuation_score"] = int(latest.night_var_index)
   result["score_summary"] = score_summary
 
+  # 洞察数据卡（规范 M27/AN_OVERVIEW）：评分引用 + 三个展示指数（规则现算，
+  # 不经过 LLM；指数只用于产品分层展示，不代表医学等级）
+  import insight_rules as ir  # 延迟 import（insight_rules 不反向依赖本模块）
+  tz = ir.resolve_tz(getattr(d, "timezone", None) or getattr(profile, "last_request_timezone", None))
+  _base = ir.compute_baselines(profile, tz)
+  _indices = ir.compute_insight_indices(profile, _base)
+  if any(_indices[k] is not None for k in ("onset_index", "structure_index", "stability_index")):
+    result["insight_overview"] = {
+      "date": date,
+      "data_state": _indices["state"],
+      "valid_nights": _indices["valid_nights"],
+      "onset_index": _indices["onset_index"],
+      "onset_label": ir.index_label(_indices["onset_index"], d.language),
+      "structure_index": _indices["structure_index"],
+      "structure_label": ir.index_label(_indices["structure_index"], d.language),
+      "stability_index": _indices["stability_index"],
+      "stability_label": ir.index_label(_indices["stability_index"], d.language),
+    }
+
   # Sleep Onset Efficiency 卡
   onset: dict = {"label": "", "description": "", "date": date}
   if latest.soe is not None:

@@ -31,6 +31,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from llm.ark_chat import VolcEngineArkChat
 from llm.router import ModelRouter
+from config import Config
 
 
 from user_profile import compute_recent_sleep_stats
@@ -347,6 +348,69 @@ Return JSON with exactly these keys:
 {json.dumps(schema, indent=2, ensure_ascii=False)}"""
 
 
+def _prompt_conclusion_polish(ctx: dict) -> str:
+    """规则结论润色 prompt（对照规范 v3 §4：LLM 仅可在既定事实上润色）。
+
+    输入是规则引擎算好的结构化结论（含事实、状态、已渲染文案），要求模型
+    只重写文本字段：不得增删数字/事实/场景/结论，不得使用禁用词，保持语言。
+    """
+    import json as _json
+    conclusions_json = _json.dumps(ctx.get("conclusions") or [], ensure_ascii=False, indent=1)
+    forbidden = "、".join(Config.INSIGHT_RULES["forbidden_terms"])
+    return f"""{_lang_instruction(ctx.get('language', 'en'))}
+
+You are polishing pre-computed sleep insight conclusions for the Mindora app.
+The conclusions below were computed by deterministic rules from the user's own data.
+Your ONLY job is to rewrite the "title" and "text" of each conclusion to read more
+naturally and warmly — the facts, numbers, states and judgments are already final.
+
+Conclusions (JSON):
+{conclusions_json}
+
+Hard constraints (violating any → output is rejected):
+- Do NOT add, remove or change any number, time, scene name, or factual claim.
+- Do NOT add new conclusions, diagnoses, causes, or effectiveness claims.
+- Do NOT use any of these forbidden terms: {forbidden}
+- Keep "title" ≤ 8 words and "text" ≤ 4 sentences.
+- Return ONLY a JSON object mapping each conclusion "key" to {{"title": ..., "text": ...}}.
+- Keys must be exactly the same set as the input conclusions."""
+
+
+def polish_output_ok(result: dict, conclusions: list, language: str) -> bool:
+    """LLM 润色输出校验（校验失败 → 保留规则模板文案）：
+    1) key 集合匹配；2) 语言校验；3) 禁用词；4) 输出数字必须能在输入中找到（防幻觉）；
+    5) 单字段长度上限。"""
+    if not isinstance(result, dict):
+        return False
+    keys = {getattr(c, "key", None) for c in conclusions}
+    if set(result.keys()) != {k for k in keys if k}:
+        return False
+    if not _language_matches(result, language):
+        return False
+    import json as _json
+    text_all = _json.dumps(result, ensure_ascii=False).lower()
+    for term in Config.INSIGHT_RULES["forbidden_terms"]:
+        if term.lower() in text_all:
+            return False
+    input_nums: set = set()
+    for c in conclusions:
+        input_nums |= set(re.findall(r"\d+", _json.dumps(getattr(c, "to_llm_dict", lambda: {})(), ensure_ascii=False)))
+        input_nums |= set(re.findall(r"\d+", str(getattr(c, "title", "")) + str(getattr(c, "text", ""))))
+    for v in result.values():
+        if not isinstance(v, dict):
+            return False
+        for field in ("title", "text"):
+            s = v.get(field)
+            if s is None:
+                continue
+            if len(s) > Config.INSIGHT_RULES["polish_max_chars"] * 3:
+                return False
+            for num in re.findall(r"\d+", s):
+                if num not in input_nums:
+                    return False
+    return True
+
+
 def _prompt_sleep_insight(ctx: dict) -> str:
     """Prompt for the 6-module insight page report (mindora_advice.md modules 0-5).
 
@@ -554,6 +618,8 @@ class SleepAnalysisLLM:
             "analysis_sleep_month":    lambda: _prompt_sleep_month(ctx),
             "analysis_explore":        lambda: _prompt_explore(ctx, modules),
             "sleep_insight_report":    lambda: _prompt_sleep_insight(ctx),
+            "sleep_insight_polish":    lambda: _prompt_conclusion_polish(ctx),
+            "insight_polish":          lambda: _prompt_conclusion_polish(ctx),
         }.get(request_type)
 
         if prompt_fn is None:
@@ -600,6 +666,8 @@ class SleepAnalysisLLM:
             "analysis_sleep_month":    lambda: _prompt_sleep_month(ctx),
             "analysis_explore":        lambda: _prompt_explore(ctx, modules),
             "sleep_insight_report":    lambda: _prompt_sleep_insight(ctx),
+            "sleep_insight_polish":    lambda: _prompt_conclusion_polish(ctx),
+            "insight_polish":          lambda: _prompt_conclusion_polish(ctx),
         }.get(request_type)
 
         if prompt_fn is None:

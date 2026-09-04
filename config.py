@@ -83,6 +83,52 @@ class Config:
   # 才做醒后预生成——纯设备后台同步、app 不活跃的用户不烧 LLM
   LLM_ANALYSIS_ACTIVITY_WINDOW_SECONDS = int(os.getenv("LLM_ANALYSIS_ACTIVITY_WINDOW_SECONDS", "86400"))
 
+  # ── 洞察规则引擎阈值（Mindora_App睡眠数据展示与分析对照规范_v3.md §4）────────
+  # 规范中标注「建议v1 / 阈值应后台可配置 / 待产品确认」的数值全部集中在这里；
+  # AN_SCORE 综合评分 v1 公式不采纳（不动现有 sleep_quality 计算），故无此项。
+  INSIGHT_RULES = {
+    # AN_DATA_STATE：数据状态机门槛
+    "data_state": {"baseline7_min_nights": 4, "baseline30_min_nights": 15},
+    # AN_ONSET：昨晚 SOL vs 近7日基线，|delta| 内视为稳定
+    "onset": {"delta_stable_min": 3},
+    # AN_STRUCTURE：阶段 Δ% 分层（相对近7日均值）
+    "structure": {"minor_delta_pct": 20, "major_delta_pct": 40},
+    # AN_FLUCTUATION：觉醒事件门槛与展开上限
+    "fluctuation": {"awake_min_minutes": 1, "list_max": 2, "expand_max": 3,
+                    "intervention_window_min": 10},
+    # AN_SCENE / SC_ASSOC：关联样本门槛（不足只说偏好）
+    "scene": {"assoc_min_uses_7d": 2, "assoc_min_uses_30d": 3},
+    # AN_ADVICE：每日最多条数、同类建议冷却、连续模式最少晚数、历史上限
+    "advice": {"max_per_day": 2, "same_type_cooldown_days": 7,
+               "pattern_min_nights": 3, "history_max_entries": 30},
+    # AN_HOME_SUMMARY：同主题不连续出现的天数
+    "home_summary": {"theme_cooldown_days": 1},
+    # AN_TREND_7D/30D：有效夜晚门槛、条数上限、最小可报告变化
+    "trend": {"max_items_7d": 2, "max_items_30d": 3,
+              "min_valid_7d": 4, "min_valid_30d": 15,
+              "min_change": {"tst_min": 20, "sol_min": 5, "waso_min": 10,
+                             "awake_count": 1, "clock_min": 15}},
+    # AN_ONSET_INDEX / AN_STRUCTURE_INDEX / AN_STABILITY_INDEX（建议v1 权重，
+    # 缺失子分按剩余权重归一）；label_bands 为产品状态分层（非医学等级），待确认
+    "indices": {
+      "onset":     {"weights": {"sol": 0.70, "hr_trend": 0.15, "rr_trend": 0.15}},
+      "structure": {"weights": {"duration": 0.45, "continuity": 0.35, "stage_stability": 0.20}},
+      "stability": {"weights": {"continuity": 0.50, "hr_stability": 0.25, "rr_stability": 0.25}},
+      "label_bands": [[80, "excellent"], [60, "good"], [0, "fair"]],
+      # 子分公式常量（建议v1，待产品确认）
+      "subscore_params": {"sol_full_min": 10, "sol_penalty_per_min": 2,
+                          "trend_dev_full_pct": 50, "stage_delta_full_pct": 100,
+                          "hr_range_full_pct": 50, "resp_var_full_pct": 50,
+                          "waso_penalty_per_min": 2, "awake_extra_penalty": 10},
+    },
+    # 洞察文案禁用词（规范生成限制；同时用于 LLM 润色输出校验）
+    "forbidden_terms": ["stress", "anxiety", "insomnia", "treatment", "diagnos",
+                        "焦虑", "失眠", "诊断", "治疗", "有效", "恢复", "焦虑型",
+                        "健康异常", "修复充分"],
+    # LLM 润色单字段长度上限（字符）
+    "polish_max_chars": 220,
+  }
+
   # ---------------------------------------------------------------------------
   # 旧版 DELETE_USER 接口访问控制：JWT 直接删除风险较高，仅允许特定 IP/MAC 调用。
   # 支持环境变量 DELETE_USER_ALLOWED_IPS / DELETE_USER_ALLOWED_MACS 覆盖，

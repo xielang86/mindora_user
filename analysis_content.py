@@ -21,6 +21,7 @@ from analysis_fallback import (
   build_fallback_report,
 )
 from llm import extract_sleep_context
+from llm.analysis import polish_output_ok as _polish_output_ok
 from user_profile import (
   UserProfile, SleepInsightReport, AnalysisTextReport,
   ANALYSIS_REPORT_KEYS, ANALYSIS_REPORT_RETENTION,
@@ -93,13 +94,17 @@ class AnalysisContentService:
   ]
 
   def calc_sleep_insight(self, uid: str, profile: UserProfile) -> Optional[SleepInsightReport]:
-    """Generate the 6-module insight report (mindora_advice.md 模块0-5) via LLM
-    and return it for storage in ``profile.sleep_insight``.
+    """Generate the 6-module insight report (mindora_advice.md 模块0-5).
+
+    生成方式（对照规范 v3 §4）：规则引擎先算结构化结论并填模板（llm_used=False，
+    立即可用、LLM 挂了也不影响输出）；LLM 启用时仅在既定事实上润色 title/content
+    （evidence/action 保留规则值），校验失败保留模板文案。
 
     复用策略（醒后每日更新机制）：有比 generated_at 更新的 sleep_data 夜晚就重算；
     没有新夜晚时 7 天内复用（慢速刷新兜底），超过 7 天也重算。
-    Returns None when there is nothing to store (LLM disabled and no existing report).
     """
+    import insight_rules as ir  # 延迟 import 避免顶层循环依赖
+
     existing = profile.sleep_insight
     now = int(time.time())
     # 文案语言：last_request_language（请求信封）优先，Profile.language 参考，兜底 en
@@ -123,49 +128,69 @@ class AnalysisContentService:
       )
       has_new_night = newest_sleep_ts > existing.generated_at
       if not has_new_night and now - existing.generated_at < 7 * 86400:
-        logging.info(f"sleep_insight still fresh for uid={uid}, skipping LLM")
+        logging.info(f"sleep_insight still fresh for uid={uid}, skipping regeneration")
         return existing
-    # existing 是兜底（llm_used=False）或语言已漂移 → 有真实夜晚了，继续走 LLM 替换之
-
-    if not self.llm or not self.llm.enabled:
-      return existing
+    # existing 是兜底（llm_used=False）或语言已漂移 → 有真实夜晚了，重新生成替换之
 
     report_tz = profile.last_request_timezone
+    today_str = _today_in_tz(report_tz).isoformat()
 
-    class _FakeData:
-      date = _today_in_tz(report_tz).isoformat()
-      start_date = None
-      end_date = None
-      language = lang
-
-    ctx = extract_sleep_context(profile, _FakeData())
-    llm_result = self.llm.generate_sync("sleep_insight_report", ctx, lang, [])
-    if not llm_result:
-      return existing
+    # ── 规则引擎：结构化结论 + 模板渲染（兜底文案，LLM 不可用也能输出）──
+    _, _, night_conclusions = ir.build_night_conclusions(profile, lang)
+    edu = ir.micro_education(profile, lang)
+    by_key = {c.key: c for c in night_conclusions}
+    by_key[edu.key] = edu
 
     report_data: dict[str, Any] = {
-      "date": _today_in_tz(report_tz).isoformat(),
-      "language": lang,
-      "generated_at": now,
-      "llm_used": True,
+      "date": today_str, "language": lang, "generated_at": now, "llm_used": False,
     }
     for key, module_id in self._INSIGHT_MODULE_KEYS:
-      m = llm_result.get(key) or {}
+      c = by_key.get(key)
+      if c is None:
+        report_data[key] = {"module_id": module_id}
+        continue
       report_data[key] = {
         "module_id": module_id,
-        "title": m.get("title", "") or "",
-        "content": m.get("content", "") or "",
-        "evidence": m.get("evidence", []) or [],
-        "action": m.get("action", "") or "",
+        "title": c.title,
+        "content": c.text,
+        "evidence": c.evidence or [],
+        "action": c.action or "",
+        "visible": c.visible,
       }
-
     try:
       report = SleepInsightReport(**report_data)
     except ValidationError as e:
-      logging.error(f"invalid insight report from LLM for uid={uid}: {e}")
+      logging.error(f"invalid rule-built insight report for uid={uid}: {e}")
       return existing
 
-    # 模块3 展示条件（mindora_advice.md）：近7日存在短暂觉醒才展示，否则前端隐藏
+    # ── LLM 润色（可选）：只重写 title/content，校验失败保留模板 ──
+    if self.llm and self.llm.enabled:
+      class _FakeData:
+        date = today_str
+        start_date = None
+        end_date = None
+        language = lang
+      ctx = extract_sleep_context(profile, _FakeData())
+      ctx["conclusions"] = [c.to_llm_dict() for c in night_conclusions]
+      llm_result = self.llm.generate_sync("sleep_insight_polish", ctx, lang, [])
+      if llm_result and _polish_output_ok(llm_result, night_conclusions, lang):
+        for key, _mid in self._INSIGHT_MODULE_KEYS:
+          m = llm_result.get(key) or {}
+          module = getattr(report, key, None)
+          if module is None:
+            continue
+          if m.get("title"):
+            module.title = m["title"]
+          if m.get("content"):
+            module.content = m["content"]
+        report.llm_used = True
+      elif llm_result:
+        logging.info(f"sleep_insight polish rejected by validator for uid={uid}, keeping rule text")
+
+    # 模块3 展示：规则结论为准；旧 avg_awake_count 检查过渡期保留为 OR 兜底
+    fluc = by_key.get("intervention")
+    if fluc is not None and fluc.visible:
+      report.intervention.visible = True
     stats = compute_recent_sleep_stats(profile, days=7)
     if not stats.get("avg_awake_count"):
       report.intervention.visible = False
@@ -186,7 +211,7 @@ class AnalysisContentService:
       ("analysis_overview", None, None, today_str, []),
       ("analysis_sleep_day", None, None, today_str, []),
       ("analysis_explore", None, None, today_str, [
-        "header_summary", "score_summary", "onset_efficiency",
+        "header_summary", "score_summary", "insight_overview", "onset_efficiency",
         "sleep_structure", "night_fluctuation", "scene_preference", "sleep_advice",
       ]),
       ("analysis_sleep_week", week_start, today_str, today_str, []),
@@ -251,62 +276,147 @@ class AnalysisContentService:
         changed = True
       return reports if changed else None
 
-    if not self.llm or not self.llm.enabled:
-      return None
+    # ── 规则引擎：结构化结论（LLM 不可用时模板报告立即可用，llm_used=False）──
+    import insight_rules as ir
+    tz = _resolve_tz(profile.last_request_timezone)
+    data_state = ir.compute_data_state(profile, tz)
+    base = ir.compute_baselines(profile, tz)
+    _, _, night_conclusions = ir.build_night_conclusions(profile, language)
+    mem = ir.insight_memory(profile)
+    today = base.today
+
+    # 规则结论 → 报告 modules 的映射（结论 key → (模块, 标题字段, 正文字段)）
+    _POLISH_MAP = {
+      "analysis_overview": {"home_summary": ("sleep_insight", "title", "description")},
+      "analysis_sleep_week": {"trend7": ("sleep_trends", "body", "description")},
+      "analysis_sleep_month": {"trend30": ("sleep_trends", "body", "description")},
+      "analysis_explore": {
+        "greeting": ("header_summary", None, "intro_text"),
+        "onset": ("onset_efficiency", "label", "description"),
+        "architecture": ("sleep_structure", "label", "description"),
+        "intervention": ("night_fluctuation", "label", "description"),
+        "scene_preference": ("scene_preference", None, "description"),
+        "advice": ("sleep_advice", None, "description"),
+      },
+    }
+
+    def _rule_group(request_type: str):
+      """返回 (该类型的规则结论列表, modules dict)；日视图无规则 → None。"""
+      by_key = {c.key: c for c in night_conclusions}
+      if request_type == "analysis_overview":
+        home = ir.rule_home_summary(night_conclusions, mem, language, today)
+        return [home], {"sleep_insight": {"title": home.title, "description": home.text}}
+      if request_type == "analysis_sleep_week":
+        t = ir.rule_trend(profile, base, language, 7)
+        return [t], {"sleep_trends": {"body": t.title, "description": t.text}}
+      if request_type == "analysis_sleep_month":
+        t = ir.rule_trend(profile, base, language, 30)
+        return [t], {"sleep_trends": {"body": t.title, "description": t.text}}
+      if request_type == "analysis_explore":
+        adv = ir.rule_advice(profile, base, data_state, night_conclusions, language)
+        modules = {
+          "header_summary": {"intro_text": by_key["greeting"].text, "intro_detail_text": ""},
+          "onset_efficiency": {"label": by_key["onset"].title, "description": by_key["onset"].text},
+          "sleep_structure": {"label": by_key["architecture"].title, "description": by_key["architecture"].text},
+          "night_fluctuation": {"label": by_key["intervention"].title, "description": by_key["intervention"].text},
+          "scene_preference": {"description": by_key["scene_preference"].text},
+          "sleep_advice": {"description": adv.text},
+        }
+        return [*night_conclusions, adv], modules
+      return None, None  # analysis_sleep_day：本阶段沿用 LLM 路径
+
+    llm_on = bool(self.llm and self.llm.enabled)
 
     for request_type, start_date, end_date, date, modules in specs:
       # 当前周期已有同语言真实报告 → 复用，不重复调 LLM；语言漂移视为过期，重生成。
-      # 兜底报告（llm_used=False）不算——有数据了就生成真报告替换之（同周期 upsert 覆盖）
+      # 规则模板报告（llm_used=False）不算——下次周期自然重算并尝试 LLM 润色
       current = _current_report(request_type, start_date, end_date, date)
       if current is not None and current.llm_used and current.language == language:
         continue
 
-      class _FakeData:
-        pass
-
-      fake = _FakeData()
-      fake.date = date
-      fake.start_date = start_date
-      fake.end_date = end_date
-      fake.language = language
-      fake.modules = modules
-
-      ctx = extract_sleep_context(profile, fake)
-      # 场景/音频名注入 ctx：LLM 只负责把这些名称按 language 本地化（输入语言不重要）
-      sleep_analysis = profile.sleep_analysis or {}
-      most_used = sleep_analysis.get("most_used_scene_7d") or sleep_analysis.get("most_used_scene")
-      if request_type == "analysis_overview" and most_used:
-        ctx["weekly_best_audio_name"] = most_used.get("scene_name")
-      elif request_type == "analysis_sleep_week" and most_used:
-        ctx["onset_scenario_name"] = most_used.get("scene_name")
-      elif request_type == "analysis_sleep_month":
-        from analysis_builders import _top_scenes  # 延迟 import 避免循环依赖
-        ctx["onset_scenario_list"] = [name for _sid, name, _c in _top_scenes(profile, days=30, limit=3)]
-      elif request_type == "analysis_explore" and most_used:
-        ctx["explore_scene_name"] = most_used.get("scene_name")
-      try:
-        llm_result = self.llm.generate_sync(request_type, ctx, language, modules)
-      except Exception as e:
-        logging.error(f"analysis report generation failed for {request_type}: {e}")
+      rule_conclusions, rule_modules = _rule_group(request_type)
+      if rule_modules is None:
+        # ── 日视图：沿用 LLM 自由生成（本阶段无对应规则）──
+        if not llm_on:
+          continue
+        class _FakeData:
+          pass
+        fake = _FakeData()
+        fake.date = date
+        fake.start_date = start_date
+        fake.end_date = end_date
+        fake.language = language
+        fake.modules = modules
+        ctx = extract_sleep_context(profile, fake)
+        try:
+          llm_result = self.llm.generate_sync(request_type, ctx, language, modules)
+        except Exception as e:
+          logging.error(f"analysis report generation failed for {request_type}: {e}")
+          continue
+        if not llm_result:
+          continue
+        report = AnalysisTextReport(
+          request_type=request_type, date=date, start_date=start_date, end_date=end_date,
+          language=language, generated_at=now, llm_used=True, modules=llm_result,
+        )
+        reports[request_type] = self._upsert_analysis_report(
+          reports[request_type], report, ANALYSIS_REPORT_RETENTION[request_type])
+        changed = True
         continue
 
-      if not llm_result:
-        continue
-
+      # ── 规则模板报告（兜底，llm_used=False，先 upsert 保证可用）──
       report = AnalysisTextReport(
-        request_type=request_type,
-        date=date,
-        start_date=start_date,
-        end_date=end_date,
-        language=language,
-        generated_at=now,
-        llm_used=True,
-        modules=llm_result,
+        request_type=request_type, date=date, start_date=start_date, end_date=end_date,
+        language=language, generated_at=now, llm_used=False, modules=rule_modules,
       )
+
+      # ── LLM 润色（可选）：只重写文本字段，校验失败保留模板 ──
+      if llm_on:
+        class _FakeData:
+          pass
+        fake = _FakeData()
+        fake.date = date
+        fake.start_date = start_date
+        fake.end_date = end_date
+        fake.language = language
+        fake.modules = modules
+        ctx = extract_sleep_context(profile, fake)
+        ctx["conclusions"] = [c.to_llm_dict() for c in rule_conclusions]
+        try:
+          llm_result = self.llm.generate_sync("insight_polish", ctx, language, modules)
+        except Exception as e:
+          logging.error(f"insight polish failed for {request_type}: {e}")
+          llm_result = None
+        if llm_result and _polish_output_ok(llm_result, rule_conclusions, language):
+          polish_map = _POLISH_MAP.get(request_type, {})
+          for c in rule_conclusions:
+            entry = polish_map.get(c.key)
+            m = llm_result.get(c.key) or {}
+            if not entry or not isinstance(m, dict):
+              continue
+            mod_key, title_field, text_field = entry
+            mod = report.modules.get(mod_key) or {}
+            if title_field and m.get("title"):
+              mod[title_field] = m["title"]
+            if m.get("text"):
+              mod[text_field] = m["text"]
+            report.modules[mod_key] = mod
+          report.llm_used = True
+        elif llm_result:
+          logging.info(f"insight polish rejected for {request_type}, keeping rule templates")
+
       reports[request_type] = self._upsert_analysis_report(
-        reports[request_type], report, ANALYSIS_REPORT_RETENTION[request_type],
-      )
+        reports[request_type], report, ANALYSIS_REPORT_RETENTION[request_type])
       changed = True
+
+    if changed:
+      # 长期记忆：建议历史（7 天同类去重依据）+ 昨日首页主题（避免连续重复）。
+      # 直接从规则函数重算（本调用内记忆尚未更新，结果与刚 upsert 的报告一致）
+      adv_c = ir.rule_advice(profile, base, data_state, night_conclusions, language)
+      home_c = ir.rule_home_summary(night_conclusions, mem, language, today)
+      ir.record_generation_memory(
+        profile, advice_types=adv_c.advice_types, home_theme=home_c.home_theme or None,
+        date_str=today.isoformat(), now=now)
 
     return reports if changed else None
 
