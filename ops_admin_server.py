@@ -116,7 +116,7 @@ def _page(title: str, body: str, session: Optional[dict] = None) -> str:
   if session:
     admin_link = ' | <a href="/admins">管理员授权</a>' if session["role"] == "super" else ""
     nav = (
-      f'<p><a href="/surveys">问卷记录</a> | <a href="/answers">问卷作答</a> | <a href="/publish">消息发布</a> | <a href="/survey_edit">新建问卷</a> | <a href="/survey_list">问卷列表</a> | <a href="/publish_logs">发布记录</a>{admin_link}'
+      f'<p><a href="/surveys">问卷记录</a> | <a href="/answers">问卷作答</a> | <a href="/publish">消息发布</a> | <a href="/survey_edit">新建问卷</a> | <a href="/survey_list">问卷列表</a> | <a href="/publish_logs">发布记录</a> | <a href="/insight_rules">洞察阈值</a>{admin_link}'
       f' | <a href="/logout">退出</a>'
       f'&nbsp;&nbsp;<small>{html.escape(session["email"])}（{session["role"]}）</small></p><hr>'
     )
@@ -1277,6 +1277,121 @@ async def handle_admins_post(request: web.Request) -> web.Response:
 
 # -------------------- 启动 --------------------
 
+# -------------------- 洞察规则阈值（对照规范 v3 §4，运营可改） --------------------
+
+_RULE_KEY_DOC = {
+  "data_state": "数据状态机门槛：baseline7_min_nights(近7天≥N晚开近期基线) / baseline30_min_nights(近30天≥N晚开长期基线)",
+  "onset": "入睡洞察：delta_stable_min(昨晚SOL与近7日基线相差±N分钟内视为稳定)",
+  "structure": "结构洞察：minor_delta_pct(阶段Δ%超过N为轻微变化) / major_delta_pct(≥2项超过N为明显变化)",
+  "fluctuation": "波动洞察：awake_min_minutes(觉醒≥N分钟计为事件) / list_max(逐条展示上限) / expand_max(汇总时最多展开条数) / intervention_window_min(觉醒后N分钟内配对设备干预)",
+  "scene": "场景洞察：assoc_min_uses_7d(近7天≥N次才给关联描述) / assoc_min_uses_30d(近30天≥N次)",
+  "advice": "睡眠建议：max_per_day(每日最多条数) / same_type_cooldown_days(同类建议冷却) / pattern_min_nights(连续模式最少晚数) / history_max_entries(历史上限)",
+  "home_summary": "首页摘要：theme_cooldown_days(同主题不连续出现天数)",
+  "trend": "周/月趋势：max_items_7d/max_items_30d(最多条数) / min_valid_7d/min_valid_30d(有效夜晚门槛) / min_change(各指标最小可报告变化)",
+  "indices": "展示指数：onset/structure/stability 权重(缺失子分按剩余权重归一) / label_bands(产品状态分层) / subscore_params(子分公式常量)",
+  "forbidden_terms": "洞察文案禁用词（逗号分隔；规则模板与 LLM 润色输出共同校验）",
+  "polish_max_chars": "LLM 润色单字段长度上限（字符）",
+}
+
+
+def _rule_leaf_html(prefix: str, value) -> str:
+  name = f"rule:{prefix}"
+  label = prefix.split(".")[-1]
+  if isinstance(value, bool):
+    opts = "".join(
+      f'<option value="{v}"{" selected" if value == v else ""}>{v}</option>'
+      for v in (True, False))
+    return f'<tr><td><code>{html.escape(label)}</code></td><td><select name="{name}">{opts}</select></td></tr>'
+  if isinstance(value, (int, float)):
+    return f'<tr><td><code>{html.escape(label)}</code></td><td><input type="number" step="any" name="{name}" value="{value}" style="width:120px"></td></tr>'
+  if isinstance(value, list):
+    return (f'<tr><td><code>{html.escape(label)}</code></td>'
+            f'<td><textarea name="{name}" rows="2">{html.escape(", ".join(str(x) for x in value))}</textarea></td></tr>')
+  return f'<tr><td><code>{html.escape(label)}</code></td><td><input name="{name}" value="{html.escape(str(value))}" style="width:320px"></td></tr>'
+
+
+def _rules_group_html(prefix: str, value) -> str:
+  if not isinstance(value, dict):
+    return _rule_leaf_html(prefix, value)
+  legend = prefix or "rules"
+  doc = _RULE_KEY_DOC.get(legend, "")
+  rows = "".join(_rules_group_html(f"{prefix}.{k}" if prefix else k, v) for k, v in value.items())
+  return (f'<fieldset style="margin:14px 0;padding:10px;border:1px solid #ddd">'
+          f'<legend><b>{html.escape(legend)}</b></legend>'
+          f'<p style="margin:4px 0;color:#666;font-size:12px">{html.escape(doc)}</p>'
+          f'<table>{rows}</table></fieldset>')
+
+
+def _parse_rule_leaf(raw: str):
+  raw = raw.strip()
+  if "," in raw:
+    return [x.strip() for x in raw.split(",") if x.strip()]
+  for cast in (int, float):
+    try:
+      return cast(raw)
+    except ValueError:
+      continue
+  if raw.lower() in ("true", "false"):
+    return raw.lower() == "true"
+  return raw
+
+
+def _form_to_rules(form) -> dict:
+  rules: dict = {}
+  for key, raw in form.items():
+    if not key.startswith("rule:"):
+      continue
+    node = rules
+    parts = key[5:].split(".")
+    for p in parts[:-1]:
+      node = node.setdefault(p, {})
+    node[parts[-1]] = _parse_rule_leaf(raw)
+  return rules
+
+
+async def handle_insight_rules_get(request: web.Request, tip: str = "", err: str = "") -> web.Response:
+  session = _get_session(request)
+  blocked = _require_ops(session)
+  if blocked:
+    return blocked
+  result = await asyncio.to_thread(_user_server_call, "/ops/insight_rules", {"jwt_token": session["jwt"]})
+  if result.get("code") != 0:
+    body = f'<p class="err">加载失败：{html.escape(str(result.get("msg")))}</p>'
+    return _html_response("洞察阈值", body, session)
+  effective = (result.get("data") or {}).get("effective") or {}
+  status_line = (f'<p><small>配置文件：{html.escape(str((result.get("data") or {}).get("path")))}'
+                 f'（{"存在" if (result.get("data") or {}).get("exists") else "缺失，当前为内置默认"}；'
+                 f'保存后按 mtime 热加载，无需重启）</small></p>')
+  tip_html = f'<p class="msg">{html.escape(tip)}</p>' if tip else ""
+  err_html = f'<p class="err">{html.escape(err)}</p>' if err else ""
+  body = f"""{status_line}{tip_html}{err_html}
+<p>阈值口径见 <code>Mindora_App睡眠数据展示与分析对照规范_v3.md</code> §4（标注「建议v1/待产品确认」的数值均在此调整）。
+只改要调的项即可，未提交的项沿用当前生效值；所有字段提交时按 key 深度合并后整体保存。</p>
+<form method="post" action="/insight_rules">
+{_rules_group_html("", effective)}
+<p><button type="submit">保存（热加载生效）</button></p>
+</form>"""
+  return _html_response("洞察阈值", body, session)
+
+
+async def handle_insight_rules_post(request: web.Request) -> web.Response:
+  session = _get_session(request)
+  blocked = _require_ops(session)
+  if blocked:
+    return blocked
+  form = await request.post()
+  rules = _form_to_rules(form)
+  if not rules:
+    return await handle_insight_rules_get(request, err="表单为空")
+  result = await asyncio.to_thread(
+    _user_server_call, "/ops/save_insight_rules",
+    {"jwt_token": session["jwt"], "rules": rules},
+  )
+  if result.get("code") == 0:
+    return await handle_insight_rules_get(request, tip=f"已保存：{result.get('msg')}")
+  return await handle_insight_rules_get(request, err=f"保存失败：{result.get('msg')}")
+
+
 def build_app() -> web.Application:
   app = web.Application()
   app.router.add_get("/", handle_index)
@@ -1291,6 +1406,8 @@ def build_app() -> web.Application:
   app.router.add_post("/survey_edit", handle_survey_edit_post)
   app.router.add_get("/survey_list", handle_survey_list)
   app.router.add_get("/publish_logs", handle_publish_logs)
+  app.router.add_get("/insight_rules", handle_insight_rules_get)
+  app.router.add_post("/insight_rules", handle_insight_rules_post)
   app.router.add_get("/admins", handle_admins_get)
   app.router.add_post("/admins", handle_admins_post)
   return app

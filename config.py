@@ -85,8 +85,11 @@ class Config:
 
   # ── 洞察规则引擎阈值（Mindora_App睡眠数据展示与分析对照规范_v3.md §4）────────
   # 规范中标注「建议v1 / 阈值应后台可配置 / 待产品确认」的数值全部集中在这里；
+  # 这是内置默认值：运营可在不部署代码的情况下，通过运营平台上传
+  # data/insight_rules.json 覆盖任意子项（按 key 深度合并，见 insight_rules_config.py，
+  # 可用 INSIGHT_RULES_CONFIG_PATH 环境变量改文件路径），热加载无需重启。
   # AN_SCORE 综合评分 v1 公式不采纳（不动现有 sleep_quality 计算），故无此项。
-  INSIGHT_RULES = {
+  INSIGHT_RULES_DEFAULT = {
     # AN_DATA_STATE：数据状态机门槛
     "data_state": {"baseline7_min_nights": 4, "baseline30_min_nights": 15},
     # AN_ONSET：昨晚 SOL vs 近7日基线，|delta| 内视为稳定

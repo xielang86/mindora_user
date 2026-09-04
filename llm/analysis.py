@@ -32,6 +32,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from llm.ark_chat import VolcEngineArkChat
 from llm.router import ModelRouter
 from config import Config
+from insight_rules_config import get_insight_rules as _get_insight_rules
 
 
 from user_profile import compute_recent_sleep_stats
@@ -356,7 +357,7 @@ def _prompt_conclusion_polish(ctx: dict) -> str:
     """
     import json as _json
     conclusions_json = _json.dumps(ctx.get("conclusions") or [], ensure_ascii=False, indent=1)
-    forbidden = "、".join(Config.INSIGHT_RULES["forbidden_terms"])
+    forbidden = "、".join(_get_insight_rules()["forbidden_terms"])
     return f"""{_lang_instruction(ctx.get('language', 'en'))}
 
 You are polishing pre-computed sleep insight conclusions for the Mindora app.
@@ -389,7 +390,7 @@ def polish_output_ok(result: dict, conclusions: list, language: str) -> bool:
         return False
     import json as _json
     text_all = _json.dumps(result, ensure_ascii=False).lower()
-    for term in Config.INSIGHT_RULES["forbidden_terms"]:
+    for term in _get_insight_rules()["forbidden_terms"]:
         if term.lower() in text_all:
             return False
     input_nums: set = set()
@@ -403,7 +404,7 @@ def polish_output_ok(result: dict, conclusions: list, language: str) -> bool:
             s = v.get(field)
             if s is None:
                 continue
-            if len(s) > Config.INSIGHT_RULES["polish_max_chars"] * 3:
+            if len(s) > _get_insight_rules()["polish_max_chars"] * 3:
                 return False
             for num in re.findall(r"\d+", s):
                 if num not in input_nums:

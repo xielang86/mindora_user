@@ -29,6 +29,7 @@ from user_profile import (
 )
 from auth import AuthRequest, AuthData
 from ops_config import append_popup, save_survey
+from insight_rules_config import save_insight_rules, insight_rules_status
 from uid.uuid import get_or_create_uuid
 from llm import SleepAnalysisLLM, deep_merge
 import sleep_plan_service
@@ -190,6 +191,8 @@ class UserServer:
     self.app.router.add_post('/ops/publish_logs', self.handle_ops_publish_logs_http)
     self.app.router.add_post('/ops/popup_meta', self.handle_ops_popup_meta_http)
     self.app.router.add_post('/ops/save_survey', self.handle_ops_save_survey_http)
+    self.app.router.add_post('/ops/save_insight_rules', self.handle_ops_save_insight_rules_http)
+    self.app.router.add_post('/ops/insight_rules', self.handle_ops_insight_rules_http)
     self.app.router.add_post('/ops/survey_list', self.handle_ops_survey_list_http)
     self.app.router.add_post('/ops/upload_image', self.handle_ops_upload_image_http)
     # 弹窗主图公开访问（文件名是内容哈希，长缓存；路径即 ops/upload_image 返回的 URL）
@@ -1080,6 +1083,50 @@ class UserServer:
       return web.json_response(InvalidReqFormatResp().model_dump(), status=400)
     except Exception as e:
       logging.exception("ops save_survey error: %s", e)
+      return web.json_response(BaseResponse(code=500, msg="Internal server error").model_dump(), status=500)
+
+  async def handle_ops_save_insight_rules_http(self, request: web.Request) -> web.Response:
+    """运营上传洞察规则阈值配置（覆盖 data/insight_rules.json，热加载生效）；仅 ops admin。
+
+    传入的 rules 按 key 深度合并在内置默认值之上后整体写回——运营只需提交要改的
+    阈值子集；合并结果即生效值，文件自包含。阈值口径见
+    Mindora_App睡眠数据展示与分析对照规范_v3.md §4 与 config.INSIGHT_RULES_DEFAULT。
+    """
+    try:
+      body = await request.json()
+      uid = await self._check_ops_admin(body.get("jwt_token") or "")
+      if uid is None:
+        return web.json_response(BaseResponse(code=403, msg="not an ops admin").model_dump(), status=403)
+      rules = body.get("rules")
+      if not isinstance(rules, dict):
+        return web.json_response(BaseResponse(code=400, msg="rules 必须是 JSON object").model_dump(), status=400)
+      ok, msg = await asyncio.to_thread(save_insight_rules, rules)
+      if not ok:
+        return web.json_response(BaseResponse(code=400, msg=msg).model_dump(), status=400)
+      logging.info("ops insight rules saved by uid=%s keys=%s", uid, sorted(rules.keys()))
+      resp = BaseResponse(code=0, msg=msg)
+      return web.json_response(resp.model_dump())
+    except (json.JSONDecodeError, TypeError) as e:
+      logging.error(f"ops save_insight_rules format error: {e}")
+      return web.json_response(InvalidReqFormatResp().model_dump(), status=400)
+    except Exception as e:
+      logging.exception("ops save_insight_rules error: %s", e)
+      return web.json_response(BaseResponse(code=500, msg="Internal server error").model_dump(), status=500)
+
+  async def handle_ops_insight_rules_http(self, request: web.Request) -> web.Response:
+    """洞察规则阈值当前生效配置快照；仅 ops admin（运营后台"洞察阈值"页加载用）。"""
+    try:
+      body = await request.json()
+      uid = await self._check_ops_admin(body.get("jwt_token") or "")
+      if uid is None:
+        return web.json_response(BaseResponse(code=403, msg="not an ops admin").model_dump(), status=403)
+      resp = BaseResponse(code=0, msg="succ")
+      return web.json_response({**resp.model_dump(), "data": insight_rules_status()})
+    except (json.JSONDecodeError, TypeError) as e:
+      logging.error(f"ops insight_rules format error: {e}")
+      return web.json_response(InvalidReqFormatResp().model_dump(), status=400)
+    except Exception as e:
+      logging.exception("ops insight_rules error: %s", e)
       return web.json_response(BaseResponse(code=500, msg="Internal server error").model_dump(), status=500)
 
   async def handle_ops_upload_image_http(self, request: web.Request) -> web.Response:
