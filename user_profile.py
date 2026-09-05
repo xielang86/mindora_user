@@ -22,7 +22,6 @@ class BaseResponse(BaseModel):
 # 推荐侧（llm/reco.py）仍只推引导式场景，不受此影响。
 SCENE_CMD_PREFIXES = ("sleep.scene.", "sleep.pure_music.", "pure_music.")
 
-
 def short_scene_id(scene_id: str) -> str:
   """播放 cmd（可带 SCENE_CMD_PREFIXES 前缀）→ 短 id，用于展示名与统计键归一。"""
   for prefix in SCENE_CMD_PREFIXES:
@@ -76,6 +75,18 @@ class SleepHealthProfile(BaseModel):
   meditation_experience: Optional[str] = Field(None, description="冥想经验")
   stress_type: Optional[str] = Field(None, description="压力类型")
   medication_status: Optional[str] = Field(None, description="用药情况")
+
+
+# 睡眠模式设置（对应 GUI/data/config 中的 profile.sleepMode）
+class SleepModeProfile(BaseModel):
+  is_smart: Optional[bool] = Field(None, description="是否开启智能睡眠模式")
+  start_time: Optional[str] = Field(None, description="睡眠模式开始时间，如 22:00")
+  end_time: Optional[str] = Field(None, description="睡眠模式结束时间，如 08:00")
+  sleep_light: Optional[int] = Field(None, description="助眠灯光等级")
+  screen_display: Optional[int] = Field(None, description="屏幕显示设置")
+  essential_oil: Optional[int] = Field(None, description="精油/香氛设置")
+  voice_guidance: Optional[int] = Field(None, description="语音引导设置")
+  wake_light: Optional[int] = Field(None, description="唤醒灯光等级")
 
 
 # 建议新增：环境与敏感度
@@ -539,6 +550,9 @@ class UserProfile(BaseModel):
 
   # 睡眠计划（设备端制定的睡眠目标，配合 SleepResult.goal_achieved 计算达成率）
   sleep_plan: Optional[SleepPlan] = Field(None, description="用户的睡眠目标计划")
+  # App 端账号级睡眠计划（睡眠计划同步接口.md；服务端为唯一事实源，含墓碑记录）
+  sleep_plans: List[SyncedSleepPlan] = Field(default_factory=list, description="账号级睡眠计划全量（含 deleted 墓碑）")
+  sleep_plans_synced_at: Optional[int] = Field(None, description="最近一次计划同步的 server_time（秒）")
 
   # App 端账号级睡眠计划（睡眠计划同步接口.md；服务端为唯一事实源，含墓碑记录）
   sleep_plans: List[SyncedSleepPlan] = Field(default_factory=list, description="账号级睡眠计划全量（含 deleted 墓碑）")
@@ -555,6 +569,9 @@ class UserProfile(BaseModel):
 
   # 睡眠健康问卷（onboarding/设置页收集的睡眠相关字段）
   sleep_health: Optional[SleepHealthProfile] = Field(None, description="睡眠健康问卷")
+
+  # 睡眠模式设置（对应 GUI/data/config 中的 profile.sleepMode）
+  sleep_mode: Optional[SleepModeProfile] = Field(None, description="睡眠模式设置")
 
   # 新增：存储推荐的助眠候选方案
   sleep_scenarios_reco: Optional[List[SleepScenario]] = Field(default_factory=list, description="推荐的候选助眠流程列表")
