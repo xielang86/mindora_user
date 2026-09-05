@@ -99,15 +99,10 @@ def extract_sleep_context(profile, data) -> dict:
         })
 
     # 场景别名：weekly_top_scene_* → prompt 里的 scene_name / used_times
+    # （旧 sleep_trend_week/month、scene.title/text 为死字段已移除——
+    #   趋势由 insight_rules.rule_trend 现算，场景由 weekly_top_scene_* 覆盖）
     ctx["scene_name"] = stats.get("weekly_top_scene_title")
     ctx["used_times"] = stats.get("weekly_top_scene_count")
-
-    # Profile sleep_analysis fields drive the prompt content.
-    sleep_analysis = profile.sleep_analysis or {}
-    ctx["sleep_trend_week"]  = sleep_analysis.get("sleep_trend_week", "")
-    ctx["sleep_trend_month"] = sleep_analysis.get("sleep_trend_month", "")
-    ctx["scene_title"]       = (sleep_analysis.get("scene") or {}).get("title", "")
-    ctx["scene_text"]        = (sleep_analysis.get("scene") or {}).get("text", "")
 
     # 去掉 None 值，让 prompt 模板里 ctx.get(key, '—') 的默认值真正生效
     # （key 存在但值为 None 时 .get 不会用默认值，会把 None 渲染进 prompt）

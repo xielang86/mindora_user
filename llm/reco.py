@@ -168,9 +168,11 @@ def _summarize_profile_for_prompt(profile: UserProfile) -> str:
 
     sleep_analysis = profile.sleep_analysis or {}
     data["sleep_analysis"] = {
-        "sleep_trend_week": sleep_analysis.get("sleep_trend_week", ""),
-        "sleep_trend_month": sleep_analysis.get("sleep_trend_month", ""),
-        "scene": sleep_analysis.get("scene", {}),
+        # 只保留仍有写入方的数值快照（场景统计由 update_profile 每次重算）；
+        # 旧 sleep_trend_week/month（死字段，从未写入）不再传入，
+        # 当前睡眠分析由 _sleep_analysis_summary 基于原始数据现算。
+        "most_used_scene_7d": sleep_analysis.get("most_used_scene_7d"),
+        "best_sleep_quality_scene_7d": sleep_analysis.get("best_sleep_quality_scene_7d"),
     }
 
     return json.dumps(data, ensure_ascii=False, indent=2)

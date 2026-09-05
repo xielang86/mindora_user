@@ -622,9 +622,12 @@ class UserProfile(BaseModel):
 
   sleep_analysis: Dict[str, Any] = Field(
     default_factory=lambda: {
-      "sleep_trend_week": "",
-      "sleep_trend_month": "",
-      "scene": {"title":"", "music":"", "text":"", "image_url": ""},
+      # 数值快照（每次 update_profile 重算，7 天窗口语义天然滚动，仅存当前一份）：
+      # most_used_scene(_7d) 与 best_sleep_quality_scene_7d 是 /analysis 骨架
+      # （weekly_best / onset_efficiency / scene_preference）的直接数据源；
+      # insight_memory 是洞察长期记忆（建议历史/昨日首页主题，见 insight_rules）。
+      # 历史上的 sleep_trend_week/month 与 scene{title,music,text,image_url}
+      # 为死字段（从未有写入方，趋势已由 rule_trend 现算），已移除。
       "most_used_scene": None,
       "most_used_scene_7d": None,
       "best_sleep_quality_scene_7d": None,
