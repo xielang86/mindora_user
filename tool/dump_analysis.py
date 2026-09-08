@@ -107,7 +107,7 @@ def run_checks(profile: dict, responses: dict[str, dict], date: str, has_sleep_s
   def check_sleep_eq(screen: str, path: str, actual, expected, note: str = ""):
     """依赖 sleep_data 源数据的对账；未拉取 sleep_data 时跳过比对（避免误报 ❌）。"""
     if not has_sleep_source:
-      c.add(screen, path, actual, "➖ 未拉取 sleep_data（加 --include-sleep-data 可对账）")
+      c.add(screen, path, actual, "➖ 未拉取 sleep_data（--sleep-data-count N 可对账）")
     else:
       c.check_eq(screen, path, actual, expected, note)
 
@@ -252,8 +252,9 @@ def main():
   parser.add_argument("--timezone", default="Asia/Shanghai")
   parser.add_argument("--out", default=None)
   parser.add_argument("--include-sleep-data", action="store_true",
-                      help="query_profile 携带 sleep_data（默认不拉；behaviors 始终不拉）。"
-                           "要对账数值字段（评分/hr_range/onset 等）时需要打开")
+                      help="[已废弃] 现在默认就拉取 sleep_data，保留仅为兼容旧用法")
+  parser.add_argument("--sleep-data-count", type=int, default=30,
+                      help="query_profile 携带最近 N 晚 sleep_data（默认 30；0=不拉）")
   args = parser.parse_args()
 
   # uid 只用于输出目录命名/报告标注；带 jwt 时服务端按 token 里的 uid 取数，
@@ -275,7 +276,7 @@ def main():
 
   print(f"target: {base_url}  uid={uid}  date={args.date}")
   profile_resp = _unwrap(client.query_profile(
-    sleep_data_count=30 if args.include_sleep_data else 0, include_behaviors=False,
+    sleep_data_count=args.sleep_data_count, include_behaviors=False,
   ))
   profile = ((profile_resp.get("data") or {}).get("user_profile")) or {}
   (out_dir / "query_profile.json").write_text(json.dumps(profile_resp, ensure_ascii=False, indent=2))
@@ -290,7 +291,7 @@ def main():
     if code != 0:
       print(f"    ⚠️ {json.dumps(resp, ensure_ascii=False)[:200]}")
 
-  checker = run_checks(profile, responses, args.date, has_sleep_source=args.include_sleep_data)
+  checker = run_checks(profile, responses, args.date, has_sleep_source=args.sleep_data_count > 0)
   report = render_report(checker, uid, args.date,
                          {p.name: str(p) for p in sorted(out_dir.glob('*.json'))})
   (out_dir / "CHECK_REPORT.md").write_text(report)

@@ -263,7 +263,8 @@ class UserServer:
     if profile:
       logging.info("profile found uid=%s summary=%s", uid, self.user_serv._profile_for_log(profile))
       profile_dict = profile.model_dump()
-      # 按请求裁剪体积大头：sleep_data 限量（0=不携带，缺省 1=只回最近一晚）；
+      # 按请求裁剪体积大头：sleep_data 限量（0=不携带，缺省 1=只回最近一晚）。
+      # 顺序与存库/快照一致（timestamp 升序，[-1] 是最新一晚），截尾保留最新 N 条。
       # 不携带 behaviors 时同时去掉 health_sync_days（健康数据对账状态）
       count = request.data.sleep_data_count
       if count <= 0:

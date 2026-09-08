@@ -82,11 +82,19 @@ class SleepModeProfile(BaseModel):
   is_smart: Optional[bool] = Field(None, description="是否开启智能睡眠模式")
   start_time: Optional[str] = Field(None, description="睡眠模式开始时间，如 22:00")
   end_time: Optional[str] = Field(None, description="睡眠模式结束时间，如 08:00")
-  sleep_light: Optional[int] = Field(None, description="助眠灯光等级")
-  screen_display: Optional[int] = Field(None, description="屏幕显示设置")
-  essential_oil: Optional[int] = Field(None, description="精油/香氛设置")
-  voice_guidance: Optional[int] = Field(None, description="语音引导设置")
-  wake_light: Optional[int] = Field(None, description="唤醒灯光等级")
+  sleep_light: Optional[str] = Field(None, description="助眠灯光等级")
+  screen_display: Optional[str] = Field(None, description="屏幕显示设置")
+  essential_oil: Optional[str] = Field(None, description="精油/香氛设置")
+  voice_guidance: Optional[str] = Field(None, description="语音引导设置")
+  wake_light: Optional[str] = Field(None, description="唤醒灯光等级")
+
+  @field_validator("sleep_light", "screen_display", "essential_oil", "voice_guidance", "wake_light", mode="before")
+  @classmethod
+  def coerce_level_to_str(cls, value):
+    # 历史数据/部分客户端仍按 int 上报等级值，pydantic v2 不再自动 int→str，这里统一归一
+    if value is not None and not isinstance(value, str):
+      return str(value)
+    return value
 
 
 # 建议新增：环境与敏感度
@@ -554,6 +562,10 @@ class UserProfile(BaseModel):
   sleep_plans: List[SyncedSleepPlan] = Field(default_factory=list, description="账号级睡眠计划全量（含 deleted 墓碑）")
   sleep_plans_synced_at: Optional[int] = Field(None, description="最近一次计划同步的 server_time（秒）")
 
+  # App 端账号级睡眠计划（睡眠计划同步接口.md；服务端为唯一事实源，含墓碑记录）
+  sleep_plans: List[SyncedSleepPlan] = Field(default_factory=list, description="账号级睡眠计划全量（含 deleted 墓碑）")
+  sleep_plans_synced_at: Optional[int] = Field(None, description="最近一次计划同步的 server_time（秒）")
+
   # 洞察页 6 模块 LLM 分析结果（mindora_advice.md 模块0-5）
   sleep_insight: Optional[SleepInsightReport] = Field(None, description="洞察页6模块睡眠分析结果")
 
@@ -691,6 +703,14 @@ class UserProfile(BaseModel):
 class ProfileData(BaseModel):
   uid: Optional[str] = Field(None, description="uid, just for debug")
   jwt_token: str | None = Field(None, description="JWT token，in wan should be fixed")
+  device_id: Optional[str] = Field(
+    None,
+    description="设备唯一标识；设备端请求必填，云端按 uid↔device_id 绑定校验/多端区分",
+  )
+  device_type: Optional[str] = Field(
+    None,
+    description="请求来源类型：设备端固定 mindora（common/device_id.DEVICE_TYPE）；App 复用本结构时填 ios/android 等",
+  )
   user_profile: Optional[UserProfile] = Field(None, description="user profile")
   language: Optional[str] = Field(None, description="界面语言，如 en、zh-Hans（健康同步 v2 必填）")
   timezone: Optional[str] = Field(None, description="客户端时区，如 Asia/Shanghai；健康数据按自然日归类的日界依据")
@@ -725,7 +745,6 @@ class ProfileData(BaseModel):
       legacy = values.pop("include_sleep_data")
       values["sleep_data_count"] = 30 if legacy else 0
     return values
-
 
 class ProfileRequest(BaseModel):
   request_type: str = Field("query_profile", description="query_profile | update_profile（client_request.md 契约）")
