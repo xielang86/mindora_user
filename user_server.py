@@ -263,9 +263,15 @@ class UserServer:
     if profile:
       logging.info("profile found uid=%s summary=%s", uid, self.user_serv._profile_for_log(profile))
       profile_dict = profile.model_dump()
-      # 按请求开关裁剪体积大头：sleep_data / behaviors（不携带 behaviors 时同时去掉 health_sync_days）
-      if not request.data.include_sleep_data:
+      # 按请求裁剪体积大头：sleep_data 限量（0=不携带，缺省 1=只回最近一晚）；
+      # 不携带 behaviors 时同时去掉 health_sync_days（健康数据对账状态）
+      count = request.data.sleep_data_count
+      if count <= 0:
         profile_dict.pop("sleep_data", None)
+      else:
+        sleep_data = profile_dict.get("sleep_data")
+        if isinstance(sleep_data, list) and len(sleep_data) > count:
+          profile_dict["sleep_data"] = sleep_data[-count:]
       if not request.data.include_behaviors:
         profile_dict.pop("behaviors", None)
         profile_dict.pop("health_sync_days", None)

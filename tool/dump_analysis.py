@@ -275,7 +275,7 @@ def main():
 
   print(f"target: {base_url}  uid={uid}  date={args.date}")
   profile_resp = _unwrap(client.query_profile(
-    include_sleep_data=args.include_sleep_data, include_behaviors=False,
+    sleep_data_count=30 if args.include_sleep_data else 0, include_behaviors=False,
   ))
   profile = ((profile_resp.get("data") or {}).get("user_profile")) or {}
   (out_dir / "query_profile.json").write_text(json.dumps(profile_resp, ensure_ascii=False, indent=2))

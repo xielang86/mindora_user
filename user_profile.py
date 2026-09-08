@@ -554,10 +554,6 @@ class UserProfile(BaseModel):
   sleep_plans: List[SyncedSleepPlan] = Field(default_factory=list, description="账号级睡眠计划全量（含 deleted 墓碑）")
   sleep_plans_synced_at: Optional[int] = Field(None, description="最近一次计划同步的 server_time（秒）")
 
-  # App 端账号级睡眠计划（睡眠计划同步接口.md；服务端为唯一事实源，含墓碑记录）
-  sleep_plans: List[SyncedSleepPlan] = Field(default_factory=list, description="账号级睡眠计划全量（含 deleted 墓碑）")
-  sleep_plans_synced_at: Optional[int] = Field(None, description="最近一次计划同步的 server_time（秒）")
-
   # 洞察页 6 模块 LLM 分析结果（mindora_advice.md 模块0-5）
   sleep_insight: Optional[SleepInsightReport] = Field(None, description="洞察页6模块睡眠分析结果")
 
@@ -715,11 +711,20 @@ class ProfileData(BaseModel):
     None,
     description="睡眠分析(sleep_insight + analysis cache)开关：None=自动 / True=跳过 / False=强制，不影响场景推荐",
   )
-  # query_profile 响应裁剪开关：sleep_data 和 behaviors 是画像的体积大头，
-  # 不需要时可要求服务端不携带，减小响应包；不携带 behaviors 时连同
-  # health_sync_days（健康数据对账状态）一起去掉
-  include_sleep_data: bool = Field(True, description="query_profile 响应是否携带 sleep_data，默认 True")
+  # query_profile 响应裁剪开关：sleep_data 和 behaviors 是画像的体积大头。
+  # sleep_data_count：0=不携带 sleep_data；缺省 1=只回最近一晚；N=最近 N 晚。
+  # 旧布尔字段 include_sleep_data 由 before-validator 映射（false→0 / true→全部 30 晚）
+  sleep_data_count: int = Field(1, ge=0, description="query_profile 响应携带最近 N 晚 sleep_data；0=不携带，缺省 1")
   include_behaviors: bool = Field(True, description="query_profile 响应是否携带 behaviors，默认 True；为 False 时同时剔除 health_sync_days")
+
+  @model_validator(mode="before")
+  @classmethod
+  def _legacy_include_sleep_data(cls, values):
+    """兼容旧布尔开关 include_sleep_data：false→0，true→全部（30，与存量上限一致）。"""
+    if isinstance(values, dict) and "include_sleep_data" in values and "sleep_data_count" not in values:
+      legacy = values.pop("include_sleep_data")
+      values["sleep_data_count"] = 30 if legacy else 0
+    return values
 
 
 class ProfileRequest(BaseModel):

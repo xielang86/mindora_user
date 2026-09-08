@@ -77,17 +77,18 @@ class UserServerClient:
 
   def query_profile(
     self,
-    include_sleep_data: bool = True,
+    sleep_data_count: int = 1,
     include_behaviors: bool = True,
   ) -> dict[str, Any]:
-    # sleep_data / behaviors 是画像体积大头；不携带 behaviors 时服务端会同时去掉 health_sync_days
+    # sleep_data / behaviors 是画像体积大头；sleep_data_count=0 不携带，N=最近 N 晚；
+    # 不携带 behaviors 时服务端会同时去掉 health_sync_days
     payload = {
       "request_type": "query_profile",
       "timestamp": int(time.time()),
       "version": "1.0",
       "data": {
         **self._auth_data(),
-        "include_sleep_data": include_sleep_data,
+        "sleep_data_count": sleep_data_count,
         "include_behaviors": include_behaviors,
       },
     }
