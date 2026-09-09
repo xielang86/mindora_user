@@ -13,9 +13,11 @@ from common.user_rights import (
   DEFAULT_USER_LEVEL,
   PREMIUM_TRIAL_DAYS,
   build_user_rights_payload,
+  level_priority,
   normalize_user_level,
   resolve_level_upgrade,
 )
+from common.apple_binding import app_account_token, normalize_app_account_token
 
 # 加载配置文件
 load_dotenv()
@@ -360,12 +362,59 @@ def init_subscription_reports_table():
     logging.warning("Could not create subscription_reports table: %s", e)
 
 
+def init_apple_subscription_tables():
+  """ASSN V2（服务端-AppStore订阅通知接入(ASSN V2).md §7.1）：订阅状态表 + 通知幂等表。"""
+  sub_sql = """
+  CREATE TABLE IF NOT EXISTS apple_subscription (
+    original_transaction_id   VARCHAR(64)  NOT NULL COMMENT '订阅链唯一主键（续订不变）',
+    environment               VARCHAR(16)  NOT NULL COMMENT 'Sandbox / Production',
+    user_id                   VARCHAR(64)  DEFAULT NULL COMMENT '绑定的 uid（可由上报认领）',
+    app_account_token         VARCHAR(64)  DEFAULT NULL COMMENT '客户端盖进交易的 UUIDv5(uid)，小写',
+    product_id                VARCHAR(128) NOT NULL COMMENT '内购产品ID',
+    tier                      VARCHAR(16)  NOT NULL COMMENT '档位：pro / premium',
+    latest_transaction_id     VARCHAR(64)  NOT NULL COMMENT '最近一次交易ID（每次续订都变）',
+    purchase_date             DATETIME     NOT NULL COMMENT '首次购买时刻',
+    expires_date              DATETIME     DEFAULT NULL COMMENT '当前期到期时刻',
+    auto_renew_status         TINYINT      NOT NULL DEFAULT 0 COMMENT '1 开启续订 / 0 已关闭',
+    auto_renew_product_id     VARCHAR(128) DEFAULT NULL COMMENT '下期将续的产品（升降档时不同）',
+    is_in_billing_retry       TINYINT      NOT NULL DEFAULT 0 COMMENT '是否在扣款重试中',
+    grace_period_expires_date DATETIME     DEFAULT NULL COMMENT '宽限期截止',
+    expiration_intent         TINYINT      DEFAULT NULL COMMENT '到期原因（EXPIRED 时记录）',
+    revocation_date           DATETIME     DEFAULT NULL COMMENT '退款/撤销时刻',
+    revocation_reason         TINYINT      DEFAULT NULL COMMENT '撤销原因',
+    last_signed_date          BIGINT       NOT NULL COMMENT '乱序保护：只接受 signedDate 更新的写入',
+    raw_payload               TEXT         DEFAULT NULL COMMENT '最近一条通知原文',
+    updated_at                DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (original_transaction_id, environment),
+    KEY idx_apple_sub_user (user_id, environment),
+    KEY idx_apple_sub_token (app_account_token)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='Apple 订阅状态表（ASSN V2）';
+  """
+  log_sql = """
+  CREATE TABLE IF NOT EXISTS apple_notification_log (
+    notification_uuid VARCHAR(64) NOT NULL COMMENT '通知唯一ID（幂等键）',
+    notification_type VARCHAR(64) NOT NULL,
+    subtype           VARCHAR(64) DEFAULT NULL,
+    signed_date       BIGINT      NOT NULL COMMENT '通知签署时刻（毫秒）',
+    received_at       DATETIME    NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '服务端收到时刻',
+    raw_payload       TEXT        NOT NULL COMMENT '通知原文（验签后解出的 JSON）',
+    PRIMARY KEY (notification_uuid)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='Apple 通知幂等日志（ASSN V2）';
+  """
+  try:
+    mysql_db.execute(sub_sql, ())
+    mysql_db.execute(log_sql, ())
+  except Exception as e:
+    logging.warning("Could not create apple_subscription/apple_notification_log tables: %s", e)
+
+
 def init_membership_schema():
   """Best-effort runtime initialization for rights-related schema."""
   init_web_columns()
   init_user_rights_columns()
   init_redemption_tables()
   init_subscription_reports_table()
+  init_apple_subscription_tables()
 
 
 def _max_dt(*values) -> datetime | None:
@@ -405,9 +454,23 @@ def get_user_rights_info(uid: str) -> dict:
   if not row or row.get("status") != 1:
     return build_user_rights_payload(DEFAULT_USER_LEVEL, None)
   trial_end_at = _max_dt(row.get("signup_trial_end_at"), row.get("basic_purchase_trial_end_at"))
+  # ASSN V2（doc §8）：真实订阅状态并入 effective_user_level，取 MAX 语义——
+  # 兑换码等来源的更高等级不会被一笔低档订阅覆盖降级
+  subscription_level = _safe_active_subscription_tier(uid)
   return build_user_rights_payload(
-    row.get("user_level"), row.get("level_end_at"), trial_end_at=trial_end_at,
+    row.get("user_level"), row.get("level_end_at"),
+    trial_end_at=trial_end_at, subscription_level=subscription_level,
   )
+
+
+def _safe_active_subscription_tier(uid: str) -> str | None:
+  """查询有效订阅档位；任何失败（表未建好/DB 抖动）都降级为 None，绝不阻塞登录。"""
+  try:
+    from config import Config
+    return get_active_subscription_tier(uid, allow_sandbox=Config.APPLE_SUBSCRIPTION_SANDBOX_ENTITLEMENT)
+  except Exception as e:
+    logging.warning("active subscription tier unavailable for uid=%s: %s", uid, e)
+    return None
 
 
 # ── 运营角色（ops_role）────────────────────────────────────────────────────
@@ -618,6 +681,25 @@ def redeem_redemption_code(uid: str, redemption_code: str) -> dict:
       conn.close()
 
 
+def _stamp_basic_purchase_trial(cursor, uid: str, now: datetime) -> tuple[bool, datetime]:
+  """第②段体验期盖章：`basic_purchase_trial_end_at IS NULL` 才写 NOW()+7d。
+
+  幂等全靠 NULL 守卫——客户端 report_subscription 与 ASSN 的 SUBSCRIBED 两个写入者
+  天然去重，不需要额外协调（高级会员体验期接口.md §2 / ASSN 文档 §8）。
+  返回 (granted, new_trial_end)。
+  """
+  new_trial_end = now + timedelta(days=PREMIUM_TRIAL_DAYS)
+  cursor.execute(
+    """
+    UPDATE user_auth
+    SET basic_purchase_trial_end_at=%s, update_time=NOW()
+    WHERE uid=%s AND basic_purchase_trial_end_at IS NULL
+    """,
+    (new_trial_end, uid),
+  )
+  return cursor.rowcount == 1, new_trial_end
+
+
 def report_subscription(
   uid: str,
   platform: str,
@@ -665,16 +747,7 @@ def report_subscription(
 
       trial_granted = False
       if grant_trial and user_row.get("basic_purchase_trial_end_at") is None:
-        new_trial_end = now + timedelta(days=PREMIUM_TRIAL_DAYS)
-        cursor.execute(
-          """
-          UPDATE user_auth
-          SET basic_purchase_trial_end_at=%s, update_time=NOW()
-          WHERE uid=%s AND basic_purchase_trial_end_at IS NULL
-          """,
-          (new_trial_end, uid),
-        )
-        trial_granted = cursor.rowcount == 1
+        trial_granted, new_trial_end = _stamp_basic_purchase_trial(cursor, uid, now)
         if trial_granted:
           user_row["basic_purchase_trial_end_at"] = new_trial_end
 
@@ -686,6 +759,24 @@ def report_subscription(
         """,
         (uid, platform or "", product_id, original_transaction_id, purchased_at),
       )
+
+      # ASSN 文档 §5.2：认领 user_id 悬空的订阅记录（未登录购买 / ASSN 接入前的老交易）。
+      # 表可能尚未建好（旧部署），失败只记日志，不影响上报主流程
+      try:
+        cursor.execute(
+          """
+          UPDATE apple_subscription
+          SET user_id=%s
+          WHERE original_transaction_id=%s AND user_id IS NULL
+          """,
+          (uid, original_transaction_id),
+        )
+        if cursor.rowcount:
+          logging.info("claim_apple_subscriptions: uid=%s claimed %d row(s) by txn=%s",
+                       uid, cursor.rowcount, original_transaction_id)
+      except Exception as e:
+        logging.warning("claim apple_subscription failed (uid=%s txn=%s): %s",
+                        uid, original_transaction_id, e)
 
     conn.commit()
     trial_end_at = _max_dt(user_row.get("signup_trial_end_at"), user_row.get("basic_purchase_trial_end_at"))
@@ -704,6 +795,214 @@ def report_subscription(
     if conn:
       conn.rollback()
     return {"code": 500, "msg": f"report subscription failed: {e}", "data": None}
+  finally:
+    if conn:
+      conn.close()
+
+
+# ── ASSN V2：Apple 订阅状态（服务端-AppStore订阅通知接入(ASSN V2).md §7）────────────
+
+# apple_subscription 的可写字段（upsert_apple_subscription 的合法键）
+APPLE_SUBSCRIPTION_FIELDS = (
+  "user_id", "app_account_token", "product_id", "tier", "latest_transaction_id",
+  "purchase_date", "expires_date", "auto_renew_status", "auto_renew_product_id",
+  "is_in_billing_retry", "grace_period_expires_date", "expiration_intent",
+  "revocation_date", "revocation_reason", "raw_payload",
+)
+
+
+def _query_all(sql: str, params: tuple = ()) -> list[dict]:
+  conn = None
+  try:
+    conn = mysql_db.get_connection()
+    with conn.cursor(pymysql.cursors.DictCursor) as cursor:
+      cursor.execute(sql, params)
+      return cursor.fetchall()
+  finally:
+    if conn:
+      conn.close()
+
+
+def log_apple_notification(
+  notification_uuid: str,
+  notification_type: str,
+  subtype: str | None,
+  signed_date: int,
+  raw_payload: str,
+) -> bool:
+  """写通知幂等表（§7.2①：Apple 必然重投，先写日志主键去重）。
+
+  返回 True = 首次收到，继续处理；False = 重复投递，直接应答 200 不再处理。
+  """
+  try:
+    mysql_db.execute(
+      """
+      INSERT INTO apple_notification_log
+        (notification_uuid, notification_type, subtype, signed_date, received_at, raw_payload)
+      VALUES (%s, %s, %s, %s, NOW(), %s)
+      """,
+      (notification_uuid, notification_type or "", subtype, signed_date, raw_payload),
+    )
+    return True
+  except pymysql.err.IntegrityError as e:
+    if e.args and e.args[0] == 1062:  # Duplicate entry → 重复投递
+      return False
+    raise
+
+
+def upsert_apple_subscription(
+  original_transaction_id: str,
+  environment: str,
+  signed_date: int,
+  **fields,
+) -> str:
+  """落订阅状态（主键 (original_transaction_id, environment)，§7.2③ 环境隔离）。
+
+  §7.2② 乱序保护：已有记录的 last_signed_date >= 本次 signed_date 时拒绝写入——
+  重试机制会让老通知在新通知之后到达，没有这条一次网络抖动就能把"已退款"覆盖回"有效"。
+
+  fields 仅接受 APPLE_SUBSCRIPTION_FIELDS 中的键；datetime 由调用方从毫秒时间戳转好。
+  返回 "inserted" / "updated" / "stale"。
+  """
+  unknown = set(fields) - set(APPLE_SUBSCRIPTION_FIELDS)
+  if unknown:
+    raise ValueError(f"unknown apple_subscription fields: {sorted(unknown)}")
+
+  conn = None
+  try:
+    conn = mysql_db.get_connection()
+    conn.begin()
+    with conn.cursor(pymysql.cursors.DictCursor) as cursor:
+      cursor.execute(
+        """
+        SELECT last_signed_date FROM apple_subscription
+        WHERE original_transaction_id=%s AND environment=%s
+        FOR UPDATE
+        """,
+        (original_transaction_id, environment),
+      )
+      row = cursor.fetchone()
+      if row and int(row["last_signed_date"]) >= signed_date:
+        conn.rollback()
+        return "stale"
+
+      if row:
+        assignments = ", ".join(f"{k}=%s" for k in fields)
+        cursor.execute(
+          f"""
+          UPDATE apple_subscription
+          SET {assignments}, last_signed_date=%s, updated_at=NOW()
+          WHERE original_transaction_id=%s AND environment=%s
+          """,
+          (*fields.values(), signed_date, original_transaction_id, environment),
+        )
+        conn.commit()
+        return "updated"
+
+      columns = ["original_transaction_id", "environment", *fields.keys(), "last_signed_date"]
+      values = [original_transaction_id, environment, *fields.values(), signed_date]
+      placeholders = ", ".join(["%s"] * len(columns))
+      cursor.execute(
+        f"INSERT INTO apple_subscription ({', '.join(columns)}) VALUES ({placeholders})",
+        tuple(values),
+      )
+      conn.commit()
+      return "inserted"
+  except Exception:
+    if conn:
+      conn.rollback()
+    raise
+  finally:
+    if conn:
+      conn.close()
+
+
+def resolve_uid_for_app_account_token(token: str | None) -> str | None:
+  """appAccountToken → uid：找同 token 且已认领（user_id 非空）的订阅记录。
+
+  UUIDv5 不可逆，只能靠前序绑定（report_subscription 认领 / 同账号历史订阅）反查；
+  查不到时返回 None，调用方按"暂不盖章、等客户端上报认领"处理（§5.2）。
+  """
+  normalized = normalize_app_account_token(token)
+  if not normalized:
+    return None
+  row = mysql_db.query_one(
+    """
+    SELECT user_id FROM apple_subscription
+    WHERE app_account_token=%s AND user_id IS NOT NULL
+    ORDER BY updated_at DESC LIMIT 1
+    """,
+    (normalized,),
+  )
+  return row["user_id"] if row else None
+
+
+def get_active_subscription_tier(uid: str, allow_sandbox: bool = False) -> str | None:
+  """uid 当前有效订阅的最高档位（"premium"/"pro"/None），ASSN 文档 §6.2 判定公式：
+
+    有效 = revocation_date IS NULL
+           AND (now < expires_date
+                OR (is_in_billing_retry AND now < grace_period_expires_date))
+
+  环境隔离（§2）：默认只认 Production；allow_sandbox（显式开关）时放行 Sandbox。
+  绑定匹配双通道：user_id 直绑，或 app_account_token = UUIDv5(uid) 前向匹配。
+  """
+  if not uid:
+    return None
+  token = normalize_app_account_token(app_account_token(uid))
+  envs = ("Production", "Sandbox") if allow_sandbox else ("Production",)
+  placeholders = ", ".join(["%s"] * len(envs))
+  rows = _query_all(
+    f"""
+    SELECT tier, expires_date, is_in_billing_retry, grace_period_expires_date, revocation_date
+    FROM apple_subscription
+    WHERE (user_id=%s OR app_account_token=%s) AND environment IN ({placeholders})
+    """,
+    (uid, token, *envs),
+  )
+  now = datetime.now()
+  best: str | None = None
+  for row in rows:
+    if row.get("revocation_date") is not None:
+      continue
+    expires_date = row.get("expires_date")
+    in_grace = (
+      row.get("is_in_billing_retry")
+      and row.get("grace_period_expires_date")
+      and row["grace_period_expires_date"] > now
+    )
+    active = (expires_date is not None and expires_date > now) or in_grace
+    if not active:
+      continue
+    tier = normalize_user_level(row.get("tier"))
+    if tier != DEFAULT_USER_LEVEL and (best is None or level_priority(tier) > level_priority(best)):
+      best = tier
+  return best
+
+
+def stamp_basic_purchase_trial_by_uid(uid: str) -> bool:
+  """ASSN 路径的第②段体验期盖章（与 report_subscription 共用 NULL 守卫幂等）。
+
+  用户不存在/非活跃/已盖过章都返回 False。独立小事务，供通知处理器使用。
+  """
+  conn = None
+  try:
+    conn = mysql_db.get_connection()
+    conn.begin()
+    now = datetime.now()
+    with conn.cursor(pymysql.cursors.DictCursor) as cursor:
+      cursor.execute("SELECT status FROM user_auth WHERE uid=%s FOR UPDATE", (uid,))
+      user_row = cursor.fetchone()
+      if not user_row or user_row["status"] != 1:
+        conn.rollback()
+        return False
+      granted, _ = _stamp_basic_purchase_trial(cursor, uid, now)
+    conn.commit()
+    return granted
+  except Exception:
+    if conn:
+      conn.rollback()
+    raise
   finally:
     if conn:
       conn.close()

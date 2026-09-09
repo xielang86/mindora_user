@@ -650,12 +650,14 @@ class UserProfile(BaseModel):
       # 数值快照（每次 update_profile 重算，7 天窗口语义天然滚动，仅存当前一份）：
       # most_used_scene(_7d) 与 best_sleep_quality_scene_7d 是 /analysis 骨架
       # （weekly_best / onset_efficiency / scene_preference）的直接数据源；
+      # recent_scene 是最近一次使用场景（设备端轮询 query_profile 展示用）；
       # insight_memory 是洞察长期记忆（建议历史/昨日首页主题，见 insight_rules）。
       # 历史上的 sleep_trend_week/month 与 scene{title,music,text,image_url}
       # 为死字段（从未有写入方，趋势已由 rule_trend 现算），已移除。
       "most_used_scene": None,
       "most_used_scene_7d": None,
       "best_sleep_quality_scene_7d": None,
+      "recent_scene": None,
     }
   )
 
@@ -733,8 +735,11 @@ class ProfileData(BaseModel):
   )
   # query_profile 响应裁剪开关：sleep_data 和 behaviors 是画像的体积大头。
   # sleep_data_count：0=不携带 sleep_data；缺省 1=只回最近一晚；N=最近 N 晚。
+  # 同一数量同时裁剪 footprint_days / inbox_messages / survey_submissions（保持一致，
+  # 截尾保留最新 N 条；0 时三者也不携带）。返回的每条 sleep_data 附计算属性
+  # sequence_summaries（各阶段时长/觉醒统计）。
   # 旧布尔字段 include_sleep_data 由 before-validator 映射（false→0 / true→全部 30 晚）
-  sleep_data_count: int = Field(1, ge=0, description="query_profile 响应携带最近 N 晚 sleep_data；0=不携带，缺省 1")
+  sleep_data_count: int = Field(1, ge=0, description="query_profile 响应携带最近 N 晚 sleep_data（附 sequence_summaries），并同量裁剪 footprint_days/inbox_messages/survey_submissions；0=均不携带，缺省 1")
   include_behaviors: bool = Field(True, description="query_profile 响应是否携带 behaviors，默认 True；为 False 时同时剔除 health_sync_days")
 
   @model_validator(mode="before")

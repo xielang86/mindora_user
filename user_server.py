@@ -263,16 +263,38 @@ class UserServer:
     if profile:
       logging.info("profile found uid=%s summary=%s", uid, self.user_serv._profile_for_log(profile))
       profile_dict = profile.model_dump()
-      # 按请求裁剪体积大头：sleep_data 限量（0=不携带，缺省 1=只回最近一晚）。
-      # 顺序与存库/快照一致（timestamp 升序，[-1] 是最新一晚），截尾保留最新 N 条。
+      # 按请求裁剪体积大头：sleep_data 限量（0=不携带，缺省 1=只回最近一晚），
+      # 同一数量同时裁剪 footprint_days / inbox_messages / survey_submissions（保持一致）。
+      # sleep_data 顺序与存库/快照一致（timestamp 升序，[-1] 是最新一晚），截尾保留最新 N 条；
+      # 每条附计算属性 sequence_summaries（各阶段时长/觉醒统计；property 不进 model_dump，需手动注入）。
       # 不携带 behaviors 时同时去掉 health_sync_days（健康数据对账状态）
       count = request.data.sleep_data_count
       if count <= 0:
         profile_dict.pop("sleep_data", None)
+        profile_dict.pop("footprint_days", None)
+        profile_dict.pop("inbox_messages", None)
+        profile_dict.pop("survey_submissions", None)
       else:
-        sleep_data = profile_dict.get("sleep_data")
-        if isinstance(sleep_data, list) and len(sleep_data) > count:
-          profile_dict["sleep_data"] = sleep_data[-count:]
+        records = profile.sleep_data
+        if len(records) > count:
+          records = records[-count:]
+        profile_dict["sleep_data"] = [
+          {**r.model_dump(), "sequence_summaries": r.sequence_summaries}
+          for r in records
+        ]
+        footprint = profile_dict.get("footprint_days")
+        if isinstance(footprint, dict) and len(footprint) > count:
+          keep_days = sorted(footprint)[-count:]
+          profile_dict["footprint_days"] = {k: footprint[k] for k in keep_days}
+        inbox = profile_dict.get("inbox_messages")
+        if isinstance(inbox, list) and len(inbox) > count:
+          profile_dict["inbox_messages"] = sorted(
+            inbox, key=lambda m: m.get("created_at") or 0)[-count:]
+        surveys = profile_dict.get("survey_submissions")
+        if isinstance(surveys, dict) and len(surveys) > count:
+          keep_ids = sorted(
+            surveys, key=lambda k: (surveys[k] or {}).get("submitted_at") or 0)[-count:]
+          profile_dict["survey_submissions"] = {k: surveys[k] for k in keep_ids}
       if not request.data.include_behaviors:
         profile_dict.pop("behaviors", None)
         profile_dict.pop("health_sync_days", None)

@@ -88,15 +88,21 @@ def get_effective_user_level(
   level_end_at: datetime | None,
   now: datetime | None = None,
   trial_end_at: datetime | None = None,
+  subscription_level: str | None = None,
 ) -> str:
   current_time = now or datetime.now()
-  # 体验期优先级高于 user_level：体验期内即便 free/pro 也按 premium 生效
+  # 体验期优先级高于一切：体验期内即便 free/pro 也按 premium 生效
   if is_premium_trial_active(trial_end_at, current_time):
     return PREMIUM_LEVEL
+  # ASSN V2（doc §8）：真实订阅档位与存储等级（兑换码等来源）取 MAX——
+  # 兑换来的 premium 不应被一笔 Basic(pro) 订阅覆盖降级
+  candidates = [DEFAULT_USER_LEVEL]
   normalized = normalize_user_level(level)
   if is_level_active(normalized, level_end_at, current_time):
-    return normalized
-  return DEFAULT_USER_LEVEL
+    candidates.append(normalized)
+  if subscription_level:
+    candidates.append(normalize_user_level(subscription_level))
+  return max(candidates, key=level_priority)
 
 
 def build_user_rights_payload(
@@ -104,19 +110,27 @@ def build_user_rights_payload(
   level_end_at: datetime | None,
   now: datetime | None = None,
   trial_end_at: datetime | None = None,
+  subscription_level: str | None = None,
 ) -> dict[str, Any]:
   current_time = now or datetime.now()
   stored_level = normalize_user_level(user_level)
-  effective_level = get_effective_user_level(stored_level, level_end_at, current_time, trial_end_at)
+  effective_level = get_effective_user_level(
+    stored_level, level_end_at, current_time, trial_end_at, subscription_level,
+  )
   trial_active = is_premium_trial_active(trial_end_at, current_time)
+  subscription_active = subscription_level is not None
   return {
     "stored_user_level": stored_level,
     "effective_user_level": effective_level,
     "level_end_at": level_end_at.isoformat() if level_end_at else None,
     # 不在体验期（或从未发放）时为 None；注意不能用 null 撤销体验期，撤销靠降 effective_user_level
     "premium_trial_end_at": trial_end_at.isoformat() if trial_active else None,
+    # ASSN 真实订阅档位（无效/无订阅时为 None），仅作展示与排查，客户端落地规则不变
+    "subscription_level": normalize_user_level(subscription_level) if subscription_active else None,
     "membership_active": (
-      is_level_active(stored_level, level_end_at, current_time) or trial_active
+      is_level_active(stored_level, level_end_at, current_time)
+      or trial_active
+      or subscription_active
     ),
     "rights": get_level_rights(effective_level),
     "server_time": current_time.isoformat(),

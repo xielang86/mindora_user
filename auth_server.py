@@ -2,7 +2,7 @@ import datetime
 import hashlib
 import secrets
 import jwt
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -1045,6 +1045,26 @@ async def wechat_qrcode():
 @app.get("/health")
 async def health():
   return {"status": "ok", "service": "auth_server"}
+
+
+@app.post("/apple/assn")
+async def apple_assn(raw_request: Request):
+  """App Store Server Notifications V2 接收端点（服务端-AppStore订阅通知接入(ASSN V2).md）。
+
+  Apple 不会带任何鉴权 header，安全性靠 JWS 三层验签（§4.2）；应答语义见 §4.3：
+  成功/丢弃 → 200 空 body；RETRYABLE_VERIFICATION_FAILURE / DB 错误 → 500 让 Apple 重投。
+  处理必须快，不做外网调用。
+  """
+  from apple_assn import handle_apple_notification
+
+  try:
+    body = await raw_request.json()
+  except Exception:
+    logging.warning("apple_assn: non-JSON body dropped")
+    return Response(status_code=200)
+  signed_payload = body.get("signedPayload", "") if isinstance(body, dict) else ""
+  status = handle_apple_notification(signed_payload)
+  return Response(status_code=status)
 
 
 if __name__ == "__main__":

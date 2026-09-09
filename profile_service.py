@@ -527,6 +527,27 @@ class UserProfileServ:
     best_id = max(stats.items(), key=lambda x: x[1]["count"])[0]
     return best_id, stats[best_id]
 
+  @staticmethod
+  def _pick_recent_scene(mindora_record: dict) -> Optional[tuple[str, int]]:
+    """最近一次使用的场景：全量记录中时间戳最新的一条，返回 (scene_id, ts)。
+
+    与 compute_recent_sleep_stats 的 recent_scene_title 同口径（/analysis 的
+    sleep_scenarios 骨架卡用它），这里落地到 profile 供设备轮询展示。
+    """
+    best_id, best_ts = None, 0
+    for scene_id, records in (mindora_record or {}).items():
+      if not isinstance(records, list) or not records:
+        continue
+      for entry in records:
+        if isinstance(entry, (list, tuple)) and len(entry) >= 1:
+          try:
+            ts = int(entry[0])
+          except (TypeError, ValueError):
+            continue
+          if ts > best_ts:
+            best_id, best_ts = scene_id, ts
+    return (best_id, best_ts) if best_id else None
+
   def _update_scene_stats(self, profile: UserProfile):
     """Pre-compute most-used scene (all-time and last 7 days) and persist them in sleep_analysis."""
     now = int(time.time())
@@ -558,6 +579,21 @@ class UserProfileServ:
         "scene_name": short_id.replace("_", " ").title(),
         "count": scene_stats["count"],
         "total_duration": scene_stats["total_duration"],
+        "updated_at": now,
+      }
+
+    # Recently used scene：最近一次使用的场景（used_at 为使用时间）。
+    # 设备端定期拉 query_profile 即可展示，无需单独请求 analysis 接口
+    recent = self._pick_recent_scene(profile.mindora_record)
+    if recent is None:
+      profile.sleep_analysis.pop("recent_scene", None)
+    else:
+      scene_id, used_at = recent
+      short_id = short_scene_id(scene_id)
+      profile.sleep_analysis["recent_scene"] = {
+        "scene_id": short_id,
+        "scene_name": short_id.replace("_", " ").title(),
+        "used_at": used_at,
         "updated_at": now,
       }
 

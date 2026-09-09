@@ -46,6 +46,27 @@ class Config:
     "com.mindora316.yearly",
   })
 
+  # ── App Store Server Notifications V2（服务端-AppStore订阅通知接入(ASSN V2).md）──
+  # Premium 档产品白名单：premium.* → premium 等级；Basic 白名单（上面）→ pro 等级
+  PREMIUM_SUBSCRIPTION_PRODUCT_IDS = frozenset({
+    "com.mindora316.premium.monthly",
+    "com.mindora316.premium.yearly",
+  })
+  APPLE_BUNDLE_ID = "com.mindora316.mindora"
+  APPLE_APP_ID = 6804918231  # 生产环境验签必填；沙盒不用
+  # Apple Root CA - G3 离线内置（doc §4.2/§10：不要运行时在线拉取），env 逗号分隔可覆盖
+  APPLE_ROOT_CERT_PATHS: list[str] = [
+    p.strip() for p in os.getenv("APPLE_ROOT_CERT_PATHS", "certs/AppleRootCA-G3.cer").split(",") if p.strip()
+  ]
+  # 灰度期（TestFlight 阶段一切内购走 Sandbox）显式放行 Sandbox 订阅权益；
+  # 默认 False —— 鉴权只认 Production（doc §2）
+  APPLE_SUBSCRIPTION_SANDBOX_ENTITLEMENT = (
+    os.getenv("APPLE_SUBSCRIPTION_SANDBOX_ENTITLEMENT", "false").lower() == "true"
+  )
+  # OCSP 在线吊销检查（doc §4.2 权衡）：服务器在国内，默认关；
+  # 开启后 Apple OCSP 端点抖动会触发 RETRYABLE_VERIFICATION_FAILURE → 应答 5xx 重投
+  APPLE_ASSN_ONLINE_CHECKS = os.getenv("APPLE_ASSN_ONLINE_CHECKS", "false").lower() == "true"
+
   # ── 睡眠计划同步（睡眠计划同步接口.md）────────────────────────────────────
   # 会员等级查询结果（auth_server query_user_rights）的内存缓存时长；查询失败不缓存、按 free 降级
   SLEEP_PLAN_TIER_CACHE_SECONDS = int(os.getenv("SLEEP_PLAN_TIER_CACHE_SECONDS", "60"))
@@ -145,3 +166,13 @@ class Config:
   )
   # 从请求头读取客户端 MAC 地址的 header 名
   DELETE_USER_MAC_HEADER: str = os.getenv("DELETE_USER_MAC_HEADER", "X-Device-Mac")
+
+
+def subscription_tier_for_product(product_id: str | None) -> str | None:
+  """Apple product_id → 会员等级：premium.* → 'premium'，Basic 白名单 → 'pro'，其余 None。"""
+  pid = (product_id or "").strip()
+  if pid in Config.PREMIUM_SUBSCRIPTION_PRODUCT_IDS:
+    return "premium"
+  if pid in Config.BASIC_SUBSCRIPTION_PRODUCT_IDS:
+    return "pro"
+  return None
