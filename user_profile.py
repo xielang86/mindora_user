@@ -741,6 +741,9 @@ class ProfileData(BaseModel):
   # 旧布尔字段 include_sleep_data 由 before-validator 映射（false→0 / true→全部 30 晚）
   sleep_data_count: int = Field(1, ge=0, description="query_profile 响应携带最近 N 晚 sleep_data（附 sequence_summaries），并同量裁剪 footprint_days/inbox_messages/survey_submissions；0=均不携带，缺省 1")
   include_behaviors: bool = Field(True, description="query_profile 响应是否携带 behaviors，默认 True；为 False 时同时剔除 health_sync_days")
+  # analysis_reports（LLM 生成的日/周/月/总览文案报告）同式限量：各序列升序、最新在尾，
+  # 截尾保留最新 N 份；缺省 1=每类只回最新一份；0=不携带 analysis_reports
+  analysis_report_count: int = Field(1, ge=0, description="query_profile 响应中 analysis_reports 每类(day/week/month/overview/explore)携带最近 N 份报告，缺省 1；0=不携带")
 
   @model_validator(mode="before")
   @classmethod

@@ -8,18 +8,74 @@
     handle_analysis_http 用 deep_merge 覆盖；md 允许文案降级
 """
 import datetime
+import time
 from typing import Optional
 
 from analysis_content import AnalysisContentService
 from user_profile import UserProfile, compute_recent_sleep_stats, short_scene_id
 
 
-def get_overall_score(profile: UserProfile) -> Optional[float]:
-  """计算用户最近7天的平均睡眠质量得分（0-100）"""
-  if not profile.sleep_data:
+# ── 数据新鲜度门（产品约定）：洞察与分析只展示最近窗口内的数据 ──────────────
+# 天级/周级：最近 7 天（含今天，日期差 ≤6）；月级：窗口起点最多 30 天前（差 ≤29）。
+# 超窗一律按无数据降级——数值字段省略、文案留空，客户端按 md 空态显示「未使用/--」；
+# 库存报告由 _find_analysis_report 同口径拦截，过期内容不会 deep_merge 进来。
+DAY_LOOKBACK_DAYS = 7
+WEEK_LOOKBACK_DAYS = 7
+MONTH_LOOKBACK_DAYS = 30
+
+
+def _req_tzinfo(d, profile: Optional[UserProfile]) -> datetime.tzinfo:
+  """请求时区优先，画像最近请求时区兜底，缺省 UTC（与生成口径一致）。"""
+  tz_name = getattr(d, "timezone", None) or getattr(profile, "last_request_timezone", None)
+  if tz_name:
+    try:
+      from zoneinfo import ZoneInfo
+      return ZoneInfo(tz_name)
+    except Exception:
+      pass
+  return datetime.timezone.utc
+
+
+def _fresh_latest(profile: Optional[UserProfile], tz: datetime.tzinfo,
+                  lookback_days: int = DAY_LOOKBACK_DAYS):
+  """时间窗内的最新一夜；最新一夜超窗（停戴超期）返回 None，调用方按无数据降级。"""
+  if not profile or not profile.sleep_data:
     return None
-  recent = profile.sleep_data[-7:]
-  scores = [s.sleep_quality for s in recent if s.sleep_quality is not None]
+  latest = profile.sleep_data[-1]  # 存库升序，[-1] 最新
+  if latest is None or latest.timestamp is None:
+    return None
+  night = datetime.datetime.fromtimestamp(latest.timestamp, tz).date()
+  today = datetime.datetime.now(tz).date()
+  return latest if (today - night).days < lookback_days else None
+
+
+def _clamp_window(start: str, end: str, today: datetime.date,
+                  lookback_days: int) -> tuple[Optional[str], Optional[str]]:
+  """请求窗口 ∩ [today-(lookback-1), today]；无交集返回 (None, None)。"""
+  try:
+    s = datetime.date.fromisoformat(start)
+    e = datetime.date.fromisoformat(end)
+  except (TypeError, ValueError):
+    return None, None
+  lo = today - datetime.timedelta(days=lookback_days - 1)
+  s, e = max(s, lo), min(e, today)
+  if s > e:
+    return None, None
+  return s.isoformat(), e.isoformat()
+
+
+def get_overall_score(profile: UserProfile, tz: Optional[datetime.tzinfo] = None) -> Optional[float]:
+  """最近 7 天（时间窗，含今天）平均睡眠质量得分；窗口内无数据返回 None。"""
+  if not profile or not profile.sleep_data:
+    return None
+  tz = tz or datetime.timezone.utc
+  today = datetime.datetime.now(tz).date()
+  lo = today - datetime.timedelta(days=DAY_LOOKBACK_DAYS - 1)
+  scores = [
+    s.sleep_quality for s in profile.sleep_data
+    if s.sleep_quality is not None
+    and lo <= datetime.datetime.fromtimestamp(s.timestamp, tz).date() <= today
+  ]
   return round(sum(scores) / len(scores), 2) if scores else None
 
 
@@ -128,17 +184,30 @@ def _top_scenes(profile: Optional[UserProfile], days: int, limit: int) -> list[t
 
 
 def _best_scene_score(profile: Optional[UserProfile]) -> Optional[int]:
-  """周最佳场景的效果分（best_sleep_quality_scene_7d.avg_sleep_quality）。"""
+  """周最佳场景的效果分（best_sleep_quality_scene_7d.avg_sleep_quality）。
+
+  快照在 update_profile 时按当时 7 天窗计算并持久化；超 7 天未刷新（停戴）
+  按无数据降级，不把过期分数带出来。
+  """
   best = (profile.sleep_analysis or {}).get("best_sleep_quality_scene_7d") if profile else None
   if best and best.get("avg_sleep_quality") is not None:
-    return int(round(best["avg_sleep_quality"]))
+    updated = best.get("updated_at") or 0
+    if time.time() - updated <= WEEK_LOOKBACK_DAYS * 86400:
+      return int(round(best["avg_sleep_quality"]))
   return None
 
 
-def _most_used_scene_entry(profile: Optional[UserProfile]) -> Optional[dict]:
-  """场景卡数据来源：优先 7 天最常用，退回全时段最常用；都没有返回 None。"""
-  sa = (profile.sleep_analysis or {}) if profile else {}
-  return sa.get("most_used_scene_7d") or sa.get("most_used_scene")
+def _week_top_scene(profile: Optional[UserProfile]) -> Optional[dict]:
+  """最近 7 天（时间窗）使用最多的场景 {scene_id, scene_name, count}；窗内无记录返回 None。
+
+  读路径现算（mindora_record 带时间戳），不读持久化快照——快照只在写入时刷新，
+  停戴用户的 most_used_scene（全时段口径）会把过期场景漏进响应。
+  """
+  top = _top_scenes(profile, days=WEEK_LOOKBACK_DAYS, limit=1)
+  if not top:
+    return None
+  sid, name, count = top[0]
+  return {"scene_id": sid, "scene_name": name, "count": count}
 
 
 def build_overview(d, profile: Optional[UserProfile]) -> dict:
@@ -147,13 +216,17 @@ def build_overview(d, profile: Optional[UserProfile]) -> dict:
 
   result: dict = {}
 
-  # overall_score：最近 7 天平均得分；无数据省略（客户端显示 --）
-  score = _window_avg_score(profile, start, date)
+  # overall_score：最近 7 天（时间窗，∩ 新鲜度窗口）平均得分；窗口内无数据省略（客户端显示 --）
+  tz = _req_tzinfo(d, profile)
+  today = datetime.datetime.now(tz).date()
+  eff_start, eff_end = _clamp_window(start, date, today, DAY_LOOKBACK_DAYS)
+  score = _window_avg_score(profile, eff_start, eff_end) if eff_start else None
   if score is not None:
     result["overall_score"] = {"score": score, "date": date}
 
-  # weekly_best：7 天最常用音频（退回全时段）；效果分取 best_sleep_quality_scene_7d
-  scene = _most_used_scene_entry(profile)
+  # weekly_best：7 天时间窗最常用音频；效果分取 best_sleep_quality_scene_7d（7 天新鲜度）。
+  # 窗口内无场景记录则整卡省略——停戴超期不回退全时段快照（新鲜度门）
+  scene = _week_top_scene(profile)
   if scene:
     weekly_best = {
       "audio_name": scene["scene_name"],
@@ -173,16 +246,19 @@ def build_overview(d, profile: Optional[UserProfile]) -> dict:
 
 def build_sleep_day(d, profile: Optional[UserProfile]) -> dict:
   date = d.date or datetime.date.today().isoformat()
-  latest = profile.sleep_data[-1] if profile and profile.sleep_data else None
+  # 新鲜度门：最新一夜超 7 天（停戴超期）按无数据降级——评分省略、场景卡
+  # 回到「未使用」空态（title/description 空串，客户端按 md 空态显示）
+  tz = _req_tzinfo(d, profile)
+  latest = _fresh_latest(profile, tz)
 
   result: dict = {}
 
-  # 顶部睡眠效率评分；无数据省略（客户端显示 --）
+  # 顶部睡眠效率评分；无（新鲜）数据省略（客户端显示 --）
   if latest and latest.sleep_quality is not None:
     result["score_summary"] = {"score": int(latest.sleep_quality), "date": date}
 
   # sleep_scenarios：标题取当天最近使用场景（无则空串），描述文案 LLM 报告覆盖
-  stats = compute_recent_sleep_stats(profile, days=1) if profile else {}
+  stats = compute_recent_sleep_stats(profile, days=1) if (profile and latest) else {}
   result["sleep_scenarios"] = {
     "title": stats.get("recent_scene_title") or "",
     "description": "",
@@ -197,14 +273,17 @@ def build_sleep_day(d, profile: Optional[UserProfile]) -> dict:
 
 
 def build_sleep_week(d, profile: Optional[UserProfile]) -> dict:
-  today = datetime.date.today()
+  tz = _req_tzinfo(d, profile)
+  today = datetime.datetime.now(tz).date()
   start = d.start_date or (today - datetime.timedelta(days=6)).isoformat()
   end   = d.end_date   or today.isoformat()
+  # 新鲜度门：周数据只看最近一周，请求窗口与 [today-6, today] 取交集，无交集按空
+  eff_start, eff_end = _clamp_window(start, end, today, WEEK_LOOKBACK_DAYS)
 
   result: dict = {}
 
   # 周窗口平均评分 + 评价；无数据省略（md：顶部评分由服务端按周窗口数据返回）
-  score = _window_avg_score(profile, start, end)
+  score = _window_avg_score(profile, eff_start, eff_end) if eff_start else None
   if score is not None:
     result["score_summary"] = {
       "score": score, "label": _localize(_score_label(score), d.language), "start_date": start, "end_date": end,
@@ -213,10 +292,10 @@ def build_sleep_week(d, profile: Optional[UserProfile]) -> dict:
   # sleep_trends：纯文案模块（LLM 报告覆盖）
   result["sleep_trends"] = {"body": "", "description": "", "start_date": start, "end_date": end}
 
-  # onset_efficiency：本周最常用场景 + 周平均入睡用时（两者独立填充，任一存在即返回模块）；
-  # 场景效果分取 best_sleep_quality_scene_7d
-  scene = _most_used_scene_entry(profile)
-  avg_onset = _window_avg_onset(profile, start, end)
+  # onset_efficiency：本周（时间窗）最常用场景 + 周平均入睡用时（两者独立填充，任一存在即返回模块）；
+  # 场景效果分取 best_sleep_quality_scene_7d（7 天新鲜度）
+  scene = _week_top_scene(profile) if eff_start else None
+  avg_onset = _window_avg_onset(profile, eff_start, eff_end) if eff_start else None
   if scene or avg_onset is not None:
     onset: dict = {"start_date": start, "end_date": end}
     if scene:
@@ -232,14 +311,17 @@ def build_sleep_week(d, profile: Optional[UserProfile]) -> dict:
 
 
 def build_sleep_month(d, profile: Optional[UserProfile]) -> dict:
-  today = datetime.date.today()
+  tz = _req_tzinfo(d, profile)
+  today = datetime.datetime.now(tz).date()
   start = d.start_date or (today - datetime.timedelta(days=29)).isoformat()
   end   = d.end_date   or today.isoformat()
+  # 新鲜度门：月数据起点最多 30 天前，请求窗口与 [today-29, today] 取交集，无交集按空
+  eff_start, eff_end = _clamp_window(start, end, today, MONTH_LOOKBACK_DAYS)
 
   result: dict = {}
 
   # 月窗口平均评分 + 评价
-  score = _window_avg_score(profile, start, end)
+  score = _window_avg_score(profile, eff_start, eff_end) if eff_start else None
   if score is not None:
     result["score_summary"] = {
       "score": score, "label": _localize(_score_label(score), d.language), "start_date": start, "end_date": end,
@@ -247,19 +329,15 @@ def build_sleep_month(d, profile: Optional[UserProfile]) -> dict:
 
   # sleep_trends：body/description 为 LLM 文案；score_series 取窗口内真实逐日评分，无数据为空序列
   score_series: list = []
-  if profile and profile.sleep_data:
-    try:
-      start_d = datetime.date.fromisoformat(start)
-      end_d = datetime.date.fromisoformat(end)
-    except ValueError:
-      start_d = end_d = None
-    if start_d is not None:
-      for sr in profile.sleep_data:
-        if sr.sleep_quality is None:
-          continue
-        day = datetime.date.fromtimestamp(sr.timestamp)
-        if start_d <= day <= end_d:
-          score_series.append({"date": day.isoformat(), "score": int(sr.sleep_quality)})
+  if profile and profile.sleep_data and eff_start:
+    start_d = datetime.date.fromisoformat(eff_start)
+    end_d = datetime.date.fromisoformat(eff_end)
+    for sr in profile.sleep_data:
+      if sr.sleep_quality is None:
+        continue
+      day = datetime.date.fromtimestamp(sr.timestamp)
+      if start_d <= day <= end_d:
+        score_series.append({"date": day.isoformat(), "score": int(sr.sleep_quality)})
   result["sleep_trends"] = {
     "body": "",
     "description": "",
@@ -269,8 +347,8 @@ def build_sleep_month(d, profile: Optional[UserProfile]) -> dict:
   }
 
   # onset_efficiency：月窗口使用次数 top3 场景 + 月平均入睡用时（任一存在即返回模块）
-  top = _top_scenes(profile, days=30, limit=3)
-  avg_onset = _window_avg_onset(profile, start, end)
+  top = _top_scenes(profile, days=MONTH_LOOKBACK_DAYS, limit=3) if eff_start else []
+  avg_onset = _window_avg_onset(profile, eff_start, eff_end) if eff_start else None
   if top or avg_onset is not None:
     onset: dict = {"start_date": start, "end_date": end}
     if top:
@@ -312,12 +390,14 @@ def build_explore(d, profile: Optional[UserProfile]) -> dict:
   date  = d.date or datetime.date.today().isoformat()
   start = (datetime.date.fromisoformat(date) - datetime.timedelta(days=6)).isoformat()
 
-  has_data = profile is not None and bool(profile.sleep_data)
-  latest   = profile.sleep_data[-1] if has_data else None
+  # 新鲜度门：洞察页内容全部来自最新一夜/最近窗口；最新一夜超 7 天（停戴超期）
+  # 与零数据同口径——data_ready=False，客户端进空态（md 空值与降级约定）
+  tz = _req_tzinfo(d, profile)
+  latest   = _fresh_latest(profile, tz)
   summaries = latest.sequence_summaries if (latest and latest.sleep_status) else {}
 
-  # 无睡眠数据：只回 data_ready=False + insight（md：客户端进入空态展示）
-  if not has_data:
+  # 无（新鲜）睡眠数据：只回 data_ready=False + insight（md：客户端进入空态展示）
+  if latest is None:
     result = {
       "data_ready": False,
       "insight": AnalysisContentService._visible_insight_dict(profile),
@@ -411,8 +491,9 @@ def build_explore(d, profile: Optional[UserProfile]) -> dict:
     fluctuation["respiratory_fluctuation"] = f"{int(latest.respiratory_var)}%"
   result["night_fluctuation"] = fluctuation
 
-  # Scene Preference 卡（scene_type 暂无元数据来源，留空待音频库分类表接入）
-  scene = _most_used_scene_entry(profile)
+  # Scene Preference 卡（scene_type 暂无元数据来源，留空待音频库分类表接入）；
+  # 7 天时间窗最常用场景，窗内无记录省略整卡（新鲜度门）
+  scene = _week_top_scene(profile)
   if scene:
     result["scene_preference"] = {
       "scene_id": scene["scene_id"],

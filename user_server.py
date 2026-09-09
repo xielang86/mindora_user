@@ -295,6 +295,18 @@ class UserServer:
           keep_ids = sorted(
             surveys, key=lambda k: (surveys[k] or {}).get("submitted_at") or 0)[-count:]
           profile_dict["survey_submissions"] = {k: surveys[k] for k in keep_ids}
+      # analysis_reports（LLM 日/周/月/总览文案报告，体积大头）同式限量：
+      # 缺省 1=每类只回最新一份，0=不携带；序列升序、最新在尾，截尾保留最新 N 份
+      report_count = request.data.analysis_report_count
+      if report_count <= 0:
+        profile_dict.pop("analysis_reports", None)
+      else:
+        reports = profile_dict.get("analysis_reports")
+        if isinstance(reports, dict):
+          profile_dict["analysis_reports"] = {
+            k: (v[-report_count:] if isinstance(v, list) and len(v) > report_count else v)
+            for k, v in reports.items()
+          }
       if not request.data.include_behaviors:
         profile_dict.pop("behaviors", None)
         profile_dict.pop("health_sync_days", None)

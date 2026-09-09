@@ -440,6 +440,26 @@ class AnalysisContentService:
     return changed
 
   @staticmethod
+  def _report_window_fresh(request_type: str, report: AnalysisTextReport, today: datetime.date) -> bool:
+    """报告周期的新鲜度门（与 analysis_builders 同口径）：
+
+    天级（overview/day/explore，按 date）与周级（按 end_date）：最近 7 天内（差 ≤6）；
+    月级按 start_date：最多 30 天前（差 ≤29）。超窗报告不合并——
+    停戴超期后请求日期漂离报告日期，过期文案不得盖到骨架上。
+    """
+    if request_type == "analysis_sleep_month":
+      ref, limit = report.start_date, 30
+    elif report.end_date is not None:
+      ref, limit = report.end_date, 7
+    else:
+      ref, limit = report.date, 7
+    try:
+      ref_date = datetime.date.fromisoformat(ref)
+    except (TypeError, ValueError):
+      return False
+    return (today - ref_date).days < limit
+
+  @staticmethod
   def _find_analysis_report(
     profile: Optional[UserProfile],
     request_type: str,
@@ -454,12 +474,33 @@ class AnalysisContentService:
     if not reports:
       return None
 
+    tz = _resolve_tz(getattr(profile, "last_request_timezone", None))
+    today = datetime.datetime.now(tz).date()
+
+    def _fresh(r: AnalysisTextReport) -> bool:
+      return AnalysisContentService._report_window_fresh(request_type, r, today)
+
     for r in reversed(reports):
       if start_date is not None or end_date is not None:
         if r.start_date == start_date and r.end_date == end_date:
-          return r
+          return r if _fresh(r) else None
       elif date is not None and r.date == date and r.start_date is None:
-        return r
+        return r if _fresh(r) else None
+
+    # 日视图特判：骨架永远展示最新一夜（sleep_data[-1]），文案应与同一夜对齐。
+    # 生成只在新夜晚到达时触发，用户停戴后请求日期会漂离报告日期——
+    # 若最新日报告覆盖的正是最新一夜，合并它，否则骨架有数值但文案全空。
+    # 报告日期 < 最新夜晚（新夜未分析）仍拒绝，交给懒触发生成；
+    # 夜晚与报告同样受 7 天新鲜度门限制（停戴超期不回旧文案）。
+    if request_type == "analysis_sleep_day" and profile.sleep_data:
+      newest_ts = max(
+        (r.timestamp for r in profile.sleep_data if r.timestamp), default=None,
+      )
+      if newest_ts is not None:
+        newest_night = datetime.datetime.fromtimestamp(newest_ts, tz).date().isoformat()
+        for r in reversed(reports):
+          if r.start_date is None and r.date == newest_night:
+            return r if _fresh(r) else None
 
     # 回退：请求的是当前周期（与生成时口径一致），直接用最新一条
     profile_tz = getattr(profile, "last_request_timezone", None)
@@ -479,16 +520,26 @@ class AnalysisContentService:
         # （如 9/2 的请求合并进 8/21 生成的"还没有睡眠数据"兜底文案）
         if latest.start_date is not None:
           if latest.start_date == c_start and latest.end_date == c_end:
-            return latest
+            return latest if _fresh(latest) else None
         elif latest.date == c_date:
-          return latest
+          return latest if _fresh(latest) else None
     return None
 
   @staticmethod
   def _visible_insight_dict(profile: Optional[UserProfile]) -> Optional[dict]:
-    """返回过滤掉 visible=False 模块后的 6 模块洞察报告 dict；无报告返回 None。"""
+    """返回过滤掉 visible=False 模块后的 6 模块洞察报告 dict；无报告返回 None。
+
+    洞察同样受 7 天新鲜度门限制：报告日期超窗（停戴超期）按无洞察处理。
+    """
     report = profile.sleep_insight if profile else None
     if report is None:
+      return None
+    tz = _resolve_tz(getattr(profile, "last_request_timezone", None))
+    today = datetime.datetime.now(tz).date()
+    try:
+      if (today - datetime.date.fromisoformat(report.date)).days >= 7:
+        return None
+    except (TypeError, ValueError):
       return None
     data = report.model_dump(mode="json")
     for key, _mid in AnalysisContentService._INSIGHT_MODULE_KEYS:
