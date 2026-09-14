@@ -73,6 +73,27 @@ def _clamp_window(start: str, end: str, today: datetime.date,
   return s.isoformat(), e.isoformat()
 
 
+def _current_window(start: Optional[str], end: Optional[str], anchor: datetime.date,
+                    lookback_days: int) -> tuple[Optional[str], Optional[str]]:
+  """Return a stable current-period window anchored to the latest valid night.
+
+  A client normally sends its current calendar period. After a user wakes up,
+  that end date advances even though no new sleep result exists; retaining the
+  request's moving start would silently shrink the sample. Treat a range that
+  reaches past the anchor as the current period and pin both bounds to it.
+  Fully historical ranges remain selectable.
+  """
+  try:
+    requested_end = datetime.date.fromisoformat(end) if end else anchor
+  except (TypeError, ValueError):
+    requested_end = anchor
+  if requested_end >= anchor:
+    start_d = anchor - datetime.timedelta(days=lookback_days - 1)
+    return start_d.isoformat(), anchor.isoformat()
+  default_start = requested_end - datetime.timedelta(days=lookback_days - 1)
+  return _clamp_window(start or default_start.isoformat(), requested_end.isoformat(), anchor, lookback_days)
+
+
 def get_overall_score(profile: UserProfile, tz: Optional[datetime.tzinfo] = None) -> Optional[float]:
   """最近 7 天（时间窗，含 anchor 当日）平均睡眠质量得分；窗口内无数据返回 None。"""
   if not profile or not profile.sleep_data:
@@ -237,16 +258,15 @@ def _week_top_scene(profile: Optional[UserProfile]) -> Optional[dict]:
 def build_overview(d, profile: Optional[UserProfile]) -> dict:
   tz = _req_tzinfo(d, profile)
   anchor = _anchor_date(profile, tz)
-  date = d.date or anchor.isoformat()
-  start = (datetime.date.fromisoformat(date) - datetime.timedelta(days=6)).isoformat()
+  date = anchor.isoformat()
+  start = (anchor - datetime.timedelta(days=DAY_LOOKBACK_DAYS - 1)).isoformat()
 
   result: dict = {}
 
-  # overall_score：最近 7 天（时间窗，∩ anchor 窗口）平均得分；窗口内无数据省略（客户端显示 --）
-  eff_start, eff_end = _clamp_window(start, date, anchor, DAY_LOOKBACK_DAYS)
-  score = _window_avg_score(profile, eff_start, eff_end, tz) if eff_start else None
-  if score is not None:
-    result["overall_score"] = {"score": score, "date": date}
+  # 首页总分直接展示最新有效夜的 sleep_quality，不取 7 天平均。
+  latest = _fresh_latest(profile, tz)
+  if latest and latest.sleep_quality is not None:
+    result["overall_score"] = {"score": int(latest.sleep_quality), "date": date}
 
   # weekly_best：7 天时间窗最常用音频；效果分取 best_sleep_quality_scene_7d（7 天新鲜度）。
   # 窗口内无场景记录则整卡省略——停戴超期不回退全时段快照（新鲜度门）
@@ -277,9 +297,11 @@ def build_sleep_day(d, profile: Optional[UserProfile]) -> dict:
 
   result: dict = {}
 
-  # 顶部睡眠效率评分；无（新鲜）数据省略（客户端显示 --）
-  if latest and latest.sleep_quality is not None:
-    result["score_summary"] = {"score": int(latest.sleep_quality), "date": date}
+  # 顶部为入睡效率（SOE），不是 sleep_quality；缺失时由客户端显示 --。
+  from sleep_session_builder import resolve_sleep_onset_efficiency
+  soe = resolve_sleep_onset_efficiency(latest) if latest else None
+  if soe is not None:
+    result["score_summary"] = {"score": int(soe), "date": date}
 
   # sleep_scenarios：标题取当天最近使用场景（无则空串），描述文案 LLM 报告覆盖
   stats = compute_recent_sleep_stats(profile, days=1) if (profile and latest) else {}
@@ -299,10 +321,9 @@ def build_sleep_day(d, profile: Optional[UserProfile]) -> dict:
 def build_sleep_week(d, profile: Optional[UserProfile]) -> dict:
   tz = _req_tzinfo(d, profile)
   anchor = _anchor_date(profile, tz)
-  start = d.start_date or (anchor - datetime.timedelta(days=6)).isoformat()
-  end   = d.end_date   or anchor.isoformat()
-  # 锚定窗口：周数据以 anchor（最近有效夜）为上界，请求窗口与 [anchor-6, anchor] 取交集，无交集按空
-  eff_start, eff_end = _clamp_window(start, end, anchor, WEEK_LOOKBACK_DAYS)
+  # 当前周固定锚定最近有效夜；明确选择的历史周仍按请求区间返回。
+  eff_start, eff_end = _current_window(d.start_date, d.end_date, anchor, WEEK_LOOKBACK_DAYS)
+  start, end = eff_start, eff_end
 
   result: dict = {}
 
@@ -337,10 +358,9 @@ def build_sleep_week(d, profile: Optional[UserProfile]) -> dict:
 def build_sleep_month(d, profile: Optional[UserProfile]) -> dict:
   tz = _req_tzinfo(d, profile)
   anchor = _anchor_date(profile, tz)
-  start = d.start_date or (anchor - datetime.timedelta(days=29)).isoformat()
-  end   = d.end_date   or anchor.isoformat()
-  # 锚定窗口：月数据起点最多 anchor 前 30 天，请求窗口与 [anchor-29, anchor] 取交集，无交集按空
-  eff_start, eff_end = _clamp_window(start, end, anchor, MONTH_LOOKBACK_DAYS)
+  # 当前月固定锚定最近有效夜；明确选择的历史月仍按请求区间返回。
+  eff_start, eff_end = _current_window(d.start_date, d.end_date, anchor, MONTH_LOOKBACK_DAYS)
+  start, end = eff_start, eff_end
 
   result: dict = {}
 
@@ -434,11 +454,13 @@ def build_explore(d, profile: Optional[UserProfile]) -> dict:
   result["header_summary"] = {"intro_text": "", "intro_detail_text": "", "date": date}
 
   # 顶部总分环：总分=当夜得分；三段分值 = soe / sleep_arch_index / night_var_index（缺哪个省哪个）
+  from sleep_session_builder import resolve_sleep_onset_efficiency
+  soe = resolve_sleep_onset_efficiency(latest)
   score_summary: dict = {"title": _localize("Sleep Score", d.language), "date": date}
   if latest.sleep_quality is not None:
     score_summary["score"] = int(latest.sleep_quality)
-  if latest.soe is not None:
-    score_summary["efficiency_score"] = int(latest.soe)
+  if soe is not None:
+    score_summary["efficiency_score"] = int(soe)
   if latest.sleep_arch_index is not None:
     score_summary["structure_score"] = int(latest.sleep_arch_index)
   if latest.night_var_index is not None:
@@ -466,8 +488,8 @@ def build_explore(d, profile: Optional[UserProfile]) -> dict:
 
   # Sleep Onset Efficiency 卡
   onset: dict = {"label": "", "description": "", "date": date}
-  if latest.soe is not None:
-    onset["score"] = int(latest.soe)
+  if soe is not None:
+    onset["score"] = int(soe)
   if latest.onset is not None:
     onset["onset_minutes"] = int(latest.onset)
   if latest.first_sleep_time:

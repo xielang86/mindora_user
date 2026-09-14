@@ -37,7 +37,8 @@ MAX_INTERVAL_SECONDS = 16 * 3600
 # onset 口径常量（md §6.1）
 _ONSET_SUSTAINED_SECONDS = 300   # 首次「持续睡着」= 累计睡够 5 分钟
 _ONSET_MICRO_AWAKE_SECONDS = 60  # 不超过 1 分钟的碎醒不算打断
-_ONSET_CAP_MINUTES = 180
+_ONSET_CAP_MINUTES = 240
+_INFERRED_LIGHT_BEFORE_DEEP_SECONDS = 10 * 60
 
 _STAGE_TYPE_MAP = {
   "sleep_stage_deep": "deep",
@@ -116,6 +117,15 @@ def derive_sessions(behaviors: dict) -> list[SleepSession]:
   return [s for s in sessions if s.asleep_seconds() >= MIN_SESSION_ASLEEP_SECONDS]
 
 
+def infer_light_sleep_start(deep_start: int) -> int:
+  """Temporary fallback for an unobserved light-sleep onset before deep sleep.
+
+  This deliberately has its own seam so a future per-user model can replace
+  the fixed estimate without changing the onset/SOE calculation.
+  """
+  return deep_start - _INFERRED_LIGHT_BEFORE_DEEP_SECONDS
+
+
 def _compute_onset(session: SleepSession) -> tuple[Optional[float], int]:
   """返回 (onset_minutes 或 None, lights_out_ts)。口径 md §6.1。"""
   lights_out = session.start
@@ -124,8 +134,12 @@ def _compute_onset(session: SleepSession) -> tuple[Optional[float], int]:
     if first_in_bed < session.start:  # 严格早于才采用；等于会话起点的包络写法弃用
       lights_out = first_in_bed
 
-  # 第一段就是睡着：会话起点已经在睡，无法知道何时入睡 → 不可测（不是「秒睡」）
+  # 第一段就是睡着：通常无法知道何时入睡。首段为深睡时，
+  # 临时推断其前 10 分钟为浅睡开始，并将这段距离作为入睡耗时代理。
   if session.intervals[0][2] != "awake" and lights_out >= session.start:
+    if session.intervals[0][2] == "deep":
+      inferred_light_start = infer_light_sleep_start(session.start)
+      return (session.start - inferred_light_start) / 60.0, inferred_light_start
     return None, lights_out
 
   acc = 0.0
@@ -167,6 +181,36 @@ def _hhmm(ts: int, tz: datetime.tzinfo) -> str:
   return datetime.datetime.fromtimestamp(ts, tz).strftime("%H:%M")
 
 
+def _score_sleep_onset_efficiency(onset_min: Optional[float]) -> Optional[float]:
+  """Convert sleep-onset minutes to the product SOE score using piecewise lines."""
+  if onset_min is None:
+    return None
+  if onset_min <= 7:
+    return 100.0
+  if onset_min <= 40:
+    return round(100.0 + (onset_min - 7) * (60.0 - 100.0) / (40.0 - 7), 1)
+  if onset_min <= 120:
+    return round(60.0 + (onset_min - 40) * (10.0 - 60.0) / (120.0 - 40), 1)
+  if onset_min <= 240:
+    return round(10.0 + (onset_min - 120) * (1.0 - 10.0) / (240.0 - 120), 1)
+  return 1.0
+
+
+def resolve_sleep_onset_efficiency(record: SleepResult) -> Optional[float]:
+  """Return stored SOE or apply the deep-first fallback to a legacy record.
+
+  New HealthKit rows persist SOE during synthesis. This read-only fallback lets
+  /analysis serve existing rows that were created before that behavior.
+  """
+  if record.soe is not None:
+    return record.soe
+  first = next(iter(record.sleep_status or []), None)
+  if first is None or first.sleep_type != "deep":
+    return None
+  inferred_light_start = infer_light_sleep_start(first.start_time)
+  return _score_sleep_onset_efficiency((first.start_time - inferred_light_start) / 60.0)
+
+
 def build_sleep_result(session: SleepSession, behaviors: dict, tz: datetime.tzinfo) -> SleepResult:
   """一个会话 → 一条 SleepResult（source=healthkit）。"""
   start, end = session.start, session.end
@@ -193,10 +237,9 @@ def build_sleep_result(session: SleepSession, behaviors: dict, tz: datetime.tzin
   else:
     quality = 0.6 * duration_score + 0.4 * (structure_score or 0)
 
-  # soe（入睡效率分）：onset ≤5 分钟计 100，≥60 分钟计 0，线性
-  soe = None
-  if onset_min is not None:
-    soe = round(max(0.0, 100.0 - max(0.0, onset_min - 5) / 55 * 100), 1)
+  # SOE（入睡效率）：7 分钟内满分；7→40 分钟 100→60；
+  # 40→120 分钟 60→10；120→240 分钟 10→1，分段线性。
+  soe = _score_sleep_onset_efficiency(onset_min)
 
   # night_var_index（夜间波动分）：觉醒次数与觉醒时长占比罚分
   span_sec = asleep_sec + awake_sec

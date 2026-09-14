@@ -138,10 +138,8 @@ def run_checks(profile: dict, responses: dict[str, dict], date: str, has_sleep_s
   # ── 概览 ──
   d = responses["analysis_overview"].get("data") or {}
   sc = (d.get("overall_score") or {}).get("score")
-  # overview 窗口为 [--date-6, --date] ∩ anchor 窗口；anchor 之后无新夜，两种终点对账等价
-  scores = _window_scores(sleep_data, (today - datetime.timedelta(days=6)).isoformat(), date)
   if sc is not None:
-    check_sleep_eq("概览 overview", "overall_score.score", sc, int(round(sum(scores) / len(scores))) if scores else None, "7 天窗口平均")
+    check_sleep_eq("概览 overview", "overall_score.score", sc, latest.get("sleep_quality") and int(latest["sleep_quality"]), "最新有效夜 sleep_quality")
   else:
     c.add("概览 overview", "overall_score", "(缺省)", "➖ 窗口内无数据，app 应显示 --")
   wb = d.get("weekly_best") or {}
