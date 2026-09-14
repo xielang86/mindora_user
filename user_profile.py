@@ -555,6 +555,8 @@ class UserProfile(BaseModel):
   uid_emb: List[float] = Field(default_factory=list)
   basic_info: Optional[Dict[str, str]] = Field(default_factory=dict)
   long_term_profile: List[Tuple[str, float]] = Field(default_factory=list)
+  sop_tag_profile: Dict[str, Any] = Field(default_factory=dict, description="服务端从保留的 Mindora 使用历史重算：标签接触、偏好证据、睡眠结果关联分开存储")
+  sop_recommendation_details: Dict[str, Any] = Field(default_factory=dict, description="SOP规则评分、命中标签、历史与当前排序、实际LLM来源")
 
   # 睡眠计划（设备端制定的睡眠目标，配合 SleepResult.goal_achieved 计算达成率）
   sleep_plan: Optional[SleepPlan] = Field(None, description="用户的睡眠目标计划")

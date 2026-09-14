@@ -307,6 +307,8 @@ class AnalysisContentService:
     def _rule_group(request_type: str):
       """返回 (该类型的规则结论列表, modules dict)；日视图无规则 → None。"""
       by_key = {c.key: c for c in night_conclusions}
+      if request_type == "analysis_sleep_day":
+        return [], ir.build_sleep_day_modules(profile, base, language)
       if request_type == "analysis_overview":
         home = ir.rule_home_summary(night_conclusions, mem, language, today)
         return [home], {"sleep_insight": {"title": home.title, "description": home.text}}
@@ -327,7 +329,7 @@ class AnalysisContentService:
           "sleep_advice": {"description": adv.text},
         }
         return [*night_conclusions, adv], modules
-      return None, None  # analysis_sleep_day：本阶段沿用 LLM 路径
+      return None, None  # 未配置规则模板的类型才允许进入旧 LLM 路径
 
     llm_on = bool(self.llm and self.llm.enabled)
 
@@ -375,7 +377,7 @@ class AnalysisContentService:
       )
 
       # ── LLM 润色（可选）：只重写文本字段，校验失败保留模板 ──
-      if llm_on:
+      if llm_on and rule_conclusions:
         class _FakeData:
           pass
         fake = _FakeData()

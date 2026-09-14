@@ -132,24 +132,24 @@ _TEMPLATES: dict[str, dict[str, str]] = {
     },
     # AN_ONSET（:3307）
     "onset_faster": {
-        "zh-Hans": "昨晚你比平时更快入睡（少 {delta} 分钟）。近 7 天平均入睡用时 {baseline7} 分钟，昨晚 {last_sol} 分钟。{vitals_clause}{scene_clause}",
-        "zh-Hant": "昨晚你平時更快入睡（少 {delta} 分鐘）。近 7 天平均入睡用時 {baseline7} 分鐘，昨晚 {last_sol} 分鐘。{vitals_clause}{scene_clause}",
-        "en": "You fell asleep faster than usual last night ({delta} min quicker). Your 7-day average sleep onset is {baseline7} min; last night it was {last_sol} min. {vitals_clause}{scene_clause}",
+        "zh-Hans": "昨晚你比平时更快入睡（少 {delta} 分钟）。近 7 天平均入睡用时 {baseline7} 分钟，昨晚 {last_sol} 分钟。{scene_clause}",
+        "zh-Hant": "昨晚你比平時更快入睡（少 {delta} 分鐘）。近 7 天平均入睡用時 {baseline7} 分鐘，昨晚 {last_sol} 分鐘。{scene_clause}",
+        "en": "You fell asleep faster than usual last night ({delta} min quicker). Your 7-day average sleep onset is {baseline7} min; last night it was {last_sol} min. {scene_clause}",
     },
     "onset_slower": {
-        "zh-Hans": "昨晚入睡用时比平时略长（多 {delta} 分钟）。近 7 天平均入睡用时 {baseline7} 分钟，昨晚 {last_sol} 分钟。{vitals_clause}{scene_clause}",
-        "zh-Hant": "昨晚入睡用時平時略長（多 {delta} 分鐘）。近 7 天平均入睡用時 {baseline7} 分鐘，昨晚 {last_sol} 分鐘。{vitals_clause}{scene_clause}",
-        "en": "It took a bit longer to fall asleep than usual last night ({delta} min more). Your 7-day average sleep onset is {baseline7} min; last night it was {last_sol} min. {vitals_clause}{scene_clause}",
+        "zh-Hans": "昨晚入睡用时比平时略长（多 {delta} 分钟）。近 7 天平均入睡用时 {baseline7} 分钟，昨晚 {last_sol} 分钟。{scene_clause}",
+        "zh-Hant": "昨晚入睡用時比平時略長（多 {delta} 分鐘）。近 7 天平均入睡用時 {baseline7} 分鐘，昨晚 {last_sol} 分鐘。{scene_clause}",
+        "en": "Sleep onset took longer than usual last night ({delta} min longer). Your 7-day average sleep onset is {baseline7} min; last night it was {last_sol} min. {scene_clause}",
     },
     "onset_stable": {
-        "zh-Hans": "昨晚入睡用时与近 7 天平均水平基本持平（{last_sol} 分钟，基线 {baseline7} 分钟）。{vitals_clause}{scene_clause}",
-        "zh-Hant": "昨晚入睡用時與近 7 天平均水平基本持平（{last_sol} 分鐘，基線 {baseline7} 分鐘）。{vitals_clause}{scene_clause}",
-        "en": "Sleep onset was in line with your 7-day average last night ({last_sol} min vs baseline {baseline7} min). {vitals_clause}{scene_clause}",
+        "zh-Hans": "昨晚入睡用时与近期基本持平。近 7 天平均入睡用时 {baseline7} 分钟，昨晚 {last_sol} 分钟。{scene_clause}",
+        "zh-Hant": "昨晚入睡用時與近期基本持平。近 7 天平均入睡用時 {baseline7} 分鐘，昨晚 {last_sol} 分鐘。{scene_clause}",
+        "en": "Last night's onset was in line with your recent pattern. Your 7-day average sleep onset is {baseline7} min; last night it was {last_sol} min. {scene_clause}",
     },
     "onset_facts": {
-        "zh-Hans": "昨晚入睡用时 {last_sol} 分钟。{vitals_clause}",
-        "zh-Hant": "昨晚入睡用時 {last_sol} 分鐘。{vitals_clause}",
-        "en": "Sleep onset took {last_sol} min last night. {vitals_clause}",
+        "zh-Hans": "昨晚入睡用时 {last_sol} 分钟。连续记录几晚后，这里会与你的个人近期基线进行比较。",
+        "zh-Hant": "昨晚入睡用時 {last_sol} 分鐘。連續記錄幾晚後，這裡會與你的個人近期基線進行比較。",
+        "en": "Sleep onset took {last_sol} min last night. After a few more nights, this will compare against your personal recent baseline.",
     },
     "onset_no_measure": {
         "zh-Hans": "昨晚未能测得入睡用时（记录从入睡后才开始），连续记录几晚后即可比较。",
@@ -248,6 +248,27 @@ _TEMPLATES: dict[str, dict[str, str]] = {
         "zh-Hans": "昨晚没有记录到场景使用。近期你最常选择「{scene}」（近 7 天 {uses} 次）。",
         "zh-Hant": "昨晚沒有記錄到場景使用。近期你最常選擇「{scene}」（近 7 天 {uses} 次）。",
         "en": "No scene usage was recorded last night. Recently you most often chose \"{scene}\" ({uses} times in 7 days).",
+    },
+    # analysis_sleep_day：仅陈述本夜记录，不把场景或阶段解释为效果/恢复。
+    "day_scene_used": {
+        "zh-Hans": "昨晚记录到你在「{scene}」场景下进入睡眠。近 7 天共记录到 {uses} 次该场景使用。",
+        "zh-Hant": "昨晚記錄到你在「{scene}」場景下進入睡眠。近 7 天共記錄到 {uses} 次該場景使用。",
+        "en": "You entered sleep with the \"{scene}\" scene recorded last night. This scene was recorded {uses} times in the last 7 days.",
+    },
+    "day_scene_none": {
+        "zh-Hans": "昨晚未记录到助眠场景使用。",
+        "zh-Hant": "昨晚未記錄到助眠場景使用。",
+        "en": "No sleep-scene usage was recorded last night.",
+    },
+    "day_stage_awake": {
+        "zh-Hans": "昨晚记录到夜间清醒 {count} 次，累计 {minutes} 分钟。",
+        "zh-Hant": "昨晚記錄到夜間清醒 {count} 次，累計 {minutes} 分鐘。",
+        "en": "{count} nighttime awakenings were recorded last night, totaling {minutes} min.",
+    },
+    "day_stage_sleep": {
+        "zh-Hans": "昨晚记录到 {stage} 睡眠 {minutes} 分钟。睡眠阶段会自然波动。",
+        "zh-Hant": "昨晚記錄到 {stage} 睡眠 {minutes} 分鐘。睡眠階段會自然波動。",
+        "en": "{minutes} min of {stage} sleep was recorded last night. Sleep stages naturally fluctuate.",
     },
     # AN_ADVICE（:3443）
     "advice_record_more": {
@@ -916,6 +937,56 @@ def rule_scene(profile: UserProfile, base: Baseline, data_state: str, lang: str)
                           valid_nights=len(base.nights_7d),
                           magnitude=0.0, actionability=1,
                           variables={"scene": name, "uses": uses_7d})
+
+
+def build_sleep_day_modules(profile: UserProfile, base: Baseline, lang: str) -> dict:
+    """analysis_sleep_day 的确定性文案。
+
+    该卡仅复述当夜已经记录的场景与分期事实；场景不推断效果，
+    分期不判断恢复或健康。这样即使 LLM 不可用，description 也稳定可对账。
+    """
+    latest = base.latest
+    if latest is None:
+        return {}
+    summ = latest.sequence_summaries if latest.sleep_status else {}
+    scene_id = attribute_scene_to_night(profile.mindora_record, latest.timestamp)
+    if scene_id:
+        scene = scene_display_name(scene_id)
+        uses = scene_uses_in_window(profile.mindora_record, scene_id,
+                                    end_ts=latest.timestamp, days=7)
+        scene_description = _safe_render("day_scene_used", {"scene": scene, "uses": uses},
+                                         lang, _t("day_scene_none", lang))
+    else:
+        scene_description = _t("day_scene_none", lang)
+
+    awake_count = int(round(summ.get("night_awake_count") or 0))
+    awake_min = int(round(summ.get("night_awake_duration") or 0))
+    stage_descriptions = {
+        "awake": _safe_render("day_stage_awake",
+                              {"count": awake_count, "minutes": awake_min}, lang, ""),
+    }
+    stage_names = {
+        "rem": {"zh-Hans": "REM", "zh-Hant": "REM", "en": "REM"},
+        "core": {"zh-Hans": "核心", "zh-Hant": "核心", "en": "core"},
+        "deep": {"zh-Hans": "深睡", "zh-Hant": "深睡", "en": "deep"},
+    }
+    duration_keys = {
+        "rem": "rem_sleep_duration", "core": "core_sleep_duration",
+        "deep": "deep_sleep_duration",
+    }
+    canonical = _canonical_lang(lang)
+    for stage, duration_key in duration_keys.items():
+        stage_descriptions[stage] = _safe_render(
+            "day_stage_sleep",
+            {"stage": stage_names[stage].get(canonical, stage_names[stage]["en"]),
+             "minutes": int(round(summ.get(duration_key) or 0))},
+            lang, "")
+    return {
+        "sleep_scenarios": {"title": scene_display_name(scene_id) if scene_id else "",
+                            "description": scene_description},
+        "stage_insights": {stage: {"description": description}
+                           for stage, description in stage_descriptions.items()},
+    }
 
 
 def build_night_conclusions(profile: UserProfile, lang: str) -> tuple:

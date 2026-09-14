@@ -141,6 +141,7 @@ class AnthropicCompatibleChat(BaseChatModel):
             auth_token=self.api_key,  # Bearer，与 Claude Code 订阅端点约定一致
             base_url=self.api_base,
             timeout=timeout_seconds,
+            max_retries=0,  # Provider failover belongs to the caller; avoid repeated timeout waits.
         )
         try:
             # 新版 anthropic SDK（kimi coding 端点同构）已移除 messages.create 的
@@ -159,6 +160,8 @@ class AnthropicCompatibleChat(BaseChatModel):
             raise RuntimeError(
                 f"调用 Anthropic 兼容 API 失败({self.api_base}): {type(e).__name__}: {e}; status_code={status}"
             ) from e
+        finally:
+            client.close()
 
         return ChatResult(generations=[ChatGeneration(message=AIMessage(content=answer))])
 

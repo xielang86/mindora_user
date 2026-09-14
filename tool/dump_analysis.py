@@ -65,6 +65,31 @@ def _latest_valid_night(sleep_data: list) -> dict:
   return best or {}
 
 
+def _effective_soe(record: dict) -> int | None:
+  """Mirror the server's persisted-SOE/deep-first compatibility behavior."""
+  soe = record.get("soe")
+  if soe is not None:
+    return int(soe)
+  first_stage = next(iter(record.get("sleep_status") or []), None)
+  if not isinstance(first_stage, dict) or first_stage.get("sleep_type") != "deep":
+    return None
+
+  # Keep this fallback aligned with sleep_session_builder:
+  # inferred light-sleep start = first deep-sleep start - 10 minutes.
+  onset_minutes = 10.0
+  if onset_minutes <= 7:
+    score = 100.0
+  elif onset_minutes <= 40:
+    score = 100.0 + (onset_minutes - 7) * (60.0 - 100.0) / (40.0 - 7)
+  elif onset_minutes <= 120:
+    score = 60.0 + (onset_minutes - 40) * (10.0 - 60.0) / (120.0 - 40)
+  elif onset_minutes <= 240:
+    score = 10.0 + (onset_minutes - 120) * (1.0 - 10.0) / (240.0 - 120)
+  else:
+    score = 1.0
+  return int(round(score, 1))
+
+
 def _window_scores(sleep_data: list, start: str, end: str) -> list[float]:
   start_d = datetime.date.fromisoformat(start)
   end_d = datetime.date.fromisoformat(end)
@@ -153,7 +178,7 @@ def run_checks(profile: dict, responses: dict[str, dict], date: str, has_sleep_s
   d = responses["analysis_sleep_day"].get("data") or {}
   sc = (d.get("score_summary") or {}).get("score")
   if sc is not None:
-    check_sleep_eq("睡眠日 day", "score_summary.score", sc, latest.get("sleep_quality") and int(latest["sleep_quality"]), "当夜（最新有效夜）sleep_quality")
+    check_sleep_eq("睡眠日 day", "score_summary.score", sc, _effective_soe(latest), "当夜（最新有效夜）有效 SOE")
   ssc = d.get("sleep_scenarios") or {}
   c.check_text("睡眠日 day", "sleep_scenarios.title", ssc.get("title"))
   c.check_text("睡眠日 day", "sleep_scenarios.description", ssc.get("description"))
@@ -195,7 +220,7 @@ def run_checks(profile: dict, responses: dict[str, dict], date: str, has_sleep_s
   if d.get("data_ready"):
     ss = d.get("score_summary") or {}
     check_sleep_eq("探索 explore", "score_summary.score", ss.get("score"), latest.get("sleep_quality") and int(latest["sleep_quality"]), "当夜（最新有效夜）sleep_quality")
-    check_sleep_eq("探索 explore", "score_summary.efficiency_score", ss.get("efficiency_score"), latest.get("soe") and int(latest["soe"]), "当夜 soe")
+    check_sleep_eq("探索 explore", "score_summary.efficiency_score", ss.get("efficiency_score"), _effective_soe(latest), "当夜有效 SOE")
     check_sleep_eq("探索 explore", "score_summary.structure_score", ss.get("structure_score"), latest.get("sleep_arch_index") and int(latest["sleep_arch_index"]), "当夜 sleep_arch_index")
     check_sleep_eq("探索 explore", "score_summary.fluctuation_score", ss.get("fluctuation_score"), latest.get("night_var_index") and int(latest["night_var_index"]), "当夜 night_var_index")
     nf = d.get("night_fluctuation") or {}

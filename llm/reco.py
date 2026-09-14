@@ -3,6 +3,7 @@ import logging
 import os
 import re
 import time
+import threading
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, List, Optional
@@ -161,6 +162,9 @@ def _summarize_profile_for_prompt(profile: UserProfile) -> str:
         data["basic_info"] = profile.basic_info
     if profile.long_term_profile:
         data["long_term_profile"] = profile.long_term_profile
+    if profile.sop_tag_profile:
+        data["sop_tag_profile"] = {k: v for k, v in profile.sop_tag_profile.items()
+                                   if k != "sleep_usage_links"}
     if profile.profile:
         prof = profile.profile.model_dump(mode="json", exclude_none=True)
         prof.pop("avatar_base64", None)
@@ -299,6 +303,7 @@ def _sleep_analysis_summary(profile: UserProfile, lang: str) -> str:
 
 
 def _build_sop_reco_prompt(profile: UserProfile, candidates: List[str]) -> str:
+    from content_tags import candidate_metadata
     knowledge = _load_text(_KNOWLEDGE_BASE_PATH)
     topology = _load_text(_TOPOLOGY_PATH)
     return f"""
@@ -316,6 +321,12 @@ Sleep strategy topology:
 
 Standard SOP process candidates:
 {json.dumps(candidates, ensure_ascii=False, indent=2)}
+
+Workbook content metadata (null means unannotated; do not guess missing tags):
+{json.dumps(candidate_metadata(candidates), ensure_ascii=False, indent=2)}
+Exposure means content was used, not liked or fully heard. Outcome associations are
+observations, not causal improvements. Workbook goals/health clues are unvalidated
+annotations, not user outcomes. Guide variants are not confirmed played.
 
 Task:
 1. Read the user's CURRENT sleep analysis and advice above (onset / structure / night fluctuations / scene association). Pick SOP processes that best match their current sleep pattern and the advice already given — e.g. slow onset → stronger relaxation/induction; frequent awakenings → steadier deep-stage sound; a well-associated scene → keep its acoustic style.
@@ -342,17 +353,64 @@ Task:
   ]
 }}
 6. Only set `cmd_name`; all other fields should be null.
-7. Return exactly 3 SOP process ids in ranked order.
+7. Return up to 3 SOP process ids in ranked order, or all candidates if fewer than 3 are available.
 """
 
 
-def _get_model() -> Optional[BaseChatModel]:
-    """睡眠推荐的 LLM 请求方向由 ModelRouter 决定（request_type="sleep_reco"，缺省走 default 方向）。"""
+_ROUTE_FAILURE_UNTIL = {}
+_ROUTE_FAILURE_LOCK = threading.Lock()
+
+
+def _route_key(route):
+    return (route.name, route.api_base, route.model)
+
+
+def _recommendation_models():
+    """Lazy initialization lets one broken provider fall through to the next."""
     try:
-        return ModelRouter.from_env().chat_model_for("sleep_reco", temperature=0.3)
+        router = ModelRouter.from_env()
     except Exception as e:
         logging.error("sleep recommendation llm init failed: %s", e)
-        return None
+        return
+    for route in router.available_routes("sleep_reco"):
+        with _ROUTE_FAILURE_LOCK:
+            cooling_down = _ROUTE_FAILURE_UNTIL.get(_route_key(route), 0) > time.monotonic()
+        if cooling_down:
+            continue
+        try:
+            model = router.chat_model_for_route(route, temperature=0.3)
+            if model is not None:
+                yield route, model
+        except Exception:
+            _mark_route_failed(route)
+            logging.exception("recommendation model initialization failed: route=%s", route.name)
+
+
+def _mark_route_failed(route):
+    with _ROUTE_FAILURE_LOCK:
+        _ROUTE_FAILURE_UNTIL[_route_key(route)] = time.monotonic() + 300
+
+
+def _invoke_recommendation(prompt, system_prompt, flow, validate, expected):
+    for route, model in _recommendation_models():
+        route_flow = f"{flow}:{route.name}"
+        _append_llm_trace("request", route_flow, prompt)
+        try:
+            response = model.invoke([SystemMessage(content=system_prompt), HumanMessage(content=prompt)])
+            raw = response.content
+            _append_llm_trace("response", route_flow, prompt, response_text=str(raw))
+            result = validate(_extract_json(raw))
+            if len(result) != expected:
+                raise ValueError(f"Expected {expected} valid candidates, received {len(result)}")
+            with _ROUTE_FAILURE_LOCK:
+                _ROUTE_FAILURE_UNTIL.pop(_route_key(route), None)
+            logging.info("recommendation LLM succeeded: flow=%s route=%s", flow, route.name)
+            return result, route.name
+        except Exception as e:
+            _mark_route_failed(route)
+            _append_llm_trace("error", route_flow, prompt, error_text=str(e))
+            logging.warning("recommendation LLM failed: flow=%s route=%s; trying next provider (%s)", flow, route.name, type(e).__name__)
+    return None, None
 
 
 def _extract_json(text: str) -> Optional[dict[str, Any]]:
@@ -532,30 +590,9 @@ class RecommendationEngine:
 
     @staticmethod
     def generate(profile: UserProfile) -> List[SleepScenario]:
-        model = _get_model()
-        if model is None:
-            logging.warning("no available LLM route (ARK_API_KEY/KIMI_API_KEY unset), using fallback sleep scenario candidates")
-            return _fallback_scenarios()
-
         prompt = _build_prompt(profile)
-        _append_llm_trace("request", "sleep_scenario_reco", prompt)
-        try:
-            response = model.invoke([
-                SystemMessage(content=_SYSTEM_PROMPT),
-                HumanMessage(content=prompt),
-            ])
-            response_text = response.content if isinstance(response.content, str) else json.dumps(response.content, ensure_ascii=False)
-            _append_llm_trace("response", "sleep_scenario_reco", prompt, response_text=response_text)
-            parsed = _extract_json(response.content)
-            scenarios = _validate_scenarios(parsed)
-            if len(scenarios) == 2:
-                return scenarios
-            logging.warning("sleep recommendation llm returned %s valid scenarios, using fallback", len(scenarios))
-        except Exception as e:
-            _append_llm_trace("error", "sleep_scenario_reco", prompt, error_text=str(e))
-            logging.error("sleep recommendation llm call failed: %s", e)
-
-        return _fallback_scenarios()
+        scenarios, _route = _invoke_recommendation(prompt, _SYSTEM_PROMPT, "sleep_scenario_reco", _validate_scenarios, 2)
+        return scenarios if scenarios is not None else _fallback_scenarios()
 
     @staticmethod
     def generate_sop_reco(profile: UserProfile, candidates: Optional[List[str]] = None) -> List[SleepScenario]:
@@ -567,38 +604,40 @@ class RecommendationEngine:
         if not candidate_scenarios:
             candidate_scenarios = [_build_sop_reco_scenario(item) for item in _default_sop_candidates()]
 
-        normalized_candidates = [
-            cmd_name
-            for scenario in candidate_scenarios
-            if (cmd_name := _extract_sop_cmd_name(scenario)) is not None
-        ]
+        from content_tags import canonical_cmd
+        from sop_ranking import rank_sops, rules
 
-        fallback = _fallback_sop_reco(candidate_scenarios)
-        if not fallback:
+        # Normalize and deduplicate at the execution seam, including fallback inputs.
+        unique = {}
+        for scenario in candidate_scenarios:
+            cmd = _extract_sop_cmd_name(scenario)
+            if cmd and not _is_pure_music_cmd(cmd) and canonical_cmd(cmd).startswith("sleep.scene."):
+                unique.setdefault(canonical_cmd(cmd), scenario)
+        candidate_scenarios = list(unique.values())
+        commands = [_extract_sop_cmd_name(s) for s in candidate_scenarios]
+        ranking = rank_sops(profile, commands)
+        candidate_map = {_extract_sop_cmd_name(s): s for s in candidate_scenarios}
+        ranked_candidates = [candidate_map[row["cmd_name"]] for row in ranking]
+        details = {
+            "rules_version": rules()["version"], "generated_at": int(time.time()),
+            "basis": "current_profile_snapshot", "ranking": ranking,
+            "historical": sorted([r for r in ranking if any(e["type"] in ("explicit_preference", "outcome_association")
+                for e in r["evidence"])], key=lambda r: -r["historical_score"])[:3],
+            "current": ranking[:3], "llm_route": None, "selection_method": "rules",
+            "limitations": ["Outcome scores describe associations, not causal improvement.",
+                            "Exposure is not preference; unavailable feedback contributes zero.",
+                            "Profile goals are not a separately collected daily state."]}
+        profile.sop_recommendation_details = details
+        details["historical_status"] = "available" if details["historical"] else "insufficient_evidence"
+        if not ranked_candidates:
             return []
-
-        model = _get_model()
-        if model is None:
-            logging.warning("no available LLM route (ARK_API_KEY/KIMI_API_KEY unset), using fallback SOP candidates")
-            return fallback[:3]
-
-        prompt = _build_sop_reco_prompt(profile, normalized_candidates)
-        _append_llm_trace("request", "sleep_sop_reco", prompt)
-        try:
-            response = model.invoke([
-                SystemMessage(content=_SOP_SYSTEM_PROMPT),
-                HumanMessage(content=prompt),
-            ])
-            response_text = response.content if isinstance(response.content, str) else json.dumps(response.content, ensure_ascii=False)
-            _append_llm_trace("response", "sleep_sop_reco", prompt, response_text=response_text)
-            parsed = _extract_json(response.content)
-            reco = _validate_sop_reco(parsed, candidate_scenarios)
-            if len(reco) == min(3, len(normalized_candidates)):
-                # 按 LLM 排序整体返回（第一位=最匹配），不再随机丢弃排序
-                return reco
-            logging.warning("sleep sop recommendation llm returned %s valid candidates, using fallback", len(reco))
-        except Exception as e:
-            _append_llm_trace("error", "sleep_sop_reco", prompt, error_text=str(e))
-            logging.error("sleep sop recommendation llm call failed: %s", e)
-
-        return fallback[:3]
+        prompt = _build_sop_reco_prompt(profile, [row["cmd_name"] for row in ranking])
+        prompt += "\nRule ranking evidence (higher scores take priority):\n" + json.dumps(ranking, ensure_ascii=False)
+        prompt += f"\nReturn exactly {min(3, len(ranking))} distinct candidates. Use content fit to resolve equal rule scores."
+        proposed, route = _invoke_recommendation(prompt, _SOP_SYSTEM_PROMPT, "sleep_sop_reco",
+            lambda payload: _validate_sop_reco(payload, ranked_candidates), min(3, len(ranking)))
+        if proposed is not None:
+            llm_order = {_extract_sop_cmd_name(s): i for i, s in enumerate(proposed)}
+            ranking = sorted(ranking, key=lambda r: (-r["score"], llm_order.get(r["cmd_name"], len(ranking))))
+            details.update(llm_route=route, selection_method="rules_with_llm_tiebreak", ranking=ranking, current=ranking[:3])
+        return [_clone_sleep_scenario(candidate_map[row["cmd_name"]]) for row in ranking[:3]]

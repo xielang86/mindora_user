@@ -32,6 +32,7 @@ from config import Config
 from engagement_service import EngagementService
 from llm import SleepAnalysisLLM
 from user_profile import UserProfile, SleepScenario, Profile, SCENE_CMD_PREFIXES, short_scene_id
+from sop_tag_profile import rebuild_sop_tag_profile
 
 run_dir = os.getenv("RUN_DIR") or os.path.dirname(os.path.abspath(__file__))
 
@@ -479,7 +480,12 @@ class UserProfileServ:
     for cmd, ts, event in self._extract_sop_start_events(plays):
       duration = event.get("duration") if isinstance(event, dict) else None
       record = profile.mindora_record.setdefault(cmd, [])
-      record.append((ts, duration))
+      # Retried start events must not inflate usage/tag evidence.
+      existing = next((i for i, item in enumerate(record) if str(item[0]) == str(ts)), None)
+      if existing is None:
+        record.append((ts, duration))
+      elif duration is not None:
+        record[existing] = (ts, duration)
       # keep the list sorted by timestamp and cap the length
       record.sort(key=lambda x: x[0])
       if len(record) > UserProfileServ.MAX_BEHAVIOR_LEN:
@@ -895,6 +901,7 @@ class UserProfileServ:
       self._update_best_scene_by_sleep_quality(new_profile)
       self._synthesize_sleep_data(new_profile)
       self._update_night_hr_range(new_profile)
+      rebuild_sop_tag_profile(new_profile)
       return new_profile
 
     # just replace, if need
@@ -902,6 +909,14 @@ class UserProfileServ:
       profile.uid_emb = new_profile.uid_emb
 
     profile.profile = self._merge_personal_profile(profile.profile, new_profile.profile)
+    # These are ranking inputs; sparse updates must preserve existing answers.
+    for field in ("sleep_health", "sleep_mode"):
+      if field in new_profile.model_fields_set:
+        incoming = getattr(new_profile, field)
+        previous = getattr(profile, field)
+        if incoming is not None and previous is not None:
+          incoming = type(incoming).model_validate({**previous.model_dump(), **incoming.model_dump(exclude_unset=True)})
+        setattr(profile, field, incoming)
     profile.long_term_profile = self._merge_profile(profile.long_term_profile, new_profile.long_term_profile)
     # 版本登记 + v1 purge 必须在 merge 前：purge 清的是存量里被覆盖天的旧口径样本
     self._apply_health_schema_update(profile, new_profile, health_schema_version, timezone)
@@ -914,6 +929,7 @@ class UserProfileServ:
     self._update_scene_stats(profile)
     self._update_best_scene_by_sleep_quality(profile)
     self._update_night_hr_range(profile)
+    rebuild_sop_tag_profile(profile)
     return profile
 
   def _apply_llm_update(
@@ -1059,6 +1075,7 @@ class UserProfileServ:
         profile.sleep_scenarios_reco = sleep_scenarios
       if standard_sop is not None:
         profile.standard_sop_reco = standard_sop
+        profile.sop_recommendation_details = llm_profile.sop_recommendation_details
       elif not profile.standard_sop_reco:
         # reco 被跳过时，兜底保证 standard_sop_reco 不为空
         profile.standard_sop_reco = self.calc_standard_sop_reco(uid, profile, old_profile)
