@@ -133,7 +133,8 @@ class AnalysisContentService:
     # existing 是兜底（llm_used=False）或语言已漂移 → 有真实夜晚了，重新生成替换之
 
     report_tz = profile.last_request_timezone
-    today_str = _today_in_tz(report_tz).isoformat()
+    # 报告日期锚定最近有效夜（停戴用户展示最后一夜），generated_at 仍是真实生成时刻
+    today_str = ir.anchor_date(profile, _resolve_tz(report_tz)).isoformat()
 
     # ── 规则引擎：结构化结论 + 模板渲染（兜底文案，LLM 不可用也能输出）──
     _, _, night_conclusions = ir.build_night_conclusions(profile, lang)
@@ -197,13 +198,16 @@ class AnalysisContentService:
     return report
 
   @staticmethod
-  def _analysis_specs_for_today(tz_name: Optional[str] = None) -> list:
+  def _analysis_specs(tz_name: Optional[str] = None, profile: Optional[UserProfile] = None) -> list:
     """5 个分析能力的当前周期定义：(request_type, start_date, end_date, date, modules)。
 
-    日级能力 start_date/end_date 为 None、date=今日；周/月带起止日期。
-    "今日"按用户画像最近请求时区计算（缺省 UTC），与每日触发门同口径。
+    日级能力 start_date/end_date 为 None、date=锚定日；周/月带起止日期。
+    周期锚定「最近有效时间」：最近一条有效夜晚的归日日期（按画像最近请求时区，
+    缺省 UTC），无有效夜回退今日——与每日触发门同口径。
     """
-    today = _today_in_tz(tz_name)
+    import insight_rules as ir  # 延迟 import 避免顶层循环依赖
+    tz = _resolve_tz(tz_name)
+    today = ir.anchor_date(profile, tz)
     today_str = today.isoformat()
     week_start = (today - datetime.timedelta(days=6)).isoformat()
     month_start = (today - datetime.timedelta(days=29)).isoformat()
@@ -245,7 +249,7 @@ class AnalysisContentService:
     reports: dict = {key: list(existing.get(key) or []) for key in ANALYSIS_REPORT_KEYS}
     now = int(time.time())
     changed = False
-    specs = self._analysis_specs_for_today(tz_name)
+    specs = self._analysis_specs(tz_name, profile)
 
     def _current_report(request_type: str, start_date, end_date, date) -> Optional[AnalysisTextReport]:
       for r in reports[request_type]:
@@ -441,11 +445,11 @@ class AnalysisContentService:
 
   @staticmethod
   def _report_window_fresh(request_type: str, report: AnalysisTextReport, today: datetime.date) -> bool:
-    """报告周期的新鲜度门（与 analysis_builders 同口径）：
+    """报告周期的新鲜度门（与 analysis_builders 同口径，today 传 anchor 锚定日）：
 
     天级（overview/day/explore，按 date）与周级（按 end_date）：最近 7 天内（差 ≤6）；
     月级按 start_date：最多 30 天前（差 ≤29）。超窗报告不合并——
-    停戴超期后请求日期漂离报告日期，过期文案不得盖到骨架上。
+    报告日期对齐有效夜后新鲜度自然成立，过期文案不得盖到骨架上。
     """
     if request_type == "analysis_sleep_month":
       ref, limit = report.start_date, 30
@@ -474,8 +478,9 @@ class AnalysisContentService:
     if not reports:
       return None
 
+    import insight_rules as ir  # 延迟 import 避免顶层循环依赖
     tz = _resolve_tz(getattr(profile, "last_request_timezone", None))
-    today = datetime.datetime.now(tz).date()
+    today = ir.anchor_date(profile, tz)
 
     def _fresh(r: AnalysisTextReport) -> bool:
       return AnalysisContentService._report_window_fresh(request_type, r, today)
@@ -487,11 +492,11 @@ class AnalysisContentService:
       elif date is not None and r.date == date and r.start_date is None:
         return r if _fresh(r) else None
 
-    # 日视图特判：骨架永远展示最新一夜（sleep_data[-1]），文案应与同一夜对齐。
+    # 日视图特判：骨架永远展示最新一夜（最近有效夜），文案应与同一夜对齐。
     # 生成只在新夜晚到达时触发，用户停戴后请求日期会漂离报告日期——
     # 若最新日报告覆盖的正是最新一夜，合并它，否则骨架有数值但文案全空。
     # 报告日期 < 最新夜晚（新夜未分析）仍拒绝，交给懒触发生成；
-    # 夜晚与报告同样受 7 天新鲜度门限制（停戴超期不回旧文案）。
+    # 夜晚与报告同样受 7 天新鲜度门限制（相对 anchor，停戴超期锚定最后一夜）。
     if request_type == "analysis_sleep_day" and profile.sleep_data:
       newest_ts = max(
         (r.timestamp for r in profile.sleep_data if r.timestamp), default=None,
@@ -506,7 +511,7 @@ class AnalysisContentService:
     profile_tz = getattr(profile, "last_request_timezone", None)
     current = {
       rt: (s, e, d)
-      for rt, s, e, d, _m in AnalysisContentService._analysis_specs_for_today(profile_tz)
+      for rt, s, e, d, _m in AnalysisContentService._analysis_specs(profile_tz, profile)
     }
     if request_type in current:
       c_start, c_end, c_date = current[request_type]
@@ -529,13 +534,15 @@ class AnalysisContentService:
   def _visible_insight_dict(profile: Optional[UserProfile]) -> Optional[dict]:
     """返回过滤掉 visible=False 模块后的 6 模块洞察报告 dict；无报告返回 None。
 
-    洞察同样受 7 天新鲜度门限制：报告日期超窗（停戴超期）按无洞察处理。
+    洞察同样受 7 天新鲜度门限制（相对 anchor 锚定日）：报告日期对齐有效夜后，
+    停戴用户锚定最后一夜，新鲜度自然成立；零数据兜底报告仍按 today 判定。
     """
     report = profile.sleep_insight if profile else None
     if report is None:
       return None
+    import insight_rules as ir  # 延迟 import 避免顶层循环依赖
     tz = _resolve_tz(getattr(profile, "last_request_timezone", None))
-    today = datetime.datetime.now(tz).date()
+    today = ir.anchor_date(profile, tz)
     try:
       if (today - datetime.date.fromisoformat(report.date)).days >= 7:
         return None

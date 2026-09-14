@@ -76,7 +76,7 @@ class UserProfileServ:
 
   # -------------------- 门面：委托给拆分后的子服务 --------------------
   _INSIGHT_MODULE_KEYS = AnalysisContentService._INSIGHT_MODULE_KEYS
-  _analysis_specs_for_today = staticmethod(AnalysisContentService._analysis_specs_for_today)
+  _analysis_specs = staticmethod(AnalysisContentService._analysis_specs)
   _upsert_analysis_report = staticmethod(AnalysisContentService._upsert_analysis_report)
   _find_analysis_report = staticmethod(AnalysisContentService._find_analysis_report)
   _visible_insight_dict = staticmethod(AnalysisContentService._visible_insight_dict)
@@ -487,13 +487,14 @@ class UserProfileServ:
 
   # -------------------- 场景统计 --------------------
   @staticmethod
-  def _calc_scene_stats(mindora_record: dict, days: int | None = None) -> dict:
+  def _calc_scene_stats(mindora_record: dict, days: int | None = None, end_ts: int | None = None) -> dict:
     """Compute usage counts and total duration per scene from mindora_record.
 
     If ``days`` is given, only entries whose timestamp is within the last
-    ``days`` days are counted.
+    ``days`` days are counted. 窗口终点默认当前时刻；读路径传 ``end_ts``
+    锚定最近有效夜（与 analysis_builders 的 anchor 口径一致）。
     """
-    cutoff_ts = int(time.time()) - days * 86400 if days else 0
+    cutoff_ts = (int(end_ts) if end_ts else int(time.time())) - days * 86400 if days else 0
     stats: dict[str, dict] = {}
     for scene_id, records in (mindora_record or {}).items():
       if not isinstance(records, list) or not records:

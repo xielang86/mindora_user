@@ -50,6 +50,21 @@ def _date_of(ts: int) -> datetime.date:
   return datetime.date.fromtimestamp(ts)
 
 
+def _is_valid_night(r: dict) -> bool:
+  """与 insight_rules.is_valid_night 同口径：有睡眠分段或有评分才算有效夜。"""
+  return bool(r.get("sleep_status")) or r.get("sleep_quality") is not None
+
+
+def _latest_valid_night(sleep_data: list) -> dict:
+  """时间戳最大的有效夜（服务端 _fresh_latest/anchor 口径）；无有效夜返回 {}。"""
+  best = None
+  for r in sleep_data:
+    if r.get("timestamp") and _is_valid_night(r):
+      if best is None or r["timestamp"] > best["timestamp"]:
+        best = r
+  return best or {}
+
+
 def _window_scores(sleep_data: list, start: str, end: str) -> list[float]:
   start_d = datetime.date.fromisoformat(start)
   end_d = datetime.date.fromisoformat(end)
@@ -59,8 +74,9 @@ def _window_scores(sleep_data: list, start: str, end: str) -> list[float]:
   ]
 
 
-def _top_scenes(mindora_record: dict, days: int, limit: int) -> list[str]:
-  cutoff = int(time.time()) - days * 86400
+def _top_scenes(mindora_record: dict, days: int, limit: int, end_ts: int | None = None) -> list[str]:
+  # 窗口终点与服务端一致：锚定最近有效夜（end_ts），缺省回退当前时刻
+  cutoff = (int(end_ts) if end_ts else int(time.time())) - days * 86400
   counts = {}
   for scene_id, records in (mindora_record or {}).items():
     # 与服务端 short_scene_id 同口径：strip 所有已知前缀（sleep.scene. / sleep.pure_music. 等）
@@ -99,10 +115,18 @@ class Checker:
 def run_checks(profile: dict, responses: dict[str, dict], date: str, has_sleep_source: bool = True) -> Checker:
   c = Checker()
   sleep_data = profile.get("sleep_data") or []
-  latest = sleep_data[-1] if sleep_data else {}
+  # 与服务端 anchor 口径一致：最新有效夜（而非 sleep_data[-1]，尾包可能是无效夜）
+  latest = _latest_valid_night(sleep_data)
+  latest_ts = int(latest["timestamp"]) if latest.get("timestamp") else None
   today = datetime.date.fromisoformat(date)
-  week_start = (today - datetime.timedelta(days=6)).isoformat()
-  month_start = (today - datetime.timedelta(days=29)).isoformat()
+  # 周/月窗口：dump 未传 start/end，服务端缺省锚定最近有效夜（build_sleep_week/month），
+  # 对账窗口同口径以 anchor 为终点；零有效夜回退 --date
+  anchor = _date_of(latest_ts) if latest_ts else today
+  week_start = (anchor - datetime.timedelta(days=6)).isoformat()
+  week_end = anchor.isoformat()
+  month_start = (anchor - datetime.timedelta(days=29)).isoformat()
+  # 锚定 7 天使用最多的场景名（服务端 _week_top_scene 同口径），overview/week/explore 共用
+  week_top = (_top_scenes(profile.get("mindora_record"), 7, 1, end_ts=latest_ts) or [None])[0]
 
   def check_sleep_eq(screen: str, path: str, actual, expected, note: str = ""):
     """依赖 sleep_data 源数据的对账；未拉取 sleep_data 时跳过比对（避免误报 ❌）。"""
@@ -114,13 +138,15 @@ def run_checks(profile: dict, responses: dict[str, dict], date: str, has_sleep_s
   # ── 概览 ──
   d = responses["analysis_overview"].get("data") or {}
   sc = (d.get("overall_score") or {}).get("score")
-  scores = _window_scores(sleep_data, week_start, date)
+  # overview 窗口为 [--date-6, --date] ∩ anchor 窗口；anchor 之后无新夜，两种终点对账等价
+  scores = _window_scores(sleep_data, (today - datetime.timedelta(days=6)).isoformat(), date)
   if sc is not None:
     check_sleep_eq("概览 overview", "overall_score.score", sc, int(round(sum(scores) / len(scores))) if scores else None, "7 天窗口平均")
   else:
     c.add("概览 overview", "overall_score", "(缺省)", "➖ 窗口内无数据，app 应显示 --")
   wb = d.get("weekly_best") or {}
-  c.add("概览 overview", "weekly_best.audio_name", wb.get("audio_name"), "📝 应对应 sleep_analysis.most_used_scene_7d.scene_name")
+  if wb.get("audio_name") is not None or week_top is not None:
+    check_sleep_eq("概览 overview", "weekly_best.audio_name", wb.get("audio_name"), week_top, "锚定 7 天使用最多场景")
   si = d.get("sleep_insight") or {}
   c.check_text("概览 overview", "sleep_insight.title", si.get("title"))
   c.check_text("概览 overview", "sleep_insight.description", si.get("description"))
@@ -129,7 +155,7 @@ def run_checks(profile: dict, responses: dict[str, dict], date: str, has_sleep_s
   d = responses["analysis_sleep_day"].get("data") or {}
   sc = (d.get("score_summary") or {}).get("score")
   if sc is not None:
-    check_sleep_eq("睡眠日 day", "score_summary.score", sc, latest.get("sleep_quality") and int(latest["sleep_quality"]), "当夜 sleep_quality")
+    check_sleep_eq("睡眠日 day", "score_summary.score", sc, latest.get("sleep_quality") and int(latest["sleep_quality"]), "当夜（最新有效夜）sleep_quality")
   ssc = d.get("sleep_scenarios") or {}
   c.check_text("睡眠日 day", "sleep_scenarios.title", ssc.get("title"))
   c.check_text("睡眠日 day", "sleep_scenarios.description", ssc.get("description"))
@@ -140,9 +166,9 @@ def run_checks(profile: dict, responses: dict[str, dict], date: str, has_sleep_s
   for rt, start, label in (("analysis_sleep_week", week_start, "周"), ("analysis_sleep_month", month_start, "月")):
     d = responses[rt].get("data") or {}
     sc = (d.get("score_summary") or {}).get("score")
-    scores = _window_scores(sleep_data, start, date)
+    scores = _window_scores(sleep_data, start, week_end)
     if sc is not None:
-      check_sleep_eq(f"睡眠{label}", "score_summary.score", sc, int(round(sum(scores) / len(scores))) if scores else None, f"{label}窗口平均")
+      check_sleep_eq(f"睡眠{label}", "score_summary.score", sc, int(round(sum(scores) / len(scores))) if scores else None, f"{label}窗口平均（锚定）")
     c.check_text(f"睡眠{label}", "score_summary.label", (d.get("score_summary") or {}).get("label"))
     tr = d.get("sleep_trends") or {}
     c.check_text(f"睡眠{label}", "sleep_trends.body", tr.get("body"))
@@ -153,17 +179,24 @@ def run_checks(profile: dict, responses: dict[str, dict], date: str, has_sleep_s
       check_sleep_eq(f"睡眠{label}", "sleep_trends.score_series.length", len(series), expected_len, "窗口内有分天数")
       sl = (d.get("onset_efficiency") or {}).get("scenario_list")
       if sl:
-        c.check_eq(f"睡眠{label}", "onset_efficiency.scenario_list", sl, _top_scenes(profile.get("mindora_record"), 30, 3), "mindora_record 30 天 top3")
+        c.check_eq(f"睡眠{label}", "onset_efficiency.scenario_list", sl,
+                   _top_scenes(profile.get("mindora_record"), 30, 3, end_ts=latest_ts), "mindora_record 锚定 30 天 top3")
     else:
       oe = d.get("onset_efficiency") or {}
-      c.add(f"睡眠{label}", "onset_efficiency.scenario_name", oe.get("scenario_name"), "📝 应对应 most_used_scene_7d")
+      if oe.get("scenario_name") is not None or week_top is not None:
+        check_sleep_eq(f"睡眠{label}", "onset_efficiency.scenario_name", oe.get("scenario_name"), week_top, "锚定 7 天使用最多场景")
 
   # ── 探索 ──
   d = responses["analysis_explore"].get("data") or {}
-  c.add("探索 explore", "data_ready", d.get("data_ready"), ("✅" if d.get("data_ready") == bool(sleep_data) else "❌ 与 sleep_data 是否为空不符") if has_sleep_source else "➖ 未拉取 sleep_data，无法核对")
+  # 与服务端 build_explore 的有效时间锚定同口径：存在有效夜（停戴超期也锚定最后一夜）
+  # 即 data_ready=True，仅零有效夜才 False
+  has_valid_night = bool(latest)
+  c.add("探索 explore", "data_ready", d.get("data_ready"),
+        ("✅" if d.get("data_ready") == has_valid_night else "❌ 与有效夜锚定口径不符（有有效夜应为 True，零有效夜为 False）")
+        if has_sleep_source else "➖ 未拉取 sleep_data，无法核对")
   if d.get("data_ready"):
     ss = d.get("score_summary") or {}
-    check_sleep_eq("探索 explore", "score_summary.score", ss.get("score"), latest.get("sleep_quality") and int(latest["sleep_quality"]), "当夜 sleep_quality")
+    check_sleep_eq("探索 explore", "score_summary.score", ss.get("score"), latest.get("sleep_quality") and int(latest["sleep_quality"]), "当夜（最新有效夜）sleep_quality")
     check_sleep_eq("探索 explore", "score_summary.efficiency_score", ss.get("efficiency_score"), latest.get("soe") and int(latest["soe"]), "当夜 soe")
     check_sleep_eq("探索 explore", "score_summary.structure_score", ss.get("structure_score"), latest.get("sleep_arch_index") and int(latest["sleep_arch_index"]), "当夜 sleep_arch_index")
     check_sleep_eq("探索 explore", "score_summary.fluctuation_score", ss.get("fluctuation_score"), latest.get("night_var_index") and int(latest["night_var_index"]), "当夜 night_var_index")
@@ -173,7 +206,8 @@ def run_checks(profile: dict, responses: dict[str, dict], date: str, has_sleep_s
     check_sleep_eq("探索 explore", "night_fluctuation.heart_rate_range", nf.get("heart_rate_range"), expected_hr, "当夜 hr_min/hr_max")
     check_sleep_eq("探索 explore", "onset_efficiency.onset_minutes", (d.get("onset_efficiency") or {}).get("onset_minutes"), latest.get("onset") and int(latest["onset"]), "当夜 onset")
     sp = d.get("scene_preference") or {}
-    c.add("探索 explore", "scene_preference.scene_name", sp.get("scene_name"), "📝 应对应 most_used_scene_7d")
+    if sp.get("scene_name") is not None or week_top is not None:
+      check_sleep_eq("探索 explore", "scene_preference.scene_name", sp.get("scene_name"), week_top, "锚定 7 天使用最多场景")
     # M27 洞察数据：三个展示指数（规则现算，不经过 LLM）
     io_ = d.get("insight_overview") or {}
     if io_:

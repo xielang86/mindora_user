@@ -403,6 +403,23 @@ def is_valid_night(r: SleepResult) -> bool:
     return bool(r.sleep_status) or r.sleep_quality is not None
 
 
+def latest_valid_night_date(profile, tz) -> Optional[datetime.date]:
+    """最近一条有效夜晚（时间戳最大）的归日日期；无有效夜返回 None（调用方回退 today）。"""
+    best_ts = None
+    for r in (profile.sleep_data if profile else None) or []:
+        if r is not None and r.timestamp and is_valid_night(r):
+            if best_ts is None or r.timestamp > best_ts:
+                best_ts = r.timestamp
+    if best_ts is None:
+        return None
+    return datetime.datetime.fromtimestamp(best_ts, tz).date()
+
+
+def anchor_date(profile, tz) -> datetime.date:
+    """有效时间锚点：最近有效夜日期，无数据回退 today。"""
+    return latest_valid_night_date(profile, tz) or datetime.datetime.now(tz).date()
+
+
 def records_in_window(profile: UserProfile, *, end_date: datetime.date, days: int, tz) -> list[SleepResult]:
     """自然日窗口 [end_date-days+1, end_date] 内的有效夜晚（区别于 [-days:] 条数切片）。"""
     start = end_date - datetime.timedelta(days=days - 1)
@@ -472,7 +489,7 @@ class Baseline:
 
 def compute_data_state(profile: UserProfile, tz) -> str:
     """AN_DATA_STATE：empty / single_night / baseline7_ready / baseline30_ready。"""
-    today = datetime.datetime.now(tz).date()
+    today = anchor_date(profile, tz)
     n30 = len(records_in_window(profile, end_date=today, days=30, tz=tz))
     if n30 == 0:
         return "empty"
@@ -486,7 +503,7 @@ def compute_data_state(profile: UserProfile, tz) -> str:
 
 
 def compute_baselines(profile: UserProfile, tz) -> Baseline:
-    today = datetime.datetime.now(tz).date()
+    today = anchor_date(profile, tz)
     nights_7d = records_in_window(profile, end_date=today, days=7, tz=tz)
     nights_30d = records_in_window(profile, end_date=today, days=30, tz=tz)
     nights_prev_7d = records_in_window(profile, end_date=today - datetime.timedelta(days=7), days=7, tz=tz)
@@ -852,7 +869,10 @@ def rule_fluctuation(profile: UserProfile, base: Baseline, data_state: str, lang
 def rule_scene(profile: UserProfile, base: Baseline, data_state: str, lang: str) -> RuleConclusion:
     latest = base.latest
     scene_id = attribute_scene_to_night(profile.mindora_record, latest.timestamp) if latest else None
-    top = top_scenes_in_window(profile.mindora_record, end_ts=int(time.time()), days=7, limit=3)
+    # top 场景窗口与 uses_7d/scene_night_stats 同口径：锚定最近有效夜而非自然当前时刻，
+    # 停戴用户的 7 天窗口应覆盖最后一夜之前的使用记录，否则窗口内记录全空、推荐场景丢失
+    end_ts = int(latest.timestamp) if latest and latest.timestamp else int(time.time())
+    top = top_scenes_in_window(profile.mindora_record, end_ts=end_ts, days=7, limit=3)
 
     def _pref_fallback():
         if top:
@@ -978,7 +998,7 @@ def rule_advice(profile: UserProfile, base: Baseline, data_state: str,
     数据不足时只给「继续记录」建议（规范 :3447）。"""
     canonical = _canonical_lang(lang)
     tz = base.tz
-    today = datetime.datetime.now(tz).date()
+    today = anchor_date(profile, tz)
     mem = insight_memory(profile)
     by_key = {c.key: c for c in conclusions}
 

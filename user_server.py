@@ -638,14 +638,26 @@ class UserServer:
 
   # -------------------- /analysis --------------------
   async def handle_analysis_http(self, request: web.Request) -> web.Response:
+    client_request_id = request.headers.get("X-Client-Request-ID", "-")
+
+    def _respond(response_obj: BaseResponse, status: int | None = None) -> web.Response:
+      http_status = status if status is not None else get_http_status(response_obj)
+      logging.info(
+        "analysis response: client_request_id=%s status=%s code=%s request_type=%s",
+        client_request_id, http_status, response_obj.code,
+        getattr(response_obj, "request_type", None),
+      )
+      return web.json_response(response_obj.model_dump(), status=http_status)
+
+    logging.info("analysis request received: client_request_id=%s", client_request_id)
     try:
       body = await request.json()
       req = AnalysisRequest.model_validate(body)
       uid = self._parse_for_uid(req.data)
       if uid is None:
-        return web.json_response(InvalidOrExpiredTokenResp().model_dump(), status=401)
+        return _respond(InvalidOrExpiredTokenResp(), status=401)
       if isinstance(uid, BaseResponse):
-        return web.json_response(uid.model_dump(), status=uid.code)
+        return _respond(uid, status=uid.code)
 
       # 用户在看法分析页 = 活跃信号（收窄后只认 /analysis 和 plays）
       self._mark_activity(uid)
@@ -697,14 +709,14 @@ class UserServer:
         deep_merge(response_data, updates)
 
       resp = AnalysisResponse(code=0, msg="success", request_type=req.request_type, data=response_data)
-      return web.json_response(resp.model_dump())
+      return _respond(resp)
 
     except ValidationError as e:
-      logging.error(f"analysis validation error: {e}")
-      return web.json_response(InvalidReqFormatResp().model_dump(), status=400)
+      logging.error("analysis validation error: client_request_id=%s error=%s", client_request_id, e)
+      return _respond(InvalidReqFormatResp(), status=400)
     except Exception as e:
-      logging.error(f"analysis error: {e}")
-      return web.json_response(BaseResponse(code=500, msg="Internal server error").model_dump(), status=500)
+      logging.error("analysis error: client_request_id=%s error=%s", client_request_id, e)
+      return _respond(BaseResponse(code=500, msg="Internal server error"), status=500)
 
   # ---- /analysis 骨架组装：委托给 analysis_builders（纯函数） ----
   def get_overall_score(self, profile: Optional[UserProfile]) -> Optional[float]:
