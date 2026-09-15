@@ -100,7 +100,7 @@ class AnalysisContentService:
     立即可用、LLM 挂了也不影响输出）；LLM 启用时仅在既定事实上润色 title/content
     （evidence/action 保留规则值），校验失败保留模板文案。
 
-    复用策略（醒后每日更新机制）：有比 generated_at 更新的 sleep_data 夜晚就重算；
+    复用策略（醒后每日更新机制）：报告日期与最新有效夜不符，或有比 generated_at 更新的夜晚就重算；
     没有新夜晚时 7 天内复用（慢速刷新兜底），超过 7 天也重算。
     """
     import insight_rules as ir  # 延迟 import 避免顶层循环依赖
@@ -109,6 +109,7 @@ class AnalysisContentService:
     now = int(time.time())
     # 文案语言：last_request_language（请求信封）优先，Profile.language 参考，兜底 en
     lang = _profile_language(profile)
+    today_str = ir.anchor_date(profile, _resolve_tz(profile.last_request_timezone)).isoformat()
     if not profile.sleep_data:
       # 零睡眠记录：模板兜底（通用建议 + Mindora 引导，不烧 LLM）。
       # 已有内容且语言未漂移一律保留——幂等；兜底（llm_used=False）语言漂移则按新语言
@@ -122,7 +123,7 @@ class AnalysisContentService:
         _today_in_tz(profile.last_request_timezone).isoformat(), now,
       )
     if existing and existing.generated_at and existing.llm_used \
-        and existing.language == lang:
+        and existing.language == lang and existing.date == today_str:
       newest_sleep_ts = max(
         (int(r.timestamp or 0) for r in (profile.sleep_data or [])), default=0,
       )
@@ -536,7 +537,7 @@ class AnalysisContentService:
   def _visible_insight_dict(profile: Optional[UserProfile]) -> Optional[dict]:
     """返回过滤掉 visible=False 模块后的 6 模块洞察报告 dict；无报告返回 None。
 
-    洞察同样受 7 天新鲜度门限制（相对 anchor 锚定日）：报告日期对齐有效夜后，
+    有睡眠数据时，旧日期报告以当前夜规则文案临时替代；其余受 7 天新鲜度门限制。
     停戴用户锚定最后一夜，新鲜度自然成立；零数据兜底报告仍按 today 判定。
     """
     report = profile.sleep_insight if profile else None
@@ -545,6 +546,12 @@ class AnalysisContentService:
     import insight_rules as ir  # 延迟 import 避免顶层循环依赖
     tz = _resolve_tz(getattr(profile, "last_request_timezone", None))
     today = ir.anchor_date(profile, tz)
+    if profile.sleep_data and report.date != today.isoformat():
+      # 后台报告尚未更新：用当前画像生成同一夜的规则文案，不调用 LLM、不修改库存。
+      current_profile = profile.model_copy(update={"sleep_insight": None})
+      report = AnalysisContentService(lambda: None).calc_sleep_insight("", current_profile)
+      if report is None:
+        return None
     try:
       if (today - datetime.date.fromisoformat(report.date)).days >= 7:
         return None
