@@ -245,6 +245,51 @@ def resolve_sleep_structure_score(record: SleepResult) -> Optional[float]:
                                summ["core_sleep_duration"])
 
 
+def sleep_duration_minutes(record: SleepResult) -> Optional[float]:
+  """Observed sleep only, excluding awake and inferred onset proxy minutes."""
+  if not record.sleep_status:
+    return None
+  return sum(max(0.0, x.duration) for x in record.sleep_status
+             if x.sleep_type in {"deep", "rem", "core"})
+
+
+def cap_sleep_quality(score: Optional[float], minutes: Optional[float]) -> Optional[float]:
+  """Product duration ceiling: 0h=0, 5h=59, 6h=79, 7h=100 (linear).
+
+  Missing stage data is unknown, not zero sleep; preserve the existing score.
+  The ceiling only reduces a score and never rewards longer sleep by itself.
+  """
+  if score is None or minutes is None:
+    return score
+  minutes = max(0.0, minutes)
+  if minutes <= 300:
+    ceiling = minutes / 300 * 59
+  elif minutes <= 360:
+    ceiling = 59 + (minutes - 300) / 60 * 20
+  else:
+    ceiling = min(100.0, 79 + (minutes - 360) / 60 * 21)
+  return min(max(0.0, score), ceiling)
+
+
+def resolve_sleep_quality(record: SleepResult) -> Optional[float]:
+  """Apply the duration ceiling to new, legacy and device scores, without writes."""
+  return cap_sleep_quality(record.sleep_quality, sleep_duration_minutes(record))
+
+
+def mean_sleep_duration(records: list[SleepResult]) -> Optional[float]:
+  durations = [d for r in records if (d := sleep_duration_minutes(r)) is not None]
+  return sum(durations) / len(durations) if durations else None
+
+
+def aggregate_sleep_quality(records: list[SleepResult]) -> Optional[float]:
+  scored = [r for r in records if r.sleep_quality is not None]
+  if not scored:
+    return None
+  average = sum(resolve_sleep_quality(r) for r in scored) / len(scored)
+  # Aggregate duration gate prevents a few high nights from masking short sleep.
+  return cap_sleep_quality(average, mean_sleep_duration(records))
+
+
 def build_sleep_result(session: SleepSession, behaviors: dict, tz: datetime.tzinfo) -> SleepResult:
   """一个会话 → 一条 SleepResult（source=healthkit）。"""
   start, end = session.start, session.end
@@ -295,7 +340,7 @@ def build_sleep_result(session: SleepSession, behaviors: dict, tz: datetime.tzin
 
   return SleepResult(
     timestamp=end,  # 醒来时刻；_analysis_needed 以它归日
-    sleep_quality=round(quality, 1),
+    sleep_quality=round(cap_sleep_quality(quality, asleep_sec / 60.0), 1),
     soe=soe,
     onset=round(onset_min, 1) if onset_min is not None else None,
     sleep_arch_index=round(structure_score, 1) if structure_score is not None else None,

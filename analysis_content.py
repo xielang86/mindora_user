@@ -80,7 +80,7 @@ def _profile_language(profile: UserProfile) -> str:
 def explore_input_fingerprint(profile: UserProfile, language: str) -> str:
   """Invalidate same-day cached prose when source data or scoring rules change."""
   payload = {
-    "version": "explore-stage-balance-v2",
+    "version": "analysis-duration-ceiling-v3",
     "language": language,
     "timezone": str(_resolve_tz(profile.last_request_timezone)),
     "sleep_data": [r.model_dump(mode="json") for r in profile.sleep_data],

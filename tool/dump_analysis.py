@@ -27,13 +27,16 @@ import os
 import sys
 import time
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from tool.user_server_client import UserServerClient
-from user_profile import short_scene_id
+from user_profile import short_scene_id, SleepResult
+from sleep_session_builder import (resolve_sleep_quality, resolve_sleep_structure_score,
+                                   aggregate_sleep_quality, mean_sleep_duration)
 
 ANALYSIS_TYPES = [
   "analysis_overview",
@@ -46,8 +49,8 @@ ANALYSIS_TYPES = [
 
 # ── 与服务端 analysis_builders 同口径的源数据计算 ──────────────────
 
-def _date_of(ts: int) -> datetime.date:
-  return datetime.date.fromtimestamp(ts)
+def _date_of(ts: int, tz=None) -> datetime.date:
+  return datetime.datetime.fromtimestamp(ts, tz).date()
 
 
 def _is_valid_night(r: dict) -> bool:
@@ -90,13 +93,26 @@ def _effective_soe(record: dict) -> int | None:
   return int(round(score, 1))
 
 
-def _window_scores(sleep_data: list, start: str, end: str) -> list[float]:
+def _quality(record: dict) -> int | None:
+  value = resolve_sleep_quality(SleepResult.model_validate(record)) if record else None
+  return int(value) if value is not None else None
+
+
+def _structure(record: dict) -> int | None:
+  value = resolve_sleep_structure_score(SleepResult.model_validate(record)) if record else None
+  return int(value) if value is not None else None
+
+
+def _window_records(sleep_data: list, start: str, end: str, tz=None) -> list[SleepResult]:
   start_d = datetime.date.fromisoformat(start)
   end_d = datetime.date.fromisoformat(end)
-  return [
-    r["sleep_quality"] for r in sleep_data
-    if r.get("sleep_quality") is not None and start_d <= _date_of(r["timestamp"]) <= end_d
-  ]
+  return [SleepResult.model_validate(r) for r in sleep_data
+          if start_d <= _date_of(r["timestamp"], tz) <= end_d]
+
+
+def _window_scores(sleep_data: list, start: str, end: str, tz=None) -> list[float]:
+  return [resolve_sleep_quality(r) for r in _window_records(sleep_data, start, end, tz)
+          if r.sleep_quality is not None]
 
 
 def _top_scenes(mindora_record: dict, days: int, limit: int, end_ts: int | None = None) -> list[str]:
@@ -129,16 +145,19 @@ class Checker:
     verdict = f"✅ 与源数据一致" if ok else f"❌ 期望 {expected!r}（{note}）"
     self.add(screen, path, actual, verdict)
 
-  def check_text(self, screen: str, path: str, value):
-    """文案字段：来自 LLM 或空串降级，无法对账，只标注来源。"""
+  def check_text(self, screen: str, path: str, value, required: bool = False):
+    """检查实际文案字段；必填卡片不得用日期或标签掩盖空正文。"""
     if value in (None, ""):
-      self.add(screen, path, value, "➖ 空（无 LLM 报告，app 应显示空/--）")
+      self.add(screen, path, value, "❌ 缺少规则/库存文案" if required else "➖ 空（缺少数据或文案）")
     else:
       self.add(screen, path, value, "📝 文案（LLM 生成或骨架兜底，人工核对语言/语义）")
 
 
-def run_checks(profile: dict, responses: dict[str, dict], date: str, has_sleep_source: bool = True) -> Checker:
+def run_checks(profile: dict, responses: dict[str, dict], date: str, has_sleep_source: bool = True,
+               timezone: str | None = None, language: str | None = None) -> Checker:
   c = Checker()
+  tz = ZoneInfo(timezone or profile.get("last_request_timezone") or "UTC")
+  language = language or profile.get("last_request_language") or "zh-Hans"
   sleep_data = profile.get("sleep_data") or []
   # 与服务端 anchor 口径一致：最新有效夜（而非 sleep_data[-1]，尾包可能是无效夜）
   latest = _latest_valid_night(sleep_data)
@@ -146,7 +165,7 @@ def run_checks(profile: dict, responses: dict[str, dict], date: str, has_sleep_s
   today = datetime.date.fromisoformat(date)
   # 周/月窗口：dump 未传 start/end，服务端缺省锚定最近有效夜（build_sleep_week/month），
   # 对账窗口同口径以 anchor 为终点；零有效夜回退 --date
-  anchor = _date_of(latest_ts) if latest_ts else today
+  anchor = _date_of(latest_ts, tz) if latest_ts else today
   week_start = (anchor - datetime.timedelta(days=6)).isoformat()
   week_end = anchor.isoformat()
   month_start = (anchor - datetime.timedelta(days=29)).isoformat()
@@ -164,7 +183,7 @@ def run_checks(profile: dict, responses: dict[str, dict], date: str, has_sleep_s
   d = responses["analysis_overview"].get("data") or {}
   sc = (d.get("overall_score") or {}).get("score")
   if sc is not None:
-    check_sleep_eq("概览 overview", "overall_score.score", sc, latest.get("sleep_quality") and int(latest["sleep_quality"]), "最新有效夜 sleep_quality")
+    check_sleep_eq("概览 overview", "overall_score.score", sc, _quality(latest), "最新有效夜时长约束后的总分")
   else:
     c.add("概览 overview", "overall_score", "(缺省)", "➖ 窗口内无数据，app 应显示 --")
   wb = d.get("weekly_best") or {}
@@ -189,17 +208,29 @@ def run_checks(profile: dict, responses: dict[str, dict], date: str, has_sleep_s
   for rt, start, label in (("analysis_sleep_week", week_start, "周"), ("analysis_sleep_month", month_start, "月")):
     d = responses[rt].get("data") or {}
     sc = (d.get("score_summary") or {}).get("score")
-    scores = _window_scores(sleep_data, start, week_end)
+    records = _window_records(sleep_data, start, week_end, tz)
+    scores = [resolve_sleep_quality(r) for r in records if r.sleep_quality is not None]
+    expected_score = aggregate_sleep_quality(records)
     if sc is not None:
-      check_sleep_eq(f"睡眠{label}", "score_summary.score", sc, int(round(sum(scores) / len(scores))) if scores else None, f"{label}窗口平均（锚定）")
+      check_sleep_eq(f"睡眠{label}", "score_summary.score", sc, int(round(expected_score)) if expected_score is not None else None, f"{label}窗口平均（锚定）")
     c.check_text(f"睡眠{label}", "score_summary.label", (d.get("score_summary") or {}).get("label"))
+    duration = mean_sleep_duration(records)
+    if sc is not None and duration is not None and duration < 300 and has_sleep_source:
+      c.check_eq(f"睡眠{label}", "score_summary.score<60", sc < 60, True, "平均睡眠不足5小时")
+      expected_label = "睡眠不足" if language in {"zh-Hans", "zh-Hant"} else "Insufficient Sleep"
+      c.check_eq(f"睡眠{label}", "score_summary.label", (d.get("score_summary") or {}).get("label"), expected_label)
+
     tr = d.get("sleep_trends") or {}
     c.check_text(f"睡眠{label}", "sleep_trends.body", tr.get("body"))
-    c.check_text(f"睡眠{label}", "sleep_trends.description", tr.get("description"))
+    c.check_text(f"睡眠{label}", "sleep_trends.description", tr.get("description"), required=bool(records))
     if rt == "analysis_sleep_month":
       series = tr.get("score_series") or []
       expected_len = len(scores)
       check_sleep_eq(f"睡眠{label}", "sleep_trends.score_series.length", len(series), expected_len, "窗口内有分天数")
+      expected_series = [{"date": _date_of(r.timestamp, tz).isoformat(), "score": int(resolve_sleep_quality(r))}
+                         for r in records if r.sleep_quality is not None]
+      check_sleep_eq(f"睡眠{label}", "sleep_trends.score_series", series, expected_series, "时长约束后的逐夜分数")
+      c.check_text(f"睡眠{label}", "onset_efficiency.description", (d.get("onset_efficiency") or {}).get("description"))
       sl = (d.get("onset_efficiency") or {}).get("scenario_list")
       if sl:
         c.check_eq(f"睡眠{label}", "onset_efficiency.scenario_list", sl,
@@ -219,9 +250,9 @@ def run_checks(profile: dict, responses: dict[str, dict], date: str, has_sleep_s
         if has_sleep_source else "➖ 未拉取 sleep_data，无法核对")
   if d.get("data_ready"):
     ss = d.get("score_summary") or {}
-    check_sleep_eq("探索 explore", "score_summary.score", ss.get("score"), latest.get("sleep_quality") and int(latest["sleep_quality"]), "当夜（最新有效夜）sleep_quality")
+    check_sleep_eq("探索 explore", "score_summary.score", ss.get("score"), _quality(latest), "最新有效夜时长约束后的总分")
     check_sleep_eq("探索 explore", "score_summary.efficiency_score", ss.get("efficiency_score"), _effective_soe(latest), "当夜有效 SOE")
-    check_sleep_eq("探索 explore", "score_summary.structure_score", ss.get("structure_score"), latest.get("sleep_arch_index") and int(latest["sleep_arch_index"]), "当夜 sleep_arch_index")
+    check_sleep_eq("探索 explore", "score_summary.structure_score", ss.get("structure_score"), _structure(latest), "当夜有效结构分（HealthKit三阶段均衡度）")
     check_sleep_eq("探索 explore", "score_summary.fluctuation_score", ss.get("fluctuation_score"), latest.get("night_var_index") and int(latest["night_var_index"]), "当夜 night_var_index")
     nf = d.get("night_fluctuation") or {}
     hr_min, hr_max = latest.get("hr_min"), latest.get("hr_max")
@@ -231,29 +262,17 @@ def run_checks(profile: dict, responses: dict[str, dict], date: str, has_sleep_s
     sp = d.get("scene_preference") or {}
     if sp.get("scene_name") is not None or week_top is not None:
       check_sleep_eq("探索 explore", "scene_preference.scene_name", sp.get("scene_name"), week_top, "锚定 7 天使用最多场景")
-    # M27 洞察数据：三个展示指数（规则现算，不经过 LLM）
-    io_ = d.get("insight_overview") or {}
-    if io_:
-        idx_ok = all(io_.get(k) is None or 0 <= io_.get(k) <= 100
-                     for k in ("onset_index", "structure_index", "stability_index"))
-        c.add("探索 explore", "insight_overview",
-              {k: io_.get(k) for k in ("onset_index", "structure_index", "stability_index", "data_state")},
-              "✅ 指数在 0-100（规则现算）" if idx_ok else "❌ 指数越界")
-    else:
-        c.add("探索 explore", "insight_overview", "(缺省)",
-              "➖ 数据不足无指数" if not has_sleep_source else "❌ 有睡眠数据应返回 insight_overview")
-    for mod in ("header_summary", "onset_efficiency", "sleep_structure", "night_fluctuation", "scene_preference", "sleep_advice"):
-      c.check_text("探索 explore", f"{mod}.description/intro", json.dumps({k: v for k, v in (d.get(mod) or {}).items() if isinstance(v, str) and v}, ensure_ascii=False) or "(空)")
-    insight = d.get("insight")
-    if insight:
-      for key in ("greeting", "onset", "architecture", "intervention", "scene_preference", "micro_education"):
-        m = insight.get(key)
-        if m is None:
-          c.add("探索 explore", f"insight.{key}", "(隐藏)", "➖ visible=False，app 不应展示该模块")
-        else:
-          c.check_text("探索 explore", f"insight.{key}.title", m.get("title"))
-    else:
-      c.add("探索 explore", "insight", None, "➖ 无洞察报告（LLM 未生成或已过期）")
+    for field in ("intro_text", "intro_detail_text"):
+      c.check_text("探索 explore", f"header_summary.{field}",
+                   (d.get("header_summary") or {}).get(field), required=True)
+    for mod in ("onset_efficiency", "sleep_structure", "night_fluctuation", "sleep_advice"):
+      c.check_text("探索 explore", f"{mod}.description", (d.get(mod) or {}).get("description"), required=True)
+    if d.get("scene_preference"):
+      c.check_text("探索 explore", "scene_preference.description", d["scene_preference"].get("description"))
+    check_sleep_eq("探索 explore", "sleep_structure.score", (d.get("sleep_structure") or {}).get("score"),
+                   _structure(latest), "与顶部结构分同口径")
+  for legacy in ("insight", "insight_overview"):
+    c.check_eq("探索 explore", f"schema.{legacy}_absent", legacy not in d, True, "接口已改为外层卡片结构")
 
   return c
 
@@ -348,7 +367,8 @@ def main():
     if code != 0:
       print(f"    ⚠️ {json.dumps(resp, ensure_ascii=False)[:200]}")
 
-  checker = run_checks(profile, responses, args.date, has_sleep_source=args.sleep_data_count > 0)
+  checker = run_checks(profile, responses, args.date, has_sleep_source=args.sleep_data_count > 0,
+                       timezone=args.timezone, language=args.language)
   report = render_report(checker, uid, args.date,
                          {p.name: str(p) for p in sorted(out_dir.glob('*.json'))})
   (out_dir / "CHECK_REPORT.md").write_text(report)
