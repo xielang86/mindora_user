@@ -4,8 +4,8 @@
 只依赖请求数据 d 与画像 profile。字段口径对齐《服务端分析接口.md》：
   - 数值永远来自真实睡眠数据；算不出真实值的模块/字段直接省略，
     由客户端按 md 的「空值与降级约定」显示 --/空态（不编造假值）
-  - 文案（title/description/label）默认空串，LLM 库存报告由
-    handle_analysis_http 用 deep_merge 覆盖；md 允许文案降级
+  - Explore 文案由当前规则生成，并按数据指纹复用匹配的库存文案；
+    其他视图的库存文案由 handle_analysis_http 合并。
 """
 import datetime
 import time
@@ -186,8 +186,7 @@ def _localize(text: Optional[str], language: str) -> Optional[str]:
 
 # 响应级 meta 字段：不属于可请求模块，modules 过滤时始终保留。
 # data_ready：探索页空态开关（md 的 modules 列表不含它，按列表过滤会把它误删）；
-# insight：6 模块洞察报告，/analysis 是其唯一客户端出口，同样不在 md 模块列表里
-RESPONSE_META_KEYS = {"data_ready", "insight"}
+RESPONSE_META_KEYS = {"data_ready"}
 
 
 def filter_modules(data: dict, modules: list) -> dict:
@@ -318,6 +317,18 @@ def build_sleep_day(d, profile: Optional[UserProfile]) -> dict:
   return filter_modules(result, d.modules)
 
 
+def _fill_period_text(result: dict, d, profile: Optional[UserProfile], start, end, tz, days: int) -> None:
+  if profile is None or start is None or end is None:
+    return
+  text_profile = profile.model_copy(update={"last_request_timezone": str(tz)})
+  modules = AnalysisContentService.period_text_modules(
+    text_profile, d.language, str(tz), start, end, days, result.get("onset_efficiency"),
+  )
+  for key, fields in modules.items():
+    if key in result:
+      result[key].update(fields)
+
+
 def build_sleep_week(d, profile: Optional[UserProfile]) -> dict:
   tz = _req_tzinfo(d, profile)
   anchor = _anchor_date(profile, tz)
@@ -352,6 +363,7 @@ def build_sleep_week(d, profile: Optional[UserProfile]) -> dict:
     if avg_onset is not None:
       onset["avg_onset_minutes"] = avg_onset
     result["onset_efficiency"] = onset
+  _fill_period_text(result, d, profile, start, end, tz, 7)
   return filter_modules(result, d.modules)
 
 
@@ -401,6 +413,7 @@ def build_sleep_month(d, profile: Optional[UserProfile]) -> dict:
     if avg_onset is not None:
       onset["avg_onset_minutes"] = avg_onset
     result["onset_efficiency"] = onset
+  _fill_period_text(result, d, profile, start, end, tz, 30)
   return filter_modules(result, d.modules)
 
 
@@ -440,51 +453,37 @@ def build_explore(d, profile: Optional[UserProfile]) -> dict:
   latest   = _fresh_latest(profile, tz)
   summaries = latest.sequence_summaries if (latest and latest.sleep_status) else {}
 
-  # 无有效夜：只回 data_ready=False + insight（md：客户端进入空态展示）
+  # 无有效夜：不返回分数卡，只保留引导与建议。
   if latest is None:
-    result = {
-      "data_ready": False,
-      "insight": AnalysisContentService._visible_insight_dict(profile),
-    }
+    result = {"data_ready": False}
+    if profile is not None:
+      from analysis_fallback import build_fallback_report
+      fallback = build_fallback_report("analysis_explore", profile, d.language, date=date)
+      for key in ("header_summary", "sleep_advice"):
+        result[key] = {**fallback.modules[key], "date": date}
     return filter_modules(result, d.modules)
 
+  date = datetime.datetime.fromtimestamp(latest.timestamp, tz).date().isoformat()
+  start = (datetime.date.fromisoformat(date) - datetime.timedelta(days=6)).isoformat()
   result: dict = {"data_ready": True}
 
   # 顶部摘要：纯文案（LLM 报告覆盖）
   result["header_summary"] = {"intro_text": "", "intro_detail_text": "", "date": date}
 
   # 顶部总分环：总分=当夜得分；三段分值 = soe / sleep_arch_index / night_var_index（缺哪个省哪个）
-  from sleep_session_builder import resolve_sleep_onset_efficiency
+  from sleep_session_builder import resolve_sleep_onset_efficiency, resolve_sleep_structure_score
   soe = resolve_sleep_onset_efficiency(latest)
+  structure_score = resolve_sleep_structure_score(latest)
   score_summary: dict = {"title": _localize("Sleep Score", d.language), "date": date}
   if latest.sleep_quality is not None:
     score_summary["score"] = int(latest.sleep_quality)
   if soe is not None:
     score_summary["efficiency_score"] = int(soe)
-  if latest.sleep_arch_index is not None:
-    score_summary["structure_score"] = int(latest.sleep_arch_index)
+  if structure_score is not None:
+    score_summary["structure_score"] = int(structure_score)
   if latest.night_var_index is not None:
     score_summary["fluctuation_score"] = int(latest.night_var_index)
   result["score_summary"] = score_summary
-
-  # 洞察数据卡（规范 M27/AN_OVERVIEW）：评分引用 + 三个展示指数（规则现算，
-  # 不经过 LLM；指数只用于产品分层展示，不代表医学等级）
-  import insight_rules as ir  # 延迟 import（insight_rules 不反向依赖本模块）
-  tz = ir.resolve_tz(getattr(d, "timezone", None) or getattr(profile, "last_request_timezone", None))
-  _base = ir.compute_baselines(profile, tz)
-  _indices = ir.compute_insight_indices(profile, _base)
-  if any(_indices[k] is not None for k in ("onset_index", "structure_index", "stability_index")):
-    result["insight_overview"] = {
-      "date": date,
-      "data_state": _indices["state"],
-      "valid_nights": _indices["valid_nights"],
-      "onset_index": _indices["onset_index"],
-      "onset_label": ir.index_label(_indices["onset_index"], d.language),
-      "structure_index": _indices["structure_index"],
-      "structure_label": ir.index_label(_indices["structure_index"], d.language),
-      "stability_index": _indices["stability_index"],
-      "stability_label": ir.index_label(_indices["stability_index"], d.language),
-    }
 
   # Sleep Onset Efficiency 卡
   onset: dict = {"label": "", "description": "", "date": date}
@@ -502,8 +501,8 @@ def build_explore(d, profile: Optional[UserProfile]) -> dict:
 
   # Sleep Structure 卡
   structure: dict = {"label": "", "description": "", "date": date}
-  if latest.sleep_arch_index is not None:
-    structure["score"] = int(latest.sleep_arch_index)
+  if structure_score is not None:
+    structure["score"] = int(structure_score)
   continuous = _longest_continuous_sleep_minutes(latest.sleep_status)
   if continuous is not None:
     structure["continuous_sleep_minutes"] = continuous
@@ -553,7 +552,11 @@ def build_explore(d, profile: Optional[UserProfile]) -> dict:
   # Sleep Advice 卡：纯文案（LLM 报告覆盖）
   result["sleep_advice"] = {"description": "", "date": date}
 
-  # 洞察页 6 模块报告（mindora_advice.md 模块0-5，update_profile 时异步生成，
-  # 已过滤 visible=False 模块；无报告则为 None）。/analysis 是其唯一客户端出口。
-  result["insight"] = AnalysisContentService._visible_insight_dict(profile)
+  # 文案按当前请求语言/时区、当前有效夜映射到文档规定的卡片。
+  text_profile = profile.model_copy(update={
+    "last_request_timezone": str(tz), "last_request_language": d.language,
+  })
+  for module, fields in AnalysisContentService.explore_text_modules(text_profile, d.language).items():
+    if module in result:
+      result[module].update(fields)
   return filter_modules(result, d.modules)

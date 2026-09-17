@@ -358,6 +358,7 @@ class SleepInsightReport(BaseModel):
   language: str = Field("en", description="文案语言代码")
   generated_at: Optional[int] = Field(None, description="生成时间戳（秒级）")
   llm_used: bool = Field(True, description="False 代表 LLM 未参与/生成失败")
+  input_fingerprint: Optional[str] = Field(None, description="生成文案时的输入数据与规则版本指纹；旧报告缺省为空")
   greeting: InsightModule = Field(
     default_factory=lambda: InsightModule(module_id=0),
     description="模块0｜顶部问候与洞察引导（Context & Trust）",
@@ -397,6 +398,7 @@ class AnalysisTextReport(BaseModel):
   language: str = Field("en", description="文案语言代码")
   generated_at: int = Field(..., description="生成时间戳（秒级）")
   llm_used: bool = Field(True, description="False 代表 LLM 未参与/生成失败")
+  input_fingerprint: Optional[str] = Field(None, description="生成文案时的输入数据与规则版本指纹；旧报告缺省为空")
   modules: Dict[str, Any] = Field(default_factory=dict, description="接口文档响应结构的模块字典")
 
 # 各类报告的保留条数：日级 30（与 sleep_data 同序列长度）、周 10、月 12

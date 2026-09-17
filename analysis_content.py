@@ -8,6 +8,8 @@
 通过 get_llm 回调取 LLM 实例（而不是构造时固化），兼容测试在构造后替换 llm 的用法。
 """
 import datetime
+import hashlib
+import json
 import logging
 import time
 from typing import Any, Optional
@@ -75,6 +77,19 @@ def _profile_language(profile: UserProfile) -> str:
   return "en"
 
 
+def explore_input_fingerprint(profile: UserProfile, language: str) -> str:
+  """Invalidate same-day cached prose when source data or scoring rules change."""
+  payload = {
+    "version": "explore-stage-balance-v2",
+    "language": language,
+    "timezone": str(_resolve_tz(profile.last_request_timezone)),
+    "sleep_data": [r.model_dump(mode="json") for r in profile.sleep_data],
+    "mindora_record": profile.mindora_record,
+    "sleep_plan": profile.sleep_plan.model_dump(mode="json") if profile.sleep_plan else None,
+  }
+  return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
+
 class AnalysisContentService:
   def __init__(self, get_llm):
     """get_llm: 无参回调，返回 SleepAnalysisLLM 实例（可为 None）。"""
@@ -123,7 +138,8 @@ class AnalysisContentService:
         _today_in_tz(profile.last_request_timezone).isoformat(), now,
       )
     if existing and existing.generated_at and existing.llm_used \
-        and existing.language == lang and existing.date == today_str:
+        and existing.language == lang and existing.date == today_str \
+        and existing.input_fingerprint == explore_input_fingerprint(profile, lang):
       newest_sleep_ts = max(
         (int(r.timestamp or 0) for r in (profile.sleep_data or [])), default=0,
       )
@@ -144,6 +160,7 @@ class AnalysisContentService:
     by_key[edu.key] = edu
 
     report_data: dict[str, Any] = {
+      "input_fingerprint": explore_input_fingerprint(profile, lang),
       "date": today_str, "language": lang, "generated_at": now, "llm_used": False,
     }
     for key, module_id in self._INSIGHT_MODULE_KEYS:
@@ -197,6 +214,108 @@ class AnalysisContentService:
     if not stats.get("avg_awake_count"):
       report.intervention.visible = False
     return report
+
+  @staticmethod
+  def explore_text_modules(profile: UserProfile, language: str) -> dict:
+    """Current-night rule text, optionally polished by matching stored reports.
+
+    Only documented text fields may be overlaid; scores/dates always come from
+    the current data. This read path never calls the LLM or changes the profile.
+    """
+    import insight_rules as ir
+    profile = profile.model_copy(deep=True)
+    state, base, conclusions = ir.build_night_conclusions(profile, language)
+    by_key = {c.key: c for c in conclusions}
+    edu = ir.micro_education(profile, language)
+    advice = ir.rule_advice(profile, base, state, conclusions, language)
+    modules = {
+      "header_summary": {"intro_text": by_key["greeting"].text, "intro_detail_text": edu.text},
+      "onset_efficiency": {"label": by_key["onset"].title, "description": by_key["onset"].text},
+      "sleep_structure": {"label": by_key["architecture"].title, "description": by_key["architecture"].text},
+      "night_fluctuation": {"label": by_key["intervention"].title, "description": by_key["intervention"].text},
+      "scene_preference": {"description": by_key["scene_preference"].text},
+      "sleep_advice": {"description": advice.text or edu.text},
+    }
+    date = base.today.isoformat()
+    fingerprint = explore_input_fingerprint(profile, language)
+    insight = profile.sleep_insight
+    if insight and insight.date == date and insight.language == language \
+        and insight.input_fingerprint == fingerprint:
+      for key, target, title_field, text_field in (
+        ("greeting", "header_summary", None, "intro_text"),
+        ("onset", "onset_efficiency", "label", "description"),
+        ("architecture", "sleep_structure", "label", "description"),
+        ("intervention", "night_fluctuation", "label", "description"),
+        ("scene_preference", "scene_preference", None, "description"),
+        ("micro_education", "header_summary", None, "intro_detail_text"),
+      ):
+        item = getattr(insight, key, None)
+        if item is None or not item.visible:
+          continue
+        if item.content:
+          modules[target][text_field] = item.content
+        if title_field and item.title:
+          modules[target][title_field] = item.title
+    # Newest matching Explore report takes precedence over the legacy insight.
+    for report in reversed(profile.analysis_reports.get("analysis_explore", []) or []):
+      if report.date != date or report.start_date is not None or report.language != language \
+          or report.input_fingerprint != fingerprint:
+        continue
+      for key, fields in modules.items():
+        values = report.modules.get(key)
+        if not isinstance(values, dict):
+          continue
+        for field in fields:
+          value = values.get(field)
+          if isinstance(value, str) and value.strip():
+            fields[field] = value
+      break
+    return modules
+
+  @staticmethod
+  def period_text_modules(profile: UserProfile, language: str, timezone: str,
+                          start: str, end: str, days: int, onset: Optional[dict] = None) -> dict:
+    """Use the numeric response's effective window for both rules and stored text."""
+    import insight_rules as ir
+    base = ir.compute_baselines(profile, _resolve_tz(timezone))
+    trend = ir.rule_trend(profile, base, language, days, start_date=start, end_date=end)
+    modules = {"sleep_trends": {"body": trend.title if trend.text else "", "description": trend.text}}
+    if days == 30 and onset:
+      names = onset.get("scenario_list") or []
+      minutes = onset.get("avg_onset_minutes")
+      parts = []
+      lang = _fallback_lang(language)
+      if names:
+        scenes = ", ".join(names)
+        parts.append({
+          "zh-Hans": f"本周期使用最多的场景为：{scenes}。",
+          "zh-Hant": f"本週期使用最多的場景為：{scenes}。",
+          "en": f"The most-used scenes in this period were: {scenes}.",
+        }[lang])
+      if minutes is not None:
+        parts.append({
+          "zh-Hans": f"有入睡用时记录的夜晚平均入睡用时为 {minutes} 分钟。",
+          "zh-Hant": f"有入睡用時記錄的夜晚平均入睡用時為 {minutes} 分鐘。",
+          "en": f"Average sleep onset was {minutes} minutes on nights with onset data.",
+        }[lang])
+      modules["onset_efficiency"] = {"description": " ".join(parts)}
+    request_type = "analysis_sleep_week" if days == 7 else "analysis_sleep_month"
+    fingerprint = explore_input_fingerprint(profile, language)
+    for report in reversed(profile.analysis_reports.get(request_type, []) or []):
+      if report.start_date != start or report.end_date != end or report.language != language:
+        continue
+      if report.input_fingerprint and report.input_fingerprint != fingerprint:
+        continue
+      for key, fields in modules.items():
+        values = report.modules.get(key)
+        if not isinstance(values, dict):
+          continue
+        for field in fields:
+          value = values.get(field)
+          if isinstance(value, str) and value.strip():
+            fields[field] = value
+      break
+    return modules
 
   @staticmethod
   def _analysis_specs(tz_name: Optional[str] = None, profile: Optional[UserProfile] = None) -> list:
@@ -338,7 +457,9 @@ class AnalysisContentService:
       # 当前周期已有同语言真实报告 → 复用，不重复调 LLM；语言漂移视为过期，重生成。
       # 规则模板报告（llm_used=False）不算——下次周期自然重算并尝试 LLM 润色
       current = _current_report(request_type, start_date, end_date, date)
-      if current is not None and current.llm_used and current.language == language:
+      if current is not None and current.llm_used and current.language == language \
+          and (request_type not in {"analysis_explore", "analysis_sleep_week", "analysis_sleep_month"} or
+               current.input_fingerprint == explore_input_fingerprint(profile, language)):
         continue
 
       rule_conclusions, rule_modules = _rule_group(request_type)
@@ -375,6 +496,7 @@ class AnalysisContentService:
       report = AnalysisTextReport(
         request_type=request_type, date=date, start_date=start_date, end_date=end_date,
         language=language, generated_at=now, llm_used=False, modules=rule_modules,
+        input_fingerprint=explore_input_fingerprint(profile, language) if request_type in {"analysis_explore", "analysis_sleep_week", "analysis_sleep_month"} else None,
       )
 
       # ── LLM 润色（可选）：只重写文本字段，校验失败保留模板 ──

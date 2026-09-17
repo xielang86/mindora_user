@@ -373,8 +373,8 @@ _EDU_FACTS = [
     {"zh-Hans": "睡前一小时调暗灯光、远离屏幕，有助于身体自然进入睡眠状态。卧室稍凉（约 18-20°C）通常更利于深睡。",
      "zh-Hant": "睡前一小時調暗燈光、遠離屏幕，有助於身體自然進入睡眠狀態。臥室稍涼（約 18-20°C）通常更利於深睡。",
      "en": "Dimming lights and avoiding screens an hour before bed helps your body wind down naturally. A slightly cool bedroom (around 18-20°C) usually supports deeper sleep."},
-    {"zh-Hans": "固定的入睡和起床时间能稳定生物钟，让入睡 progressively 更顺畅。",
-     "zh-Hant": "固定的入睡和起床時間能穩定生物鐘，讓入睡 progressively 更順暢。",
+    {"zh-Hans": "固定的入睡和起床时间能稳定生物钟，让入睡逐渐更顺畅。",
+     "zh-Hant": "固定的入睡和起床時間能穩定生物鐘，讓入睡逐漸更順暢。",
      "en": "Consistent bed and wake times stabilize your body clock and make falling asleep progressively smoother."},
     {"zh-Hans": "夜里短暂醒来几次很常见，关键是能否很快重新入睡。醒来后看时间或手机反而容易让大脑清醒。",
      "zh-Hant": "夜裡短暫醒來幾次很常見，關鍵是能否很快重新入睡。醒來後看時間或手機反而容易讓大腦清醒。",
@@ -1192,20 +1192,34 @@ def _fmt_minutes(mins: Optional[float]) -> str:
     return f"{h}h{m:02d}m" if h else f"{m}m"
 
 
-def rule_trend(profile: UserProfile, base: Baseline, lang: str, days: int) -> RuleConclusion:
+def rule_trend(profile: UserProfile, base: Baseline, lang: str, days: int, *,
+               start_date: Optional[str] = None, end_date: Optional[str] = None) -> RuleConclusion:
     """当前窗口 vs 前一窗口（同口径）对比 + MAD 稳定性 + 最小变化阈值过滤。
     30 天前一窗口不可得（sleep_data 只保留 30 晚）时按规范降级为分布+稳定性描述。"""
     tz = base.tz
     canonical = _canonical_lang(lang)
     cur = base.nights_7d if days == 7 else base.nights_30d
     prev = base.nights_prev_7d if days == 7 else base.nights_prev_30d
+    window_days = days
+    if start_date and end_date:
+        start = datetime.date.fromisoformat(start_date)
+        end = datetime.date.fromisoformat(end_date)
+        window_days = (end - start).days + 1
+        cur = records_in_window(profile, end_date=end, days=window_days, tz=tz)
+        prev = records_in_window(profile, end_date=start - datetime.timedelta(days=1),
+                                 days=window_days, tz=tz)
     min_valid = R["trend"]["min_valid_7d" if days == 7 else "min_valid_30d"]
     max_items = R["trend"]["max_items_7d" if days == 7 else "max_items_30d"]
     title_key = "title_trend7" if days == 7 else "title_trend30"
 
-    if len(cur) < min_valid:
+    if len(cur) < min_valid or not any(r.sleep_status or r.onset is not None for r in cur):
+        insufficient = {
+            "zh-Hans": f"本周期有 {len(cur)} 条有效睡眠记录，暂不足以判断趋势，继续记录后可进行比较。",
+            "zh-Hant": f"本週期有 {len(cur)} 條有效睡眠記錄，暫不足以判斷趨勢，繼續記錄後可進行比較。",
+            "en": f"This period contains {len(cur)} valid sleep records. More data is needed to assess trends.",
+        }
         return RuleConclusion(key=f"trend{days}", theme=f"trend{days}", title=_t(title_key, lang),
-                              text=_t("trend_stable", lang).format(days=days) if cur else "",
+                              text=insufficient.get(canonical, insufficient["en"]) if cur else "",
                               visible=False, state="insufficient_data", facts_only=True,
                               valid_nights=len(cur))
 
@@ -1284,7 +1298,7 @@ def rule_trend(profile: UserProfile, base: Baseline, lang: str, days: int) -> Ru
 
     items.sort(key=lambda x: -x[0])
     if not items:
-        text = _t("trend_stable", lang).format(days=days)
+        text = _t("trend_stable", lang).format(days=window_days)
         tpl = "trend_stable"
     else:
         text = " ".join(s for _, s in items[:max_items])

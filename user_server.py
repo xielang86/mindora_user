@@ -701,7 +701,8 @@ class UserServer:
         )
         report = None
         await self._schedule_llm_update_if_needed(uid, delay=0)
-      if report:
+      if report and req.request_type not in {"analysis_explore", "analysis_sleep_week", "analysis_sleep_month"}:
+        # Explore/周/月已在 builder 按实际窗口合并白名单文案，避免旧窗口文案或数值覆盖。
         # 只合并客户端请求的模块，保持 modules 分字段查询语义不被库存报告击穿
         updates = report.modules
         if req.data.modules:

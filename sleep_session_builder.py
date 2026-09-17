@@ -16,7 +16,7 @@ SleepResult 行（source="healthkit" 标记）。
     终点 = 首次累计睡够 5 分钟（≤1 分钟碎醒不打断）；第一段即睡着 → 不可测（None）；
     上限 180 分钟
   - 得分为派生启发式（本文件底部注明公式）：sleep_quality 由时长/效率/结构加权，
-    soe 由 onset 推出，sleep_arch_index 由 deep+rem 占比，night_var_index 由觉醒情况
+    soe 由 onset 推出，sleep_arch_index 由 deep/rem/core 三阶段均衡度，night_var_index 由觉醒情况
   - hr_min/hr_max 不在这里填：profile_service._update_night_hr_range 按会话起点
     配对 v2 的 sleep_heart_rate_min/max 写入
   - 设备（Mindora）上报的 SleepResult 优先：会话窗口内已有非合成行则跳过该晚；
@@ -211,6 +211,40 @@ def resolve_sleep_onset_efficiency(record: SleepResult) -> Optional[float]:
   return _score_sleep_onset_efficiency((first.start_time - inferred_light_start) / 60.0)
 
 
+# Product heuristic, not clinical thresholds. Keep the former 45% deep+REM
+# reference, but account for all three stages and penalize excess as well as deficit.
+_STRUCTURE_REFERENCE = {"deep": 0.20, "rem": 0.25, "core": 0.55}
+
+
+def score_sleep_structure(deep: float, rem: float, core: float) -> Optional[float]:
+  """Stage balance score from durations in any shared unit; awake is excluded.
+
+  100 * (1 - total variation distance to the reference distribution).
+  No staged sleep returns None. Missing core can score at most 45, and an
+  all-core night scores 55; neither missing stages nor excessive deep/REM
+  can receive a perfect score. Reference proportions are product parameters.
+  """
+  durations = {"deep": max(0.0, deep), "rem": max(0.0, rem), "core": max(0.0, core)}
+  total = sum(durations.values())
+  if total <= 0:
+    return None
+  distance = sum(abs(durations[k] / total - ref) for k, ref in _STRUCTURE_REFERENCE.items()) / 2
+  return round(max(0.0, min(100.0, 100 * (1 - distance))), 1)
+
+
+def resolve_sleep_structure_score(record: SleepResult) -> Optional[float]:
+  """Recompute legacy HealthKit stage scores without rewriting stored rows.
+
+  Device-provided scores remain authoritative. Without stage samples there is
+  no basis for recalculation, so preserve the stored value.
+  """
+  if record.source != SOURCE_HEALTHKIT or not record.sleep_status:
+    return record.sleep_arch_index
+  summ = record.sequence_summaries
+  return score_sleep_structure(summ["deep_sleep_duration"], summ["rem_sleep_duration"],
+                               summ["core_sleep_duration"])
+
+
 def build_sleep_result(session: SleepSession, behaviors: dict, tz: datetime.tzinfo) -> SleepResult:
   """一个会话 → 一条 SleepResult（source=healthkit）。"""
   start, end = session.start, session.end
@@ -228,9 +262,10 @@ def build_sleep_result(session: SleepSession, behaviors: dict, tz: datetime.tzin
   onset_min, lights_out = _compute_onset(session)
 
   # ── 派生得分（启发式，无设备算法时让各 score 卡有真实数据支撑）────────────
-  # duration：总睡眠对标 8h；structure：deep+rem 占比对标 45%；efficiency：总睡眠/卧床
+  # duration：总睡眠对标 8h；structure：三阶段均衡度；efficiency：总睡眠/卧床
   duration_score = min(asleep_sec / (8 * 3600), 1.0) * 100
-  structure_score = min((deep_sec + rem_sec) / asleep_sec / 0.45, 1.0) * 100 if asleep_sec else None
+  core_sec = sum(e - s for s, e, t in session.intervals if t == "core")
+  structure_score = score_sleep_structure(deep_sec, rem_sec, core_sec)
   efficiency = asleep_sec / in_bed_sec if in_bed_sec else None
   if efficiency is not None:
     quality = 0.5 * duration_score + 0.25 * efficiency * 100 + 0.25 * (structure_score or 0)
