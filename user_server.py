@@ -93,6 +93,10 @@ def save_popup_image(data: bytes) -> tuple[Optional[str], Optional[str]]:
   return f"{Config.PUBLIC_API_BASE}/popup_images/{name}", None
 
 
+class MembershipLookupError(RuntimeError):
+  """无法确认会员权益；不得当作免费用户继续同步。"""
+
+
 class UserServer:
   @staticmethod
   def _request_for_log(req_or_data) -> Any:
@@ -864,11 +868,7 @@ class UserServer:
 
   # -------------------- /sleep_plan（睡眠计划同步接口.md） --------------------
   async def _get_effective_level(self, uid: str, jwt_token: Optional[str]) -> str:
-    """查询用户当前生效等级（auth_server query_user_rights），60s 内存缓存。
-
-    查询失败按 free 降级且不缓存（下次重试）：只影响「新增计划」的额度判定，
-    已有计划的更新/删除不受影响；客户端有乐观更新 + 重传队列，可自愈。
-    """
+    """查询当前生效等级，只缓存成功结果；失败中止同步，供客户端重试。"""
     now = time.time()
     cached = self._tier_cache.get(uid)
     if cached and now - cached[1] < Config.SLEEP_PLAN_TIER_CACHE_SECONDS:
@@ -889,11 +889,20 @@ class UserServer:
             json=req.model_dump(mode="json"),
             timeout=3,
           ) as resp:
+            if resp.status != 200:
+              raise MembershipLookupError(f"auth HTTP status={resp.status}")
             body = await resp.json()
-        level = ((body or {}).get("data") or {}).get("effective_user_level") or "free"
+        if not isinstance(body, dict) or body.get("code") != 0:
+          raise MembershipLookupError("auth returned unsuccessful business response")
+        data = body.get("data")
+        level = data.get("effective_user_level") if isinstance(data, dict) else None
+        if not isinstance(level, str) or level not in sleep_plan_service.PLAN_QUOTA_BY_LEVEL:
+          raise MembershipLookupError("auth returned missing or invalid effective_user_level")
       except Exception as e:
-        logging.error("query_user_rights failed for uid=%s: %s", uid, e)
-        return "free"
+        # 不记录响应体或请求 token；错误不能缓存成 free，否则会误拒绝会员计划。
+        detail = str(e) if isinstance(e, MembershipLookupError) else type(e).__name__
+        logging.error("query_user_rights failed for uid=%s: %s", uid, detail)
+        raise MembershipLookupError("Membership verification unavailable") from e
     elif Config.IS_DEBUG and uid in self.debug_uid_set:
       level = "premium"  # 测试 uid 放行全额度
 
@@ -952,6 +961,12 @@ class UserServer:
       resp = BaseResponse(code=0, msg="ok")
       return web.json_response({**resp.model_dump(), "data": data})
 
+    except MembershipLookupError:
+      # 不返回 plans=[]/tier_not_allowed：客户端应保留本地计划和待同步队列。
+      return web.json_response(
+        BaseResponse(code=503, msg="Membership verification unavailable; retry later").model_dump(),
+        status=503,
+      )
     except ValidationError as e:
       logging.error(f"sleep_plan validation error: {e}")
       return web.json_response(InvalidReqFormatResp().model_dump(), status=400)

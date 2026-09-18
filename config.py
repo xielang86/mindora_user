@@ -68,7 +68,7 @@ class Config:
   APPLE_ASSN_ONLINE_CHECKS = os.getenv("APPLE_ASSN_ONLINE_CHECKS", "false").lower() == "true"
 
   # ── 睡眠计划同步（睡眠计划同步接口.md）────────────────────────────────────
-  # 会员等级查询结果（auth_server query_user_rights）的内存缓存时长；查询失败不缓存、按 free 降级
+  # 会员等级查询结果（auth_server query_user_rights）的内存缓存时长；查询失败不缓存，睡眠计划接口返回 503 供客户端重试
   SLEEP_PLAN_TIER_CACHE_SECONDS = int(os.getenv("SLEEP_PLAN_TIER_CACHE_SECONDS", "60"))
 
   # 健康数据口径版本（健康数据同步接口_0814.md §8）：服务端当前认知的最新版本。
