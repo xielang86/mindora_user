@@ -340,6 +340,7 @@ def build_sleep_result(session: SleepSession, behaviors: dict, tz: datetime.tzin
 
   return SleepResult(
     timestamp=end,  # 醒来时刻；_analysis_needed 以它归日
+    in_bed_intervals=list(session.in_bed),
     sleep_quality=round(cap_sleep_quality(quality, asleep_sec / 60.0), 1),
     soe=soe,
     onset=round(onset_min, 1) if onset_min is not None else None,

@@ -704,7 +704,7 @@ class UserServer:
       if report and req.request_type not in {"analysis_explore", "analysis_sleep_week", "analysis_sleep_month"}:
         # Explore/周/月已在 builder 按实际窗口合并白名单文案，避免旧窗口文案或数值覆盖。
         # 只合并客户端请求的模块，保持 modules 分字段查询语义不被库存报告击穿
-        updates = report.modules
+        updates = analysis_builders.report_text_updates(req.request_type, report.modules)
         if req.data.modules:
           updates = {k: v for k, v in updates.items() if k in req.data.modules}
         deep_merge(response_data, updates)

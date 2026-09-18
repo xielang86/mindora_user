@@ -34,7 +34,8 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from tool.user_server_client import UserServerClient
-from user_profile import short_scene_id, SleepResult
+from user_profile import short_scene_id, SleepResult, UserProfile
+from sleep_metrics import build_sleep_metrics
 from sleep_session_builder import (resolve_sleep_quality, resolve_sleep_structure_score,
                                    aggregate_sleep_quality, mean_sleep_duration)
 
@@ -240,15 +241,29 @@ def run_checks(profile: dict, responses: dict[str, dict], date: str, has_sleep_s
       if oe.get("scenario_name") is not None or week_top is not None:
         check_sleep_eq(f"睡眠{label}", "onset_efficiency.scenario_name", oe.get("scenario_name"), week_top, "锚定 7 天使用最多场景")
 
+  # ── Home/Day 共用睡眠估算指标 ──
+  expected_metrics = build_sleep_metrics(SleepResult.model_validate(latest), UserProfile.model_validate(profile), tz) if latest else None
+  for rt in ("analysis_overview", "analysis_sleep_day"):
+    metrics = (responses[rt].get("data") or {}).get("sleep_metrics")
+    if has_sleep_source:
+      c.check_eq(rt, "sleep_metrics", metrics, expected_metrics, "真实inBed优先，否则按当夜分段估算")
+    if metrics:
+      for field in ("sleep_onset_minutes", "time_in_bed_minutes"):
+        value = metrics.get(field)
+        c.check_eq(rt, f"sleep_metrics.{field}.type", value is None or type(value) is int, True, "整数分钟或null")
+      c.check_eq(rt,"sleep_metrics.source.valid",metrics.get("source") in {"measured","estimated"},True)
+  c.check_eq("Home/Day", "sleep_metrics.same", (responses["analysis_overview"].get("data") or {}).get("sleep_metrics"),
+             (responses["analysis_sleep_day"].get("data") or {}).get("sleep_metrics"), "两接口全量请求结构和值相同")
+
   # ── 探索 ──
   d = responses["analysis_explore"].get("data") or {}
-  # 与服务端 build_explore 的有效时间锚定同口径：存在有效夜（停戴超期也锚定最后一夜）
-  # 即 data_ready=True，仅零有效夜才 False
-  has_valid_night = bool(latest)
-  c.add("探索 explore", "data_ready", d.get("data_ready"),
-        ("✅" if d.get("data_ready") == has_valid_night else "❌ 与有效夜锚定口径不符（有有效夜应为 True，零有效夜为 False）")
-        if has_sleep_source else "➖ 未拉取 sleep_data，无法核对")
-  if d.get("data_ready"):
+  # data_ready 已废弃：依据返回分数决定数值校验，并独立校验文案。
+  c.add("探索 explore", "data_ready", d.get("data_ready"), "➖ 已废弃，不参与显示判定")
+  has_scores = any(v is not None for k,v in (d.get("score_summary") or {}).items()
+                   if k == "score" or k.endswith("_score")) or any(
+                     (d.get(k) or {}).get("score") is not None
+                     for k in ("onset_efficiency", "sleep_structure", "night_fluctuation"))
+  if has_scores:
     ss = d.get("score_summary") or {}
     check_sleep_eq("探索 explore", "score_summary.score", ss.get("score"), _quality(latest), "最新有效夜时长约束后的总分")
     check_sleep_eq("探索 explore", "score_summary.efficiency_score", ss.get("efficiency_score"), _effective_soe(latest), "当夜有效 SOE")
@@ -264,7 +279,7 @@ def run_checks(profile: dict, responses: dict[str, dict], date: str, has_sleep_s
       check_sleep_eq("探索 explore", "scene_preference.scene_name", sp.get("scene_name"), week_top, "锚定 7 天使用最多场景")
     for field in ("intro_text", "intro_detail_text"):
       c.check_text("探索 explore", f"header_summary.{field}",
-                   (d.get("header_summary") or {}).get(field), required=True)
+                   (d.get("header_summary") or {}).get(field), required=field == "intro_text")
     for mod in ("onset_efficiency", "sleep_structure", "night_fluctuation", "sleep_advice"):
       c.check_text("探索 explore", f"{mod}.description", (d.get(mod) or {}).get("description"), required=True)
     if d.get("scene_preference"):

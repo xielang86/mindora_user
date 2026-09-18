@@ -12,6 +12,7 @@ import time
 from typing import Optional
 
 from sleep_session_builder import resolve_sleep_quality, aggregate_sleep_quality, mean_sleep_duration
+from sleep_metrics import build_sleep_metrics
 from analysis_content import AnalysisContentService
 from user_profile import UserProfile, compute_recent_sleep_stats, short_scene_id
 
@@ -202,6 +203,28 @@ def filter_modules(data: dict, modules: list) -> dict:
   return {k: v for k, v in data.items() if k in modules or k in RESPONSE_META_KEYS}
 
 
+def report_text_updates(request_type: str, modules: dict) -> dict:
+  """Only documented prose can be supplied by a stored Home/Day report."""
+  allowed = ({"sleep_insight": {"title", "description"}} if request_type == "analysis_overview"
+             else {"sleep_scenarios": {"title", "description"}})
+  out = {}
+  for key, fields in allowed.items():
+    value = modules.get(key)
+    if isinstance(value, dict):
+      selected = {k:v for k,v in value.items() if k in fields and isinstance(v,str) and v.strip()}
+      if selected:
+        out[key] = selected
+  if request_type == "analysis_sleep_day" and isinstance(modules.get("stage_insights"), dict):
+    stages = {}
+    for stage in ("awake", "rem", "core", "deep"):
+      value = modules["stage_insights"].get(stage)
+      if isinstance(value, dict) and isinstance(value.get("description"),str) and value["description"].strip():
+        stages[stage] = {"description": value["description"]}
+    if stages:
+      out["stage_insights"] = stages
+  return out
+
+
 def _anchor_ts(profile: Optional[UserProfile]) -> int:
   """场景使用窗口的终点：最近有效夜时间戳，零记录回退当前时刻（与 _anchor_date 同口径）。
 
@@ -271,6 +294,7 @@ def build_overview(d, profile: Optional[UserProfile]) -> dict:
 
   # 首页总分直接展示最新有效夜的 sleep_quality，不取 7 天平均。
   latest = _fresh_latest(profile, tz)
+  metrics = build_sleep_metrics(latest, profile, tz)
   if latest and latest.sleep_quality is not None:
     result["overall_score"] = {"score": int(resolve_sleep_quality(latest)), "date": date}
 
@@ -291,6 +315,8 @@ def build_overview(d, profile: Optional[UserProfile]) -> dict:
 
   # sleep_insight：纯文案模块，默认值空串（LLM 报告覆盖；md 降级约定显示空字符串）
   result["sleep_insight"] = {"title": "", "description": "", "date": date}
+  if metrics is not None:
+    result["sleep_metrics"] = metrics
   return filter_modules(result, d.modules)
 
 
@@ -300,7 +326,10 @@ def build_sleep_day(d, profile: Optional[UserProfile]) -> dict:
   # 有效时间锚定：展示最新有效夜；停戴超期不再降级，零记录才按无数据
   # 回空态（title/description 空串，客户端按 md 空态显示，文案走兜底）
   latest = _fresh_latest(profile, tz)
+  metrics = build_sleep_metrics(latest, profile, tz)
 
+  if latest is not None:
+    date = datetime.datetime.fromtimestamp(latest.timestamp, tz).date().isoformat()
   result: dict = {}
 
   # 顶部为入睡效率（SOE），不是 sleep_quality；缺失时由客户端显示 --。
@@ -321,6 +350,8 @@ def build_sleep_day(d, profile: Optional[UserProfile]) -> dict:
   result["stage_insights"] = {
     stage: {"description": "", "date": date} for stage in ("awake", "rem", "core", "deep")
   }
+  if metrics is not None:
+    result["sleep_metrics"] = metrics
   return filter_modules(result, d.modules)
 
 

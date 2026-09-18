@@ -201,6 +201,7 @@ class SleepResult(BaseModel):
   # behaviors 序列合成（sleep_session_builder）。合成行在同晚修正值到达时被重算覆盖，
   # 且与同晚设备上报行共存时让位（设备数据更准）
   source: Optional[str] = Field(None, description="记录来源：None=客户端上报；healthkit=服务端合成")
+  in_bed_intervals: List[Tuple[int, int]] = Field(default_factory=list, description="真实卧床样本的起止 Unix 秒；保留来源，禁止写入估算区间")
 
   @property
   def sequence_summaries(self):
