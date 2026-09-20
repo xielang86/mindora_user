@@ -334,7 +334,8 @@ def build_sleep_day(d, profile: Optional[UserProfile]) -> dict:
 
   # 顶部为入睡效率（SOE），不是 sleep_quality；缺失时由客户端显示 --。
   from sleep_session_builder import resolve_sleep_onset_efficiency
-  soe = resolve_sleep_onset_efficiency(latest) if latest else None
+  metric_onset = metrics.get("sleep_onset_minutes") if metrics else None
+  soe = resolve_sleep_onset_efficiency(latest, metric_onset) if latest else None
   if soe is not None:
     result["score_summary"] = {"score": int(soe), "date": date}
 

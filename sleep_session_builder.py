@@ -196,14 +196,22 @@ def _score_sleep_onset_efficiency(onset_min: Optional[float]) -> Optional[float]
   return 1.0
 
 
-def resolve_sleep_onset_efficiency(record: SleepResult) -> Optional[float]:
+def resolve_sleep_onset_efficiency(
+  record: SleepResult,
+  fallback_onset_min: Optional[float] = None,
+) -> Optional[float]:
   """Return stored SOE or apply the deep-first fallback to a legacy record.
 
   New HealthKit rows persist SOE during synthesis. This read-only fallback lets
-  /analysis serve existing rows that were created before that behavior.
+  /analysis serve existing rows that were created before that behavior.  When
+  the caller has already resolved an onset duration (for example via
+  ``build_sleep_metrics``), use it before the legacy deep-first fallback so the
+  displayed metric and its score cannot disagree.
   """
   if record.soe is not None:
     return record.soe
+  if fallback_onset_min is not None:
+    return _score_sleep_onset_efficiency(fallback_onset_min)
   first = next(iter(record.sleep_status or []), None)
   if first is None or first.sleep_type != "deep":
     return None
