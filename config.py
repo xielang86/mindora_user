@@ -68,6 +68,9 @@ class Config:
   APPLE_ASSN_ONLINE_CHECKS = os.getenv("APPLE_ASSN_ONLINE_CHECKS", "false").lower() == "true"
 
   # ── 睡眠计划同步（睡眠计划同步接口.md）────────────────────────────────────
+  # 联调默认关闭会员校验；关闭时仅睡眠计划按 premium 额度（5 条）处理。
+  # 设置环境变量 SLEEP_PLAN_CHECK_MEMBERSHIP=true 并重启可恢复真实会员校验。
+  SLEEP_PLAN_CHECK_MEMBERSHIP = os.getenv("SLEEP_PLAN_CHECK_MEMBERSHIP", "false").strip().lower() == "true"
   # 会员等级查询结果（auth_server query_user_rights）的内存缓存时长；查询失败不缓存，睡眠计划接口返回 503 供客户端重试
   SLEEP_PLAN_TIER_CACHE_SECONDS = int(os.getenv("SLEEP_PLAN_TIER_CACHE_SECONDS", "60"))
 

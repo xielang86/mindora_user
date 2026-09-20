@@ -25,6 +25,7 @@ from db.mysql_db import (
   init_web_columns, register_user_with_password, get_user_password_hash,
   get_user_by_phone, register_phone_user, get_or_create_wechat_user,
   init_membership_schema, get_user_rights_info, redeem_redemption_code,
+  get_user_membership_info,
   create_redemption_codes, get_ops_role, set_ops_role,
   report_subscription,
 )
@@ -776,6 +777,24 @@ def query_user_rights_handler(data: AuthData) -> AuthResponse:
   )
 
 
+def query_membership_info_handler(data: AuthData) -> AuthResponse:
+  """Return the authenticated user's persisted and effective membership fields."""
+  payload = decode_access_token(data.jwt_token)
+  uid = payload.get("uid")
+  membership_info = get_user_membership_info(uid)
+  if membership_info is None:
+    raise HTTPException(status_code=404, detail="user not found")
+  if membership_info["status"] != 1:
+    raise HTTPException(status_code=403, detail="user is inactive")
+  membership_info.pop("status", None)
+  return AuthResponse(
+    request_type=AuthRequestType.QUERY_MEMBERSHIP_INFO,
+    code=0,
+    msg="success",
+    data=membership_info,
+  )
+
+
 def query_ops_role_handler(data: AuthData) -> AuthResponse:
   """查询本人运营角色（user_server / 运营后台据此判断 push 权限）。"""
   payload = decode_access_token(data.jwt_token)
@@ -981,6 +1000,9 @@ async def handle_auth(request: AuthRequest, raw_request: Request):
 
   elif req_type == AuthRequestType.QUERY_USER_RIGHTS:
     return query_user_rights_handler(data)
+
+  elif req_type == AuthRequestType.QUERY_MEMBERSHIP_INFO:
+    return query_membership_info_handler(data)
 
   elif req_type == AuthRequestType.QUERY_OPS_ROLE:
     return query_ops_role_handler(data)

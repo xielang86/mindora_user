@@ -10,6 +10,7 @@
 """
 import asyncio,copy,datetime,hashlib,json,logging,os,re,time
 from typing import Any, Optional
+from uuid import uuid4
 from dotenv import load_dotenv
 import jwt
 from pydantic import BaseModel, ValidationError
@@ -868,7 +869,10 @@ class UserServer:
 
   # -------------------- /sleep_plan（睡眠计划同步接口.md） --------------------
   async def _get_effective_level(self, uid: str, jwt_token: Optional[str]) -> str:
-    """查询当前生效等级，只缓存成功结果；失败中止同步，供客户端重试。"""
+    """睡眠计划使用的权限等级；关闭校验时直接放行 premium，不改变账号权益。"""
+    if not Config.SLEEP_PLAN_CHECK_MEMBERSHIP:
+      return "premium"
+
     now = time.time()
     cached = self._tier_cache.get(uid)
     if cached and now - cached[1] < Config.SLEEP_PLAN_TIER_CACHE_SECONDS:
@@ -915,14 +919,49 @@ class UserServer:
     服务端是唯一事实源：合并/额度/唯一开启/完成判定都在 sleep_plan_service；
     客户端乐观更新后以本响应整体覆盖本地。
     """
+    client_request_id = request.headers.get("X-Client-Request-ID", "-")
+    raw_request_type = "-"
+    request_id = uuid4().hex[:12]
+    started_at = time.monotonic()
+    uid = None
+    request_type = "unknown"
+    status = 500
+    logging.info("sleep_plan received: request_id=%s client_request_id=%s", request_id, client_request_id)
     try:
       body = await request.json()
+      if isinstance(body, dict):
+        raw_request_type = body.get("request_type", "-")
+      raw_data = body.get("data") if isinstance(body, dict) else None
+      raw_plans = raw_data.get("plans") if isinstance(raw_data, dict) else None
+      logging.info(
+        "sleep_plan request received: request_id=%s client_request_id=%s request_type=%s plans=%s",
+        request_id, client_request_id,
+        raw_request_type,
+        len(raw_plans) if isinstance(raw_plans, list) else "-",
+      )
       req = SleepPlanSyncRequest.model_validate(body)
-      uid = self._parse_for_uid(req.data)
-      if uid is None:
-        return web.json_response(InvalidOrExpiredTokenResp().model_dump(), status=401)
-
+      request_type = req.request_type
       d = req.data
+      uid = self._parse_for_uid(d)
+      # 白名单式摘要，不写 JWT、完整计划内容或自定义名称。
+      summary = {
+        "request_type": request_type, "uid": uid, "device_id": d.device_id,
+        "timezone": d.timezone, "language": d.language, "last_sync_at": d.last_sync_at,
+        "membership_check": Config.SLEEP_PLAN_CHECK_MEMBERSHIP,
+        "plan_count": len(d.plans),
+        "plans": [{"plan_id": p.plan_id, "kind": p.kind, "status": p.status,
+                   "deleted": p.deleted, "updated_at": p.updated_at} for p in d.plans],
+      }
+      logging.info("sleep_plan request: request_id=%s client_request_id=%s %s",
+                   request_id, client_request_id, json.dumps(summary, ensure_ascii=False))
+      if uid is None:
+        status = 401
+        logging.warning(
+          "sleep_plan response: request_id=%s client_request_id=%s request_type=%s status=401 reason=invalid_token",
+          request_id, client_request_id, request_type,
+        )
+        return web.json_response(InvalidOrExpiredTokenResp().model_dump(), status=status)
+
       incoming = d.plans if req.request_type == "sync_plans" else []
       effective_level = await self._get_effective_level(uid, d.jwt_token)
 
@@ -958,21 +997,48 @@ class UserServer:
         "plans": [p.model_dump(mode="json") for p in visible],
         "rejected": result.rejected,
       }
+      logging.info("sleep_plan result: request_id=%s client_request_id=%s %s", request_id, client_request_id, json.dumps({
+        "request_type": request_type, "uid": uid,
+        "membership_check": Config.SLEEP_PLAN_CHECK_MEMBERSHIP,
+        "membership_tier": data["membership_tier"], "quota": data["quota"],
+        "plan_ids": [p.plan_id for p in visible], "changed": result.changed,
+        "rejected": result.rejected,
+      }, ensure_ascii=False))
       resp = BaseResponse(code=0, msg="ok")
+      status = 200
       return web.json_response({**resp.model_dump(), "data": data})
 
     except MembershipLookupError:
+      status = 503
+      logging.warning("sleep_plan membership unavailable: request_id=%s uid=%s", request_id, uid)
       # 不返回 plans=[]/tier_not_allowed：客户端应保留本地计划和待同步队列。
+      logging.warning(
+        "sleep_plan response: request_id=%s client_request_id=%s request_type=%s status=503 reason=membership_unavailable",
+        request_id, client_request_id, request_type,
+      )
       return web.json_response(
         BaseResponse(code=503, msg="Membership verification unavailable; retry later").model_dump(),
         status=503,
       )
-    except ValidationError as e:
-      logging.error(f"sleep_plan validation error: {e}")
-      return web.json_response(InvalidReqFormatResp().model_dump(), status=400)
-    except Exception as e:
-      logging.exception("sleep_plan error: %s", e)
+    except (ValidationError, json.JSONDecodeError) as e:
+      status = 400
+      errors = e.errors(include_input=False, include_context=False, include_url=False) if isinstance(e, ValidationError) else "invalid JSON"
+      logging.warning(
+        "sleep_plan invalid request: request_id=%s client_request_id=%s request_type=%s errors=%s",
+        request_id, client_request_id, raw_request_type, errors,
+      )
+      return web.json_response(InvalidReqFormatResp().model_dump(), status=status)
+    except Exception:
+      logging.exception(
+        "sleep_plan error: request_id=%s client_request_id=%s request_type=%s uid=%s",
+        request_id, client_request_id, raw_request_type, uid,
+      )
       return web.json_response(BaseResponse(code=500, msg="Internal server error").model_dump(), status=500)
+    finally:
+      logging.info(
+        "sleep_plan finished: request_id=%s client_request_id=%s request_type=%s uid=%s status=%s elapsed_ms=%.1f",
+        request_id, client_request_id, raw_request_type, uid, status, (time.monotonic() - started_at) * 1000,
+      )
 
   # -------------------- 运营后台接口（/ops/*） --------------------
   # 调用方：ops_admin_server.py。鉴权两步：本地验 JWT → auth_server 查 ops_role，

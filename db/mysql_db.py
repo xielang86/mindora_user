@@ -463,6 +463,62 @@ def get_user_rights_info(uid: str) -> dict:
   )
 
 
+def get_user_membership_info(uid: str) -> dict | None:
+  """Return persisted membership sources plus the effective rights projection.
+
+  Keep this query limited to membership fields. In particular, do not expose
+  password hashes, salts, devices, or contact identifiers through the auth API.
+  """
+  if not uid:
+    return None
+
+  sql = (
+    "SELECT uid, status, user_level, level_end_at, "
+    "signup_trial_end_at, basic_purchase_trial_end_at "
+    "FROM user_auth WHERE uid=%s"
+  )
+  legacy_sql = "SELECT uid, status, user_level, level_end_at FROM user_auth WHERE uid=%s"
+  try:
+    row = mysql_db.query_one(sql, (uid,))
+  except Exception as e:
+    logging.warning("trial columns unavailable, using legacy membership query: %s", e)
+    try:
+      row = mysql_db.query_one(legacy_sql, (uid,))
+    except Exception as e2:
+      logging.warning("membership query failed for uid=%s: %s", uid, e2)
+      return None
+
+  if not row:
+    return None
+
+  trial_end_at = _max_dt(row.get("signup_trial_end_at"), row.get("basic_purchase_trial_end_at"))
+  subscription_level = _safe_active_subscription_tier(uid)
+  rights_info = build_user_rights_payload(
+    row.get("user_level"), row.get("level_end_at"),
+    trial_end_at=trial_end_at, subscription_level=subscription_level,
+  )
+  return {
+    "uid": row["uid"],
+    "status": row.get("status"),
+    "user_level": row.get("user_level"),
+    "level_end_at": row.get("level_end_at").isoformat() if row.get("level_end_at") else None,
+    "signup_trial_end_at": (
+      row.get("signup_trial_end_at").isoformat()
+      if row.get("signup_trial_end_at") else None
+    ),
+    "basic_purchase_trial_end_at": (
+      row.get("basic_purchase_trial_end_at").isoformat()
+      if row.get("basic_purchase_trial_end_at") else None
+    ),
+    "premium_trial_end_at": rights_info["premium_trial_end_at"],
+    "subscription_level": rights_info["subscription_level"],
+    "effective_user_level": rights_info["effective_user_level"],
+    "membership_active": rights_info["membership_active"],
+    "rights": rights_info["rights"],
+    "server_time": rights_info["server_time"],
+  }
+
+
 def _safe_active_subscription_tier(uid: str) -> str | None:
   """查询有效订阅档位；任何失败（表未建好/DB 抖动）都降级为 None，绝不阻塞登录。"""
   try:

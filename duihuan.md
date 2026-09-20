@@ -85,6 +85,42 @@
 | `rights.max_reports_per_day` | int | 每日可用分析次数上限 |
 | `server_time` | string | 服务端当前时间，ISO 8601 格式 |
 
+## request_type = `query_membership_info`
+
+登录后使用 JWT 查询完整会员信息。该请求返回 `user_auth` 中的会员事实字段，
+以及服务端计算出的当前生效权益；不会返回密码、盐值、设备列表或联系方式。
+
+### 请求体
+
+```json
+{
+  "request_type": "query_membership_info",
+  "version": "1.0",
+  "timestamp": 1711296000,
+  "data": {
+    "jwt_token": "eyJhbGciOiJSUzI1NiIs..."
+  }
+}
+```
+
+### 响应字段
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `uid` | string | 用户 UID |
+| `user_level` | string | 数据库保存的等级 |
+| `level_end_at` | string/null | 数据库保存的等级截止时间 |
+| `signup_trial_end_at` | string/null | 注册体验期原始截止时间 |
+| `basic_purchase_trial_end_at` | string/null | 首次购买 Basic 体验期原始截止时间 |
+| `premium_trial_end_at` | string/null | 当前两段体验期截止时间的最大值（已过期时为 null） |
+| `subscription_level` | string/null | 当前有效的 Apple 订阅档位 |
+| `effective_user_level` | string | 当前实际生效等级 |
+| `membership_active` | bool | 当前是否有有效会员权益 |
+| `rights` | object | 当前生效等级对应的权益清单 |
+| `server_time` | string | 服务端当前时间，ISO 8601 格式 |
+
+成功响应的外层格式与其他认证请求一致：`code=0`，`data` 为上述字段。
+
 ### 当前默认权益映射
 
 | user_level | llm_models | algorithms |

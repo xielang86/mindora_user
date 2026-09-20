@@ -50,6 +50,7 @@ class AuthRequestType(StrEnum):
   REDEEM_REDEMPTION_CODE = "redeem_redemption_code"              # 兑换权益码
   GENERATE_REDEMPTION_CODES = "generate_redemption_codes"        # 生成权益码（后台）
   QUERY_USER_RIGHTS = "query_user_rights"                        # 查询用户权益
+  QUERY_MEMBERSHIP_INFO = "query_membership_info"                # 查询完整会员信息
   QUERY_OPS_ROLE = "query_ops_role"                              # 查询本人运营角色（ops_role）
   GRANT_OPS_ROLE = "grant_ops_role"                              # 0号管理员(super)授权他人运营角色
   REPORT_SUBSCRIPTION = "report_subscription"                    # 内购购买成功上报（首次 Basic 触发 Premium 体验期）
@@ -286,6 +287,10 @@ class AuthRequest(BaseModel):
         raise ValueError(f"request_type={req_type}时，data中以下字段必填：{missing}")
 
     elif req_type == AuthRequestType.QUERY_USER_RIGHTS:
+      if data.jwt_token is None:
+        raise ValueError(f"request_type={req_type}时，data.jwt_token必填")
+
+    elif req_type == AuthRequestType.QUERY_MEMBERSHIP_INFO:
       if data.jwt_token is None:
         raise ValueError(f"request_type={req_type}时，data.jwt_token必填")
 
