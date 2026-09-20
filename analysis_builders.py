@@ -505,13 +505,15 @@ def build_explore(d, profile: Optional[UserProfile]) -> dict:
   date = datetime.datetime.fromtimestamp(latest.timestamp, tz).date().isoformat()
   start = (datetime.date.fromisoformat(date) - datetime.timedelta(days=6)).isoformat()
   result: dict = {"data_ready": True}
+  metrics = build_sleep_metrics(latest, profile, tz)
 
   # 顶部摘要：纯文案（LLM 报告覆盖）
   result["header_summary"] = {"intro_text": "", "intro_detail_text": "", "date": date}
 
   # 顶部总分环：总分=当夜得分；三段分值 = soe / sleep_arch_index / night_var_index（缺哪个省哪个）
   from sleep_session_builder import resolve_sleep_onset_efficiency, resolve_sleep_structure_score
-  soe = resolve_sleep_onset_efficiency(latest)
+  metric_onset = metrics.get("sleep_onset_minutes") if metrics else None
+  soe = resolve_sleep_onset_efficiency(latest, metric_onset)
   structure_score = resolve_sleep_structure_score(latest)
   score_summary: dict = {"title": _localize("Sleep Score", d.language), "date": date}
   if latest.sleep_quality is not None:
@@ -528,8 +530,8 @@ def build_explore(d, profile: Optional[UserProfile]) -> dict:
   onset: dict = {"label": "", "description": "", "date": date}
   if soe is not None:
     onset["score"] = int(soe)
-  if latest.onset is not None:
-    onset["onset_minutes"] = int(latest.onset)
+  if metric_onset is not None:
+    onset["onset_minutes"] = int(metric_onset)
   if latest.first_sleep_time:
     onset["first_sleep_time"] = latest.first_sleep_time
   if latest.hr_before_sleep is not None:
