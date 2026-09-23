@@ -2,12 +2,24 @@ import uuid
 import os
 import typing, logging
 from cryptography.fernet import Fernet, InvalidToken
-
+import hashlib
+from common.util import normalize_email
 # -------------------------- 配置项（可自定义） --------------------------
 # 加密文件路径（存储uuid1的加密内容）
 UUID_ENCRYPT_FILE = "uuid_mac_time.enc"
 # Fernet加密密钥（可自行生成替换，生成方法见下方说明）
 ENCRYPT_KEY = b'scHtsUOJBon6_RHMOIbkDDx_EDObXiPh8AUMV1c7ch4='  # 需是32位base64编码字符串
+
+
+def generate_uid_and_salt(email: str) -> tuple[str, str]:
+  """生成UID（SHA256+加盐）和盐值"""
+  normalized_email = normalize_email(email)
+  salt = os.urandom(16).hex()  # 生成32位随机盐
+  # 加盐Hash生成UID
+  hash_obj = hashlib.sha256()
+  hash_obj.update((salt + normalized_email).encode("utf-8"))
+  uid = hash_obj.hexdigest()
+  return uid, salt
 
 def generate_user_uuid(device_id: str, email: str) -> typing.Optional[str]:
   """

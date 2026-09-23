@@ -1,0 +1,445 @@
+import argparse
+import datetime as dt
+import json
+import os
+import time
+from typing import Any
+
+import requests
+
+
+DEFAULT_BASE_URL = os.getenv("USER_SERVER_URL", "http://127.0.0.1:9001")
+DEFAULT_PORT = int(os.getenv("USER_SERVER_PORT", "9001"))
+DEFAULT_LANGUAGE = os.getenv("USER_SERVER_LANGUAGE", "zh-Hans")
+DEFAULT_TIMEZONE = os.getenv("USER_SERVER_TIMEZONE", "Asia/Shanghai")
+# 必须在 user_server.py 的 debug_uid_set 白名单内，否则无 JWT 时会 401
+DEFAULT_DEBUG_UID = os.getenv("USER_SERVER_DEBUG_UID", "mindora_test_uid1")
+
+
+class UserServerClient:
+  def __init__(
+    self,
+    base_url: str = DEFAULT_BASE_URL,
+    jwt_token: str = "",
+    uid: str = DEFAULT_DEBUG_UID,
+    timeout: int = 30,
+    language: str = DEFAULT_LANGUAGE,
+    timezone: str = DEFAULT_TIMEZONE,
+  ):
+    self.base_url = base_url.rstrip("/")
+    self.jwt_token = jwt_token
+    self.uid = uid
+    self.timeout = timeout
+    self.language = language
+    self.timezone = timezone
+    self.session = requests.Session()
+    self.session.trust_env = False
+
+  def _auth_data(self) -> dict[str, Any]:
+    if self.jwt_token:
+      return {"jwt_token": self.jwt_token}
+    return {"uid": self.uid}
+
+  def _post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+    url = f"{self.base_url}{path}"
+    try:
+      response = self.session.post(url, json=payload, timeout=self.timeout)
+      try:
+        body: Any = response.json()
+      except ValueError:
+        body = response.text
+
+      return {
+        "status_code": response.status_code,
+        "ok": response.ok,
+        "url": url,
+        "request": payload,
+        "response": body,
+      }
+    except requests.exceptions.RequestException as exc:
+      return {
+        "status_code": None,
+        "ok": False,
+        "url": url,
+        "request": payload,
+        "response": {"error": str(exc)},
+      }
+
+  def login_with_jwt(self, jwt_token: str | None = None) -> dict[str, Any]:
+    token = jwt_token or self.jwt_token
+    payload = {
+      "request_type": "login_with_jwt",
+      "timestamp": int(time.time()),
+      "version": "1.0",
+      "data": {"jwt_token": token},
+    }
+    return self._post("/login", payload)
+
+  def query_profile(
+    self,
+    sleep_data_count: int = 1,
+    include_behaviors: bool = True,
+    analysis_report_count: int = 1,
+    include_mindora_record: bool = True,
+    engagement_count: int = 1,
+  ) -> dict[str, Any]:
+    # sleep_data / behaviors / analysis_reports 是画像体积大头；count=0 不携带，N=最近 N 条/份；
+    # 不携带 behaviors 时服务端会同时去掉 health_sync_days；
+    # include_mindora_record=False 额外去掉播放历史（设备端不展示）
+    payload = {
+      "request_type": "query_profile",
+      "timestamp": int(time.time()),
+      "version": "1.0",
+      "data": {
+        **self._auth_data(),
+        "sleep_data_count": sleep_data_count,
+        "include_behaviors": include_behaviors,
+        "analysis_report_count": analysis_report_count,
+        "include_mindora_record": include_mindora_record,
+        "engagement_count": engagement_count,
+      },
+    }
+    return self._post("/user_profile", payload)
+
+  def query_user_rights(self) -> dict[str, Any]:
+    """直查 auth_server 权益；base_url 应指向认证服务，必须提供 JWT。"""
+    if not self.jwt_token:
+      raise ValueError("query_user_rights requires --jwt-token or JWT_TOKEN")
+    return self._post("/auth", {
+      "request_type": "query_user_rights",
+      "timestamp": int(time.time()),
+      "version": "1.0",
+      "data": {"jwt_token": self.jwt_token},
+    })
+
+  def query_plans(self, device_id: str = "cli-plan-query", last_sync_at: int | None = None) -> dict[str, Any]:
+    """单独查询账号睡眠计划，不上传计划变更。"""
+    data = {
+      **self._auth_data(),
+      "language": self.language,
+      "timezone": self.timezone,
+      "device_id": device_id,
+    }
+    if last_sync_at is not None:
+      data["last_sync_at"] = last_sync_at
+    return self._post("/sleep_plan", {
+      "request_type": "query_plans",
+      "timestamp": int(time.time()),
+      "version": "1.0",
+      "data": data,
+    })
+
+  def query_health_sync_state(self, start_date: str, end_date: str) -> dict[str, Any]:
+    """健康数据对账（健康数据同步接口_0814.md §8.4）：窗口内已有数据的天+口径版本。"""
+    payload = {
+      "request_type": "query_health_sync_state",
+      "timestamp": int(time.time()),
+      "version": "1.0",
+      "data": {
+        **self._auth_data(),
+        "timezone": self.timezone,
+        "start_date": start_date,
+        "end_date": end_date,
+      },
+    }
+    return self._post("/user_profile", payload)
+
+  def update_profile(
+    self,
+    user_profile: dict[str, Any] | None = None,
+    skip_sleep_scenarios_reco_update: bool | None = None,
+    skip_sleep_analysis_update: bool | None = None,
+    health_schema_version: int | None = None,
+  ) -> dict[str, Any]:
+    payload = {
+      "request_type": "update_profile",
+      "timestamp": int(time.time()),
+      "version": "1.0",
+      "data": {
+        **self._auth_data(),
+        "user_profile": user_profile or self.default_user_profile(),
+        "language": self.language,
+        "timezone": self.timezone,
+      },
+    }
+    # 三态开关：None=不带该字段（服务端自动决策）；True=跳过；False=强制
+    if skip_sleep_scenarios_reco_update is not None:
+      payload["data"]["skip_sleep_scenarios_reco_update"] = skip_sleep_scenarios_reco_update
+    if skip_sleep_analysis_update is not None:
+      payload["data"]["skip_sleep_analysis_update"] = skip_sleep_analysis_update
+    if health_schema_version is not None:
+      payload["data"]["health_schema_version"] = health_schema_version
+    return self._post("/user_profile", payload)
+
+  def analysis_overview(self, date: str | None = None, modules: list[str] | None = None) -> dict[str, Any]:
+    return self._analysis_request(
+      "analysis_overview",
+      {"date": date or self.today(), "modules": modules or ["overall_score", "weekly_best", "sleep_insight"]},
+    )
+
+  def analysis_sleep_day(self, date: str | None = None, modules: list[str] | None = None) -> dict[str, Any]:
+    return self._analysis_request(
+      "analysis_sleep_day",
+      {"date": date or self.today(), "modules": modules or ["score_summary", "sleep_scenarios", "stage_insights"]},
+    )
+
+  def analysis_sleep_week(
+    self,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    modules: list[str] | None = None,
+  ) -> dict[str, Any]:
+    return self._analysis_request(
+      "analysis_sleep_week",
+      {
+        "start_date": start_date or self.days_ago(6),
+        "end_date": end_date or self.today(),
+        "modules": modules or ["score_summary", "sleep_trends", "onset_efficiency"],
+      },
+    )
+
+  def analysis_sleep_month(
+    self,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    modules: list[str] | None = None,
+  ) -> dict[str, Any]:
+    return self._analysis_request(
+      "analysis_sleep_month",
+      {
+        "start_date": start_date or self.days_ago(29),
+        "end_date": end_date or self.today(),
+        "modules": modules or ["score_summary", "sleep_trends", "onset_efficiency"],
+      },
+    )
+
+  def analysis_explore(self, date: str | None = None, modules: list[str] | None = None) -> dict[str, Any]:
+    return self._analysis_request(
+      "analysis_explore",
+      {
+        "date": date or self.today(),
+        "modules": modules or [
+          "header_summary",
+          "score_summary",
+          "onset_efficiency",
+          "sleep_structure",
+          "night_fluctuation",
+          "scene_preference",
+          "sleep_advice",
+        ],
+      },
+    )
+
+  def analysis_explore_partial(self, date: str | None = None) -> dict[str, Any]:
+    """analysis_explore — 只取 score_summary + sleep_advice（模块过滤演示）"""
+    return self.analysis_explore(date=date, modules=["score_summary", "sleep_advice"])
+
+  def analysis_invalid_token(self) -> dict[str, Any]:
+    """坏 JWT — 期望 401"""
+    payload = {
+      "request_type": "analysis_overview",
+      "timestamp": int(time.time()),
+      "version": "1.0",
+      "data": {
+        "jwt_token": "invalid.token.value",
+        "language": self.language,
+        "timezone": self.timezone,
+        "date": self.today(),
+      },
+    }
+    return self._post("/analysis", payload)
+
+  def analysis_missing_auth(self) -> dict[str, Any]:
+    """既无 uid 也无 jwt_token — 期望 400"""
+    payload = {
+      "request_type": "analysis_overview",
+      "timestamp": int(time.time()),
+      "version": "1.0",
+      "data": {
+        "language": self.language,
+        "timezone": self.timezone,
+        "date": self.today(),
+      },
+    }
+    return self._post("/analysis", payload)
+
+  def run_all(self) -> dict[str, dict[str, Any]]:
+    results: dict[str, dict[str, Any]] = {}
+    if self.jwt_token:
+      results["login_with_jwt"] = self.login_with_jwt()
+
+    results["update_profile"] = self.update_profile()
+    results["query_profile"] = self.query_profile()
+    results["analysis_overview"] = self.analysis_overview()
+    results["analysis_sleep_day"] = self.analysis_sleep_day()
+    results["analysis_sleep_week"] = self.analysis_sleep_week()
+    results["analysis_sleep_month"] = self.analysis_sleep_month()
+    results["analysis_explore"] = self.analysis_explore()
+    results["analysis_explore_partial"] = self.analysis_explore_partial()
+    results["analysis_invalid_token"] = self.analysis_invalid_token()
+    results["analysis_missing_auth"] = self.analysis_missing_auth()
+    return results
+
+  def _analysis_request(self, request_type: str, extra_data: dict[str, Any]) -> dict[str, Any]:
+    payload = {
+      "request_type": request_type,
+      "timestamp": int(time.time()),
+      "version": "1.0",
+      "data": {
+        **self._auth_data(),
+        "language": self.language,
+        "timezone": self.timezone,
+        **extra_data,
+      },
+    }
+    return self._post("/analysis", payload)
+
+  @staticmethod
+  def today() -> str:
+    return dt.date.today().isoformat()
+
+  @staticmethod
+  def days_ago(days: int) -> str:
+    return (dt.date.today() - dt.timedelta(days=days)).isoformat()
+
+  def default_user_profile(self) -> dict[str, Any]:
+    return {
+      "uid_emb": [],
+      "long_term_profile": [],
+      "behaviors": {
+        "heart_rate": [],
+        "blood_oxygen": [],
+        "sleep_status": [],
+        "clicks": [],
+        "plays": [],
+      },
+      "profile": {
+        "nickname": "Mindora Test User",
+        "gender": "Unknown",
+        "age": "28",
+        "birthday": "1998-08-12",
+        "email": "profile@example.com",
+        "phone": "13800138000",
+        "address_list": [
+          {
+            "id": "addr_001",
+            "is_default": True,
+            "region": "Shanghai",
+            "detail": "Zhonghai Center A-1501",
+            "name": "Test User",
+            "phone": "13800138000",
+          }
+        ],
+        "avatar_base64": "",
+        "avatar_mime_type": "image/jpeg",
+      },
+    }
+
+
+def print_result(title: str, result: Any):
+  print(f"\n{'=' * 20} {title} {'=' * 20}")
+  # 调试输出保留请求结构，但不打印认证令牌。
+  def redact(value):
+    if isinstance(value, dict):
+      return {key: "***" if key == "jwt_token" else redact(item) for key, item in value.items()}
+    if isinstance(value, list):
+      return [redact(item) for item in value]
+    return value
+
+  print(json.dumps(redact(result), ensure_ascii=False, indent=2))
+
+
+def build_parser() -> argparse.ArgumentParser:
+  parser = argparse.ArgumentParser(description="Client for all HTTP APIs exposed by user_server.py")
+  parser.add_argument(
+    "action",
+    nargs="?",
+    default="run_all",
+    choices=[
+      "run_all",
+      "login",
+      "query_profile",
+      "query_plans",
+      "query_user_rights",
+      "update_profile",
+      "analysis_overview",
+      "analysis_sleep_day",
+      "analysis_sleep_week",
+      "analysis_sleep_month",
+      "analysis_explore",
+      "analysis_explore_partial",
+      "analysis_invalid_token",
+      "analysis_missing_auth",
+    ],
+  )
+  parser.add_argument("--base-url", default=DEFAULT_BASE_URL)
+  parser.add_argument("--host", default=None,
+                      help="user_server IP/hostname，如 192.168.1.207；传入后覆盖 --base-url")
+  parser.add_argument("--port", type=int, default=None,
+                      help=f"user_server 端口，默认 {DEFAULT_PORT}；仅随 --host 生效")
+  parser.add_argument("--jwt-token", default=os.getenv("JWT_TOKEN", ""))
+  parser.add_argument("--uid", default=DEFAULT_DEBUG_UID)
+  parser.add_argument("--timeout", type=int, default=30)
+  parser.add_argument("--date", default=None)
+  parser.add_argument("--start-date", default=None)
+  parser.add_argument("--end-date", default=None)
+  parser.add_argument("--language", default=DEFAULT_LANGUAGE)
+  parser.add_argument("--timezone", default=DEFAULT_TIMEZONE)
+  parser.add_argument("--device-id", default="cli-plan-query", help="睡眠计划查询的设备标识")
+  parser.add_argument("--last-sync-at", type=int, default=None, help="睡眠计划上次同步的 Unix 秒时间戳（可选）")
+  parser.add_argument("--focus", nargs="*", default=None)
+  parser.add_argument("--modules", nargs="*", default=None)
+  parser.add_argument("--skip-sleep-scenarios-reco-update", action="store_const", const=True, default=None,
+                      help="显式要求跳过场景推荐重算；不带则交给服务端自动决策")
+  return parser
+
+
+def main():
+  parser = build_parser()
+  args = parser.parse_args()
+  if args.action == "query_user_rights" and not args.jwt_token:
+    parser.error("query_user_rights requires --jwt-token or JWT_TOKEN")
+  base_url = f"http://{args.host}:{args.port or DEFAULT_PORT}" if args.host else args.base_url
+  client = UserServerClient(
+    base_url=base_url,
+    jwt_token=args.jwt_token,
+    uid=args.uid,
+    timeout=args.timeout,
+    language=args.language,
+    timezone=args.timezone,
+  )
+
+  if args.action == "run_all":
+    result = client.run_all()
+  elif args.action == "login":
+    result = client.login_with_jwt()
+  elif args.action == "query_profile":
+    result = client.query_profile()
+  elif args.action == "query_user_rights":
+    result = client.query_user_rights()
+  elif args.action == "query_plans":
+    result = client.query_plans(device_id=args.device_id, last_sync_at=args.last_sync_at)
+  elif args.action == "update_profile":
+    result = client.update_profile(skip_sleep_scenarios_reco_update=args.skip_sleep_scenarios_reco_update)
+  elif args.action == "analysis_overview":
+    result = client.analysis_overview(date=args.date, modules=args.modules)
+  elif args.action == "analysis_sleep_day":
+    result = client.analysis_sleep_day(date=args.date, modules=args.modules)
+  elif args.action == "analysis_sleep_week":
+    result = client.analysis_sleep_week(start_date=args.start_date, end_date=args.end_date, modules=args.modules)
+  elif args.action == "analysis_sleep_month":
+    result = client.analysis_sleep_month(start_date=args.start_date, end_date=args.end_date, modules=args.modules)
+  elif args.action == "analysis_explore":
+    result = client.analysis_explore(date=args.date, modules=args.modules)
+  elif args.action == "analysis_explore_partial":
+    result = client.analysis_explore_partial(date=args.date)
+  elif args.action == "analysis_invalid_token":
+    result = client.analysis_invalid_token()
+  elif args.action == "analysis_missing_auth":
+    result = client.analysis_missing_auth()
+
+  print_result(args.action, result)
+
+
+if __name__ == "__main__":
+  main()

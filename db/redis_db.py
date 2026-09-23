@@ -1,0 +1,158 @@
+import redis
+from redis.exceptions import RedisError
+from dotenv import load_dotenv
+import os, logging, time
+
+# 加载配置文件
+load_dotenv()
+
+class RedisDB:
+  """Redis操作封装（连接池+通用读写）"""
+  _pool = None
+
+  def __init__(self):
+    self.host = os.getenv("REDIS_HOST")
+    self.port = int(os.getenv("REDIS_PORT"))
+    self.db = int(os.getenv("REDIS_DB"))
+    self.password = os.getenv("REDIS_PASSWORD") or None
+    self._init_pool()
+
+  def _init_pool(self):
+    """初始化Redis连接池"""
+    if not RedisDB._pool:
+      RedisDB._pool = redis.ConnectionPool(
+        host=self.host,
+        port=self.port,
+        db=self.db,
+        password=self.password,
+        decode_responses=True  # 自动将bytes转为str
+      )
+
+  def get_client(self):
+    """获取Redis客户端（从连接池）"""
+    try:
+      return redis.Redis(connection_pool=RedisDB._pool)
+    except RedisError as e:
+      raise Exception(f"Redis连接失败：{str(e)}")
+
+  def get(self, key: str) -> str | None:
+    """读取Redis值"""
+    client = self.get_client()
+    try:
+      return client.get(key)
+    except RedisError as e:
+      logging.error(
+        "Redis get failed: %s, key_len=%d, host=%s:%s/%s",
+        e, len(key) if key else 0, self.host, self.port, self.db,
+      )
+      try:
+        self._reset_pool()
+        client = self.get_client()
+        return client.get(key)
+      except RedisError as e2:
+        logging.exception("Redis get retry also failed")
+        raise Exception(f"Redis读取失败：{str(e2)}") from e2
+
+  def _reset_pool(self):
+    """Close and recreate the connection pool (used after connection errors)."""
+    try:
+      if RedisDB._pool:
+        RedisDB._pool.disconnect(inuse_connections=True)
+    except Exception as e:
+      logging.warning(f"Redis reset_pool disconnect warning: {e}")
+    RedisDB._pool = None
+    self._init_pool()
+
+  def set(self, key: str, value: str, expire_seconds: int = None) -> bool:
+    """
+    写入Redis值（支持过期时间）
+    :param key: 键
+    :param value: 值
+    :param expire_seconds: 过期时间（秒），None则永久
+    :return: 是否成功
+    """
+    if expire_seconds is not None:
+      try:
+        expire_seconds = int(expire_seconds)
+      except (TypeError, ValueError) as e:
+        raise ValueError(f"Invalid expire_seconds for Redis set: {expire_seconds!r}") from e
+      if expire_seconds <= 0:
+        raise ValueError(f"Redis expire_seconds must be positive, got {expire_seconds}")
+
+    client = self.get_client()
+    try:
+      if expire_seconds:
+        client.setex(key, expire_seconds, value)
+      else:
+        client.set(key, value)
+      return True
+    except RedisError as e:
+      logging.error(
+        "Redis set failed: %s, key_len=%d, value_len=%d, expire=%s, host=%s:%s/%s",
+        e, len(key) if key else 0, len(value) if value else 0,
+        expire_seconds, self.host, self.port, self.db,
+      )
+      # Try once more with a fresh pool in case the connection was dropped.
+      try:
+        self._reset_pool()
+        client = self.get_client()
+        if expire_seconds:
+          client.setex(key, expire_seconds, value)
+        else:
+          client.set(key, value)
+        return True
+      except RedisError as e2:
+        logging.exception("Redis set retry also failed")
+        raise Exception(f"Redis写入失败：{str(e2)}") from e2
+
+  def delete(self, key: str) -> bool:
+    """删除Redis键"""
+    client = self.get_client()
+    try:
+      return bool(client.delete(key))
+    except RedisError as e:
+      logging.error(
+        "Redis delete failed: %s, key_len=%d, host=%s:%s/%s",
+        e, len(key) if key else 0, self.host, self.port, self.db,
+      )
+      try:
+        self._reset_pool()
+        client = self.get_client()
+        return bool(client.delete(key))
+      except RedisError as e2:
+        logging.exception("Redis delete retry also failed")
+        raise Exception(f"Redis删除失败：{str(e2)}") from e2
+
+# 初始化Redis实例（全局单例）
+redis_db = RedisDB()
+
+# ------------------- 业务封装：验证码操作 -------------------
+# 说明：JWT 不再写 Redis（jwt_token:* 历史上只写不读，验签走本地公钥 verify_token；
+# 软删号后的踢下线如需实现，应在验签路径加状态校验，而不是靠这份记录）。
+def get_verify_code(email: str, device_id: str) -> str | None:
+  """获取验证码（key格式：verify_code:{email}:{device_id}）"""
+  key = f"verify_code:{email}:{device_id}"
+  return redis_db.get(key)
+
+def set_verify_code(email: str, device_id: str, code: str, expire_seconds: int ) -> int:
+  key = f"verify_code:{email}:{device_id}"
+  return redis_db.set(key, code, expire_seconds)
+
+def delete_verify_code(email: str, device_id: str) -> bool:
+  """删除验证码（成功验证后消费，防止重放）"""
+  key = f"verify_code:{email}:{device_id}"
+  return redis_db.delete(key)
+
+
+if __name__ == "__main__":
+  import logger
+  email = "zhouzhao@example.com"
+  did = "xielang"
+  verify_code = "1234"
+  expire_seconds = 1
+  set_verify_code(email, did, verify_code, expire_seconds)
+  read_code = get_verify_code(email, did)
+  logging.info(f"write vcode={verify_code}, and read for {read_code}")
+  time.sleep(expire_seconds + 1)
+  read_code = get_verify_code(email, did)
+  logging.info(f"after sleep expire_seconds, write vcode={verify_code}, and read for {read_code}")
