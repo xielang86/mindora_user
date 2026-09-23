@@ -31,7 +31,10 @@ from common import util
 from config import Config
 from engagement_service import EngagementService
 from llm import SleepAnalysisLLM
-from user_profile import UserProfile, SleepScenario, Profile, SCENE_CMD_PREFIXES, short_scene_id
+from user_profile import (
+  UserProfile, SleepScenario, Profile, SCENE_CMD_PREFIXES, short_scene_id,
+  ENGAGEMENT_RESPONSE_KEYS, keep_latest_engagement, active_sleep_plan,
+)
 from sop_tag_profile import rebuild_sop_tag_profile
 
 run_dir = os.getenv("RUN_DIR") or os.path.dirname(os.path.abspath(__file__))
@@ -42,6 +45,31 @@ class UserProfileServ:
   MAX_BEHAVIOR_LEN = 100
   # sleep_data 保留条数：与分析报告日级保留一致（日级 30）
   MAX_SLEEP_DATA_LEN = 30
+
+  # 头像 base64 上限：画像每次 query/update 都会整体回吐，无上限的头像会让
+  # 每轮轮询都背上几百 KB。超限不静默截断（截断后 base64 解不出图），
+  # 保留原头像并告警，其余个人资料字段照常合并。
+  MAX_AVATAR_BASE64_LEN = 256 * 1024
+
+  # uid 向量维度上限：客户端直供、此前无任何校验（>16 就整体覆盖）。
+  # 超限不截断——截半的向量做相似度是错的，宁可保留旧值并告警。
+  MAX_UID_EMB_LEN = 128
+
+  # 运营/陪伴四件套（弹窗状态/站内消息/问卷提交/陪伴足迹）单用户条数上限。
+  # 四者此前只增不删：足迹一天一条，另外三个随运营发布/问卷次数线性增长。
+  # 完整数据各有专用端点（/footprint、/popup、/survey），画像里只是副本。
+  MAX_ENGAGEMENT_LEN = 500
+
+  # 单条 SleepResult 内嵌序列上限（客户端直供、逐条无上限，30 条记录能把画像撑爆）。
+  # 实测一晚 5~30 段，合成行最多受 HEALTH_V2_BEHAVIOR_CAP 约束；取宽松上限只挡异常。
+  # 截断保留「开头」而不是结尾：入睡时长/卧床起点在序列头部，丢尾部只影响醒来段。
+  MAX_SLEEP_RECORD_LIST_LEN = {
+    "sleep_status": 2000,
+    "night_events": 2000,
+    "in_bed_intervals": 200,
+    "self_rating_tags": 50,
+    "scene_preference": 100,
+  }
 
   # 场景使用 ↔ 睡眠记录的对齐窗口（"使用当晚"口径）：
   # sleep_data 时间戳实测为次日早晨上传（约 04:47–09:14），场景使用发生在
@@ -56,8 +84,8 @@ class UserProfileServ:
   # 截断后 §8.4 对账会谎报"这些天没数据"（天从 behaviors 现算）导致客户端无限重传，
   # 服务端合成 SleepResult 也会丢阶段。v1 废弃 key（heart_rate 等）与 plays/clicks
   # 等交互行为沿用 MAX_BEHAVIOR_LEN。
-  # 注意 sleep_stage_light 同时属于 HEALTH_V1_DEPRECATED_KEYS（v1 语义混入
-  # unspecified，v2 批次覆盖当天要 purge 旧样本）——两个集合职责不同，不冲突。
+  # sleep_stage_light 是 v1/v2 共用但语义不同的字段；只在该字段首次迁移时
+  # 清理 v1 样本，后续 v2 分片必须增量合并。
   HEALTH_V2_BEHAVIOR_KEYS = {
     "sleep_heart_rate_min", "sleep_heart_rate_max",
     "sleep_heart_rate_variability_sdnn", "sleep_respiratory_rate",
@@ -203,9 +231,61 @@ class UserProfileServ:
         return UserProfile.model_validate(data)
       return None
 
+  @staticmethod
+  def _accept_uid_emb(candidate) -> bool:
+    """uid_emb 维度校验：超过 MAX_UID_EMB_LEN 一律拒绝（保留旧值），不截断。"""
+    if candidate is not None and len(candidate) > UserProfileServ.MAX_UID_EMB_LEN:
+      logging.warning(
+        "uid_emb rejected: dim=%d exceeds limit %d", len(candidate), UserProfileServ.MAX_UID_EMB_LEN,
+      )
+      return False
+    return True
+
+  @staticmethod
+  def _cap_engagement_containers(profile: UserProfile) -> None:
+    """四件套落盘前封顶，各自按时间戳挤掉最旧的。
+
+    注意副作用（上限 500 远高于现实量级，正常用户碰不到）：
+      - survey_submissions 被挤掉后，同一 survey_id 可以再次提交（幂等键丢失）；
+        运营侧全量记录另存全局 KV（SURVEY_RECORD_PREFIX），不受影响
+      - popup_states 被挤掉后，该弹窗的频控计数从零开始
+    """
+    for key in ENGAGEMENT_RESPONSE_KEYS:
+      container = getattr(profile, key, None)
+      size = len(container) if isinstance(container, (dict, list)) else 0
+      if size > UserProfileServ.MAX_ENGAGEMENT_LEN:
+        logging.warning("%s truncated: %d -> %d", key, size, UserProfileServ.MAX_ENGAGEMENT_LEN)
+        setattr(profile, key, keep_latest_engagement(
+          key, container, UserProfileServ.MAX_ENGAGEMENT_LEN))
+
+  @staticmethod
+  def _cap_sleep_record_lists(profile: UserProfile) -> None:
+    """落盘前给每条 SleepResult 的内嵌序列封顶（防御异常客户端，正常一晚远不到上限）。
+
+    sleep_data 本身有 MAX_SLEEP_DATA_LEN 条数上限，但单条里的 sleep_status /
+    night_events 等由客户端直供、此前无任何上限，30 条各塞满就能把画像撑到几十 MB。
+    保留序列开头（入睡段），超限只告警不报错——这里是兜底，不是业务校验。
+    """
+    for record in profile.sleep_data or []:
+      for fname, cap in UserProfileServ.MAX_SLEEP_RECORD_LIST_LEN.items():
+        values = getattr(record, fname, None)
+        if isinstance(values, list) and len(values) > cap:
+          logging.warning(
+            "sleep_data[ts=%s].%s truncated: %d -> %d",
+            record.timestamp, fname, len(values), cap,
+          )
+          setattr(record, fname, values[:cap])
+
   def save_profile(self, uid: str, profile: UserProfile):
     """将单个用户的画像写入持久化存储；落盘前 revision +1（query_revision 变更探测版本号）。"""
     with self.lock:
+      # sleep_data 落盘不变式：按 timestamp 升序，[-1] 恒为最新一晚。
+      # 读路径（query_profile 的 [-N:]）、_night_window、compute_recent_sleep_stats
+      # 的 [-days:] 全都依赖这条，这里是所有写入路径的唯一收口，兜住工具脚本等旁路。
+      if profile.sleep_data:
+        profile.sleep_data.sort(key=lambda r: r.timestamp)
+      self._cap_sleep_record_lists(profile)
+      self._cap_engagement_containers(profile)
       profile.revision = (profile.revision or 0) + 1
       if self.storage_mode == "leveldb":
         data = json.dumps(self._profile_to_json_data(profile)).encode('utf-8')
@@ -354,6 +434,16 @@ class UserProfileServ:
     except (TypeError, ValueError, OverflowError, OSError):
       return None
 
+  def _health_sample_version(self, profile: UserProfile, key: str, timestamp, fallback_tz) -> int:
+    """登记时区与当前查询时区可以不同；先按登记时区找到样本的实际版本。"""
+    if key in self.HEALTH_V1_DEPRECATED_KEYS - {"sleep_stage_light"}:
+      return 1
+    registered_tz = self._resolve_tz(profile.health_sync_timezone or profile.last_request_timezone,
+                                   warn=False) if (profile.health_sync_timezone or profile.last_request_timezone) else fallback_tz
+    day = self._health_day(timestamp, registered_tz)
+    version = profile.health_sync_field_versions.get(day, {}).get(key, profile.health_sync_days.get(day, 1))
+    return max(1, version)
+
   def _apply_health_schema_update(
     self,
     profile: UserProfile,
@@ -362,49 +452,121 @@ class UserProfileServ:
     timezone: Optional[str],
     purge: bool = True,
   ) -> None:
-    """按本批 behaviors 覆盖的自然日登记口径版本；v2 批次清除当天 v1 废弃 key 的旧样本。
+    """按字段迁移，避免任意 v2 分片清空同日 core 或其他尚未替换的指标。
 
-    版本语义（md §8.4）：某天现存数据的版本，多版本取最低。v2 批次 purge 后该天
-    现存数据只剩 v2，故直接登记本批版本；v1 批次（缺省=1）只登记，不 purge——
-    若该天已有 v2 数据，v1 样本混入后版本回落 1，下次 v2 批次再 purge 收敛。
-
-    purge=False 用于全新画像分支：存量就是本批数据自己，purge 会把本批的
-    sleep_stage_light（同时在 v1 废弃 key 集合里）误清掉。
+    日级版本取现存字段的最低版本；字段级进度防止分批迁移重复清理。
+    light 仅在本字段首次 v1→v2 时替换；已为 v2 时合并增量，并忽略同日 v1
+    light 回传（两版语义不兼容）。改名字段等对应 v2 数据齐备后才移除旧字段。
     """
-    version = health_schema_version if health_schema_version else 1
+    version = health_schema_version or 1
     if version > Config.HEALTH_SCHEMA_VERSION:
-      logging.warning(
-        "health_schema_version %s newer than server-known %s",
-        version, Config.HEALTH_SCHEMA_VERSION,
-      )
+      logging.warning("unknown health_schema_version=%s; keep data without migration", version)
+    known_v2 = version == 2
     tz = self._resolve_tz(timezone)
 
-    days: set[str] = set()
-    for key, values in (new_profile.behaviors or {}).items():
-      if key not in self.HEALTH_BEHAVIOR_KEYS or not isinstance(values, list):
-        continue
-      for item in values:
-        if isinstance(item, (list, tuple)) and item:
-          day = self._health_day(item[0], tz)
+    def sample_day(item):
+      if not isinstance(item, (list, tuple)) or len(item) < 2:
+        return None
+      return self._health_day(item[0], tz)
+
+    def fields_by_day(behaviors):
+      result = {}
+      for key, values in (behaviors or {}).items():
+        if key not in self.HEALTH_BEHAVIOR_KEYS or not isinstance(values, list):
+          continue
+        for item in values:
+          day = sample_day(item)
           if day:
-            days.add(day)
-    if not days:
+            result.setdefault(day, set()).add(key)
+      return result
+
+    # 新建画像没有旧数据；profile 与 new_profile 可能为同一对象，不能自清理。
+    state = {}
+    old_only = self.HEALTH_V1_DEPRECATED_KEYS - {"sleep_stage_light"}
+    if purge:
+      for key in self.HEALTH_BEHAVIOR_KEYS:
+        for item in profile.behaviors.get(key, []):
+          day = sample_day(item)
+          if day:
+            fields = state.setdefault(day, {})
+            old_version = self._health_sample_version(profile, key, item[0], tz)
+            fields[key] = min(fields.get(key, old_version), old_version)
+
+    # 晚到的 v1 light 不得覆盖/混入已经完成迁移的 v2 core。
+    if version == 1 and purge:
+      values = new_profile.behaviors.get("sleep_stage_light", [])
+      kept = [item for item in values if state.get(sample_day(item), {}).get("sleep_stage_light", 1) < 2]
+      if len(kept) != len(values):
+        logging.warning("ignore %d legacy light samples on migrated v2 days", len(values) - len(kept))
+        new_profile.behaviors["sleep_stage_light"] = kept
+    incoming = fields_by_day(new_profile.behaviors)
+    if not incoming:
       return
 
-    if version >= 2 and purge:
-      for key in self.HEALTH_V1_DEPRECATED_KEYS:
-        samples = profile.behaviors.get(key)
-        if not samples:
-          continue
-        kept = [s for s in samples
-                if not (isinstance(s, (list, tuple)) and s and self._health_day(s[0], tz) in days)]
-        removed = len(samples) - len(kept)
-        if removed:
-          logging.info("purge %d v1 samples of %s on days %s (health v2)", removed, key, sorted(days))
-          profile.behaviors[key] = kept
+    def remove_day(key, day):
+      values = profile.behaviors.get(key, [])
+      kept = [item for item in values if sample_day(item) != day or (
+        key == "sleep_stage_light" and self._health_sample_version(profile, key, item[0], tz) >= 2
+      )]
+      removed = len(values) - len(kept)
+      if removed:
+        profile.behaviors[key] = kept
+        logging.info("health migration: removed %d legacy %s samples on %s", removed, key, day)
+      state.get(day, {}).pop(key, None)
 
-    for day in days:
-      profile.health_sync_days[day] = version
+    replacements = {
+      "heart_rate": ({"sleep_heart_rate_min", "sleep_heart_rate_max"},),
+      "heart_rate_variability_sdnn": ({"sleep_heart_rate_variability_sdnn"},),
+      "respiratory_rate": ({"sleep_respiratory_rate"},),
+      "body_temperature": ({"sleep_body_temperature"}, {"sleeping_wrist_temperature"}),
+    }
+    for day, keys in incoming.items():
+      fields = state.setdefault(day, {})
+      if known_v2 and purge and "sleep_stage_light" in keys and fields.get("sleep_stage_light", 2) < 2:
+        remove_day("sleep_stage_light", day)
+      elif known_v2 and purge and "sleep_stage_unspecified" in keys:
+        # v1 light 混入过 unspecified：迁移时按明确重传的起点剔除对应旧样本，
+        # 避免两条轨同时计为 core。未被替换的 v1 light 仍保留并报告版本 1。
+        replaced = {item[0] for item in new_profile.behaviors["sleep_stage_unspecified"] if sample_day(item) == day}
+        values = profile.behaviors.get("sleep_stage_light", [])
+        kept = [item for item in values if item[0] not in replaced or
+                self._health_sample_version(profile, "sleep_stage_light", item[0], tz) >= 2]
+        if len(kept) != len(values):
+          profile.behaviors["sleep_stage_light"] = kept
+          logging.info("health migration: moved %d legacy light samples to unspecified on %s", len(values)-len(kept), day)
+          if not any(sample_day(item) == day for item in kept):
+            fields.pop("sleep_stage_light", None)
+      if known_v2:
+        # deep/rem 等未改语义的旧字段可直接兼容 v2，不需要破坏性清理。
+        for key in fields.keys() - self.HEALTH_V1_DEPRECATED_KEYS:
+          fields[key] = 2
+      for key in keys:
+        if key in old_only:
+          fields[key] = 1  # 改名后的旧字段仍是 v1，不能因信封标 v2 就伪报已迁移。
+        elif known_v2:
+          fields[key] = 2
+        elif version == 1:
+          fields[key] = min(fields.get(key, 1), 1)
+        else:
+          fields[key] = 1  # 未知版本保留数据但不宣称已完成已知迁移。
+      if known_v2 and purge:
+        for old_key, alternatives in replacements.items():
+          # 心率 min/max 可以分包抵达，齐备之前保留全天心率，日级版本维持 1。
+          if old_key in keys:
+            continue
+          if any(group & keys and all(fields.get(key) == 2 for key in group) for group in alternatives):
+            if old_key == "heart_rate":
+              pairs = []
+              for key in ("sleep_heart_rate_min", "sleep_heart_rate_max"):
+                samples = list(profile.behaviors.get(key, [])) + list(new_profile.behaviors.get(key, []))
+                pairs.append({item[0] for item in samples if sample_day(item) == day})
+              if not pairs[0] & pairs[1]:
+                continue  # 必须是同一会话起点的一对 min/max，不是当天任意两个点。
+            remove_day(old_key, day)
+
+    profile.health_sync_field_versions = state
+    profile.health_sync_timezone = str(tz)
+    profile.health_sync_days = {day: min(versions.values()) for day, versions in state.items() if versions}
 
   def backfill_sleep_data_inplace(self, profile: UserProfile) -> dict:
     """存量画像回填（tool/backfill_sleep_data.py 调用）：从 behaviors 合成
@@ -440,7 +602,8 @@ class UserProfileServ:
           continue
         day = self._health_day(item[0], tz)
         if day and start_date <= day <= end_date:
-          days[day] = profile.health_sync_days.get(day, 1)
+          version = self._health_sample_version(profile, key, item[0], tz)
+          days[day] = min(days.get(day, version), version)
     return [
       {"date": day, "health_schema_version": days[day]}
       for day in sorted(days)
@@ -778,6 +941,12 @@ class UserProfileServ:
       value = getattr(new, fname)
       if value is None:
         continue
+      if fname == "avatar_base64" and len(value) > UserProfileServ.MAX_AVATAR_BASE64_LEN:
+        logging.warning(
+          "avatar_base64 rejected: len=%d exceeds limit %d, keeping previous avatar",
+          len(value), UserProfileServ.MAX_AVATAR_BASE64_LEN,
+        )
+        continue
       setattr(merged, fname, value)
     return merged
 
@@ -820,6 +989,7 @@ class UserProfileServ:
     （一晚一对，时间戳同为该晚睡眠会话起点），按会话起点落入当夜窗口配对写入；
     每次 update 幂等重算。v1 的 heart_rate 全天序列不再兜底。
     """
+    from sleep_session_builder import SOURCE_HEALTHKIT
     v2_min = self._hr_pairs_from_points(profile.behaviors.get("sleep_heart_rate_min"))
     v2_max = self._hr_pairs_from_points(profile.behaviors.get("sleep_heart_rate_max"))
     v2_pairs = [(ts, v2_min[ts], v2_max[ts]) for ts in v2_min.keys() & v2_max.keys()]
@@ -834,6 +1004,13 @@ class UserProfileServ:
       if matched:
         record.hr_min = min(mn for mn, _mx in matched)
         record.hr_max = max(mx for _mn, mx in matched)
+        # v2 只传当晚心率 min/max（md §3），没有心率序列，真均值算不出来。
+        # md §9 的周/月视图口径本就是「按晚等权的平均值」，这里用区间中点补上，
+        # 否则 avg_heart_rate 对纯 HealthKit 用户恒为 null，日视图 Vitals 与
+        # compute_recent_sleep_stats → LLM 全都拿不到心率。
+        # ⚠️ 是区间中点，不是时间加权均值；只补服务端合成行，设备上报的真实均值不覆盖。
+        if record.source == SOURCE_HEALTHKIT:
+          record.avg_heart_rate = round((record.hr_min + record.hr_max) / 2, 1)
 
   def _synthesize_sleep_data(self, profile: UserProfile) -> int:
     """从 v2 健康 behaviors 合成每晚 SleepResult（sleep_session_builder，source="healthkit"）。
@@ -871,6 +1048,62 @@ class UserProfileServ:
     profile.sleep_data = sorted(kept, key=lambda r: r.timestamp)[-UserProfileServ.MAX_SLEEP_DATA_LEN:]
     return added
 
+  # 新建画像时允许客户端写入的字段（与合并路径实际采信的字段保持一致）：
+  # 合并路径只动 uid_emb / profile / sleep_health / sleep_mode / behaviors / sleep_data，
+  # long_term_profile 走 _merge_profile（恒返回旧值，即不采信），其余全是服务端独占。
+  CLIENT_OWNED_PROFILE_FIELDS = (
+    "uid_emb", "profile", "sleep_health", "sleep_mode", "behaviors", "sleep_data",
+  )
+
+  @staticmethod
+  def _new_profile_from_client(new_profile: UserProfile) -> UserProfile:
+    """客户端首包 → 新画像：只拷贝 CLIENT_OWNED_PROFILE_FIELDS，其余取服务端默认值。"""
+    profile = UserProfile()
+    dropped = []
+    for fname in type(new_profile).model_fields:
+      if fname in UserProfileServ.CLIENT_OWNED_PROFILE_FIELDS:
+        value = getattr(new_profile, fname)
+        if fname == "uid_emb" and not UserProfileServ._accept_uid_emb(value):
+          continue  # 保留默认空向量
+        if fname == "sleep_data":
+          # 与后续每次更新同一套归一：按 timestamp 升序、同 ts 去重、保留最近 30 晚。
+          # 首包直接照抄客户端数组的话，乱序上报会让「最新一晚」落在数组中间，
+          # 读路径的 [-N:] 就会取错夜。
+          value = UserProfileServ._merge_sleep_data([], value)
+        setattr(profile, fname, value)
+      elif fname in new_profile.model_fields_set:
+        dropped.append(fname)
+    if dropped:
+      logging.warning("new profile: dropped server-owned fields from client payload: %s", dropped)
+    return profile
+
+  def _update_goal_achieved(self, profile: UserProfile) -> None:
+    """按当前生效的睡眠计划回填每晚 goal_achieved（本晚睡眠目标完成度，0-100）。
+
+    口径：TST（sequence_summaries.total_sleep_duration）/ 计划 target_minutes × 100，
+    上限 100。只算落在计划生效窗口 [activated_at, now] 内的夜晚——计划昨天才启用，
+    不该给上个月的夜晚打分；无 active 计划时不动任何记录（保持既有值）。
+
+    设备上报行（source 非 healthkit）若已自带值则保留：设备侧按自己的计划算过。
+    每次 update 幂等重算，计划改目标后旧夜晚会跟着刷新。
+    """
+    from sleep_session_builder import SOURCE_HEALTHKIT
+    plan = active_sleep_plan(profile)
+    if plan is None or plan.activated_at is None:
+      return
+    target = plan.target_minutes
+    now = int(time.time())
+    for record in profile.sleep_data or []:
+      if not (plan.activated_at <= record.timestamp <= now):
+        continue
+      if record.source != SOURCE_HEALTHKIT and record.goal_achieved is not None:
+        continue
+      summ = record.sequence_summaries if record.sleep_status else None
+      if not summ:
+        continue
+      tst = summ.get("total_sleep_duration") or 0
+      record.goal_achieved = round(min(tst / target * 100, 100.0), 1)
+
   def _apply_basic_update(
     self,
     uid: str,
@@ -884,14 +1117,21 @@ class UserProfileServ:
 
     Returns the profile object that should be saved.
     """
+    # 版本登记时区独立保存，切换请求时区不能把已迁移数据重新误认为 v1。
+    if profile is not None and not profile.health_sync_timezone:
+      profile.health_sync_timezone = profile.last_request_timezone or timezone or "UTC"
     # 记录最近请求环境：每日 LLM 触发门的自然日口径 + 分析文案语言
     self._note_request_meta(new_profile, timezone, language)
     if profile is not None:
       self._note_request_meta(profile, timezone, language)
 
     if profile is None:
-      # 新建画像：客户端携带的 revision 一律作废，从 0 起（save 时 +1 变 1）
-      new_profile.revision = 0
+      # 新建画像：只采信客户端自有字段（与合并路径同一张白名单），其余一律取默认值。
+      # 此前这里直接落库整个 new_profile，等于把 analysis_reports / sop_tag_profile /
+      # mindora_record / inbox_messages / sleep_plans 等服务端独占字段在「首次 update」
+      # 这一刻开放给客户端写入，且不过任何条数上限（sleep_plans 还能绕过额度与校验）。
+      # revision 一律作废，从 0 起（save 时 +1 变 1）。
+      new_profile = self._new_profile_from_client(new_profile)
       new_profile.profile = self._merge_personal_profile(None, new_profile.profile)
       self._apply_health_schema_update(new_profile, new_profile, health_schema_version, timezone, purge=False)
       # 新画像也要把本批 plays 的 sop_start 聚合进 mindora_record，
@@ -901,11 +1141,13 @@ class UserProfileServ:
       self._update_best_scene_by_sleep_quality(new_profile)
       self._synthesize_sleep_data(new_profile)
       self._update_night_hr_range(new_profile)
+      self._update_goal_achieved(new_profile)
       rebuild_sop_tag_profile(new_profile)
       return new_profile
 
     # just replace, if need
-    if len(new_profile.uid_emb) > 16 or profile.uid_emb is None or len(profile.uid_emb) == 0:
+    if (len(new_profile.uid_emb) > 16 or profile.uid_emb is None or len(profile.uid_emb) == 0) \
+        and self._accept_uid_emb(new_profile.uid_emb):
       profile.uid_emb = new_profile.uid_emb
 
     profile.profile = self._merge_personal_profile(profile.profile, new_profile.profile)
@@ -929,6 +1171,7 @@ class UserProfileServ:
     self._update_scene_stats(profile)
     self._update_best_scene_by_sleep_quality(profile)
     self._update_night_hr_range(profile)
+    self._update_goal_achieved(profile)
     rebuild_sop_tag_profile(profile)
     return profile
 

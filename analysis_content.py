@@ -27,7 +27,7 @@ from llm.analysis import polish_output_ok as _polish_output_ok
 from user_profile import (
   UserProfile, SleepInsightReport, AnalysisTextReport,
   ANALYSIS_REPORT_KEYS, ANALYSIS_REPORT_RETENTION,
-  compute_recent_sleep_stats,
+  compute_recent_sleep_stats, active_sleep_plan,
 )
 
 
@@ -77,15 +77,31 @@ def _profile_language(profile: UserProfile) -> str:
   return "en"
 
 
+def _active_plan_digest(profile: UserProfile) -> Optional[dict]:
+  """进指纹/进 prompt 的计划摘要：只取影响分析结果的字段。"""
+  plan = active_sleep_plan(profile)
+  if plan is None:
+    legacy = profile.sleep_plan
+    return legacy.model_dump(mode="json") if legacy else None
+  return {
+    "plan_id": plan.plan_id, "kind": plan.kind,
+    "target_minutes": plan.target_minutes,
+    "sleep_time": plan.sleep_time, "wake_time": plan.wake_time,
+    "activated_at": plan.activated_at,
+  }
+
+
 def explore_input_fingerprint(profile: UserProfile, language: str) -> str:
   """Invalidate same-day cached prose when source data or scoring rules change."""
   payload = {
-    "version": "analysis-duration-ceiling-v3",
+    "version": "analysis-builder-onset-v4",
     "language": language,
     "timezone": str(_resolve_tz(profile.last_request_timezone)),
     "sleep_data": [r.model_dump(mode="json") for r in profile.sleep_data],
     "mindora_record": profile.mindora_record,
-    "sleep_plan": profile.sleep_plan.model_dump(mode="json") if profile.sleep_plan else None,
+    # 账号级计划（active 那条）：目标时长变了，goal_achieved 与时长分都会变，
+    # 必须进指纹，否则改目标当天的缓存文案不会刷新
+    "sleep_plan": _active_plan_digest(profile),
   }
   return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 

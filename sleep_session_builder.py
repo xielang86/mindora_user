@@ -14,7 +14,7 @@ SleepResult 行（source="healthkit" 标记）。
     （SleepElement.duration 单位是分钟，behaviors 区间是秒）
   - onset 按 md §6.1：lightsOut = inBed 起点（严格早于会话起点才采用，否则取会话起点），
     终点 = 首次累计睡够 5 分钟（≤1 分钟碎醒不打断）；第一段即睡着 → 不可测（None）；
-    上限 180 分钟
+    上限 240 分钟
   - 得分为派生启发式（本文件底部注明公式）：sleep_quality 由时长/效率/结构加权，
     soe 由 onset 推出，sleep_arch_index 由 deep/rem/core 三阶段均衡度，night_var_index 由觉醒情况
   - hr_min/hr_max 不在这里填：profile_service._update_night_hr_range 按会话起点
@@ -23,6 +23,7 @@ SleepResult 行（source="healthkit" 标记）。
     合成行在同晚行为修正值到达后由重算覆盖（窗口匹配替换，见 profile_service）
 """
 import datetime
+import math
 from typing import Optional
 
 from user_profile import SleepElement, SleepResult
@@ -196,27 +197,33 @@ def _score_sleep_onset_efficiency(onset_min: Optional[float]) -> Optional[float]
   return 1.0
 
 
-def resolve_sleep_onset_efficiency(
-  record: SleepResult,
-  fallback_onset_min: Optional[float] = None,
-) -> Optional[float]:
-  """Return stored SOE or apply the deep-first fallback to a legacy record.
+def resolve_sleep_onset(record: SleepResult) -> Optional[float]:
+  """统一的读路径：优先合成/设备记录的 onset；旧行缺失时复用同一合成算法。
 
-  New HealthKit rows persist SOE during synthesis. This read-only fallback lets
-  /analysis serve existing rows that were created before that behavior.  When
-  the caller has already resolved an onset duration (for example via
-  ``build_sleep_metrics``), use it before the legacy deep-first fallback so the
-  displayed metric and its score cannot disagree.
+  不引入 Home/Day 专属的 15 分钟或个人基线估计。首段 core/rem 且没有更早
+  inBed 时仍未知；首段 deep 保留既有 10 分钟估计。只读，不改写历史记录。
   """
+  if record.onset is not None:
+    return record.onset if math.isfinite(record.onset) and 0 <= record.onset <= _ONSET_CAP_MINUTES else None
+  session = SleepSession()
+  session.intervals = sorted(
+    (x.start_time, x.start_time + round(x.duration * 60), x.sleep_type)
+    for x in record.sleep_status
+    if x.sleep_type in {"awake", "core", "deep", "rem"} and x.start_time > 0
+    and math.isfinite(x.duration) and 0 < x.duration * 60 <= MAX_INTERVAL_SECONDS
+  )
+  if not session.intervals:
+    return None
+  session.in_bed = list(record.in_bed_intervals)
+  onset, _ = _compute_onset(session)
+  return round(onset, 1) if onset is not None else None
+
+
+def resolve_sleep_onset_efficiency(record: SleepResult) -> Optional[float]:
+  """统一读取已保存的 SOE；旧行缺失时用同一 onset 和分段评分公式补算。"""
   if record.soe is not None:
     return record.soe
-  if fallback_onset_min is not None:
-    return _score_sleep_onset_efficiency(fallback_onset_min)
-  first = next(iter(record.sleep_status or []), None)
-  if first is None or first.sleep_type != "deep":
-    return None
-  inferred_light_start = infer_light_sleep_start(first.start_time)
-  return _score_sleep_onset_efficiency((first.start_time - inferred_light_start) / 60.0)
+  return _score_sleep_onset_efficiency(resolve_sleep_onset(record))
 
 
 # Product heuristic, not clinical thresholds. Keep the former 45% deep+REM
