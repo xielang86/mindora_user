@@ -11,6 +11,7 @@ import datetime
 import time
 from typing import Optional
 
+from sleep_session_builder import resolve_sleep_onset
 from sleep_session_builder import resolve_sleep_quality, aggregate_sleep_quality, mean_sleep_duration
 from sleep_metrics import build_sleep_metrics
 from analysis_content import AnalysisContentService
@@ -149,8 +150,8 @@ def _window_avg_onset(profile: Optional[UserProfile], start: str, end: str,
   except ValueError:
     return None
   onsets = [
-    s.onset for s in profile.sleep_data
-    if s.onset is not None
+    value for s in profile.sleep_data
+    if (value := resolve_sleep_onset(s)) is not None
     and start_d <= datetime.datetime.fromtimestamp(s.timestamp, tz).date() <= end_d
   ]
   return int(round(sum(onsets) / len(onsets))) if onsets else None
@@ -527,8 +528,9 @@ def build_explore(d, profile: Optional[UserProfile]) -> dict:
   onset: dict = {"label": "", "description": "", "date": date}
   if soe is not None:
     onset["score"] = int(soe)
-  if latest.onset is not None:
-    onset["onset_minutes"] = int(latest.onset)
+  onset_minutes = resolve_sleep_onset(latest)
+  if onset_minutes is not None:
+    onset["onset_minutes"] = int(onset_minutes)
   if latest.first_sleep_time:
     onset["first_sleep_time"] = latest.first_sleep_time
   if latest.hr_before_sleep is not None:
@@ -544,7 +546,8 @@ def build_explore(d, profile: Optional[UserProfile]) -> dict:
   continuous = _longest_continuous_sleep_minutes(latest.sleep_status)
   if continuous is not None:
     structure["continuous_sleep_minutes"] = continuous
-  tb = summaries.get("time_in_bed") or 0
+  # 阶段占比分母用阶段跨度（sleep_span），不是卧床时长——见 sequence_summaries 注释
+  tb = summaries.get("sleep_span") or 0
   if tb:
     structure["rem_percent"]  = f"{round(summaries.get('rem_sleep_duration', 0) / tb * 100, 1)}%"
     structure["deep_percent"] = f"{round(summaries.get('deep_sleep_duration', 0) / tb * 100, 1)}%"

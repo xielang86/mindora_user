@@ -32,6 +32,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from llm.ark_chat import VolcEngineArkChat
 from llm.router import ModelRouter
 from config import Config
+from sleep_session_builder import resolve_sleep_onset, resolve_sleep_onset_efficiency
 from insight_rules_config import get_insight_rules as _get_insight_rules
 
 
@@ -74,11 +75,11 @@ def extract_sleep_context(profile, data) -> dict:
     latest = profile.sleep_data[-1] if profile.sleep_data else None
     if latest is not None:
         summaries = latest.sequence_summaries if latest.sleep_status else {}
-        tb = summaries.get("time_in_bed") or 0
+        tb = summaries.get("sleep_span") or 0   # 阶段占比分母，见 sequence_summaries
         ctx.update({
             "latest_score":           latest.sleep_quality,
-            "latest_soe":             latest.soe,
-            "latest_onset_min":       latest.onset,
+            "latest_soe":             resolve_sleep_onset_efficiency(latest),
+            "latest_onset_min":       resolve_sleep_onset(latest),
             "latest_sleep_arch":      latest.sleep_arch_index,
             "latest_night_var":       latest.night_var_index,
             "latest_first_sleep_time": latest.first_sleep_time,
@@ -93,6 +94,8 @@ def extract_sleep_context(profile, data) -> dict:
             "latest_awake_count":     summaries.get("night_awake_count"),
             "latest_awake_min":       summaries.get("night_awake_duration"),
             "latest_awake_type":      summaries.get("night_awake_type"),
+            "latest_total_sleep_min": summaries.get("total_sleep_duration"),
+            "latest_goal_achieved":   latest.goal_achieved,
             "latest_deep_pct":        round(summaries.get("deep_sleep_duration", 0) / tb * 100, 1) if tb else None,
             "latest_rem_pct":         round(summaries.get("rem_sleep_duration", 0) / tb * 100, 1) if tb else None,
             "latest_core_pct":        round(summaries.get("core_sleep_duration", 0) / tb * 100, 1) if tb else None,

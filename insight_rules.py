@@ -19,8 +19,9 @@ from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
 from analysis_fallback import _canonical_lang, _nickname
+from sleep_session_builder import resolve_sleep_onset
 from insight_rules_config import get_insight_rules
-from user_profile import UserProfile, SleepResult, short_scene_id
+from user_profile import UserProfile, SleepResult, short_scene_id, active_sleep_plan
 
 
 class _RulesProxy:
@@ -532,9 +533,9 @@ def compute_baselines(profile: UserProfile, tz) -> Baseline:
     latest = nights_7d[-1] if nights_7d else (nights_30d[-1] if nights_30d else None)
     # 基线不含昨晚（昨晚是被比较对象）
     base_nights = [r for r in nights_7d if r is not latest]
-    sol_meas = [r.onset for r in base_nights if r.onset is not None]
+    sol_meas = [v for r in base_nights if (v := resolve_sleep_onset(r)) is not None]
     sol7 = _mean(sol_meas) if len(sol_meas) >= R["data_state"]["baseline7_min_nights"] else None
-    sol30_meas = [r.onset for r in nights_30d if r is not latest and r.onset is not None]
+    sol30_meas = [v for r in nights_30d if r is not latest and (v := resolve_sleep_onset(r)) is not None]
     sol30 = _mean(sol30_meas) if len(sol30_meas) >= R["data_state"]["baseline30_min_nights"] else None
 
     stage7: dict[str, float] = {}
@@ -556,7 +557,7 @@ def compute_baselines(profile: UserProfile, tz) -> Baseline:
     for r in base_nights:
         s = r.sequence_summaries if r.sleep_status else {}
         if s:
-            tst.append((s.get("time_in_bed") or 0) - (s.get("night_awake_duration") or 0))
+            tst.append(s.get("total_sleep_duration") or 0)
             waso.append(s.get("night_awake_duration") or 0)
     return Baseline(
         tz=tz, today=today, latest=latest,
@@ -638,8 +639,8 @@ def scene_night_stats(profile: UserProfile, scene_id: str, *, end_date: datetime
             n += 1
             if r.sleep_quality is not None:
                 scores.append(r.sleep_quality)
-            if r.onset is not None:
-                onsets.append(r.onset)
+            if (onset := resolve_sleep_onset(r)) is not None:
+                onsets.append(onset)
     return {"nights": n, "avg_score": _mean(scores), "avg_sol": _mean(onsets),
             "end_ts": today_ts}
 
@@ -686,12 +687,13 @@ def _vitals_direction(last_val, base_val) -> Optional[tuple[str, str]]:
 
 def rule_onset(profile: UserProfile, base: Baseline, data_state: str, lang: str) -> RuleConclusion:
     latest = base.latest
-    if latest is None or latest.onset is None:
+    onset = resolve_sleep_onset(latest) if latest is not None else None
+    if onset is None:
         text = _t("onset_no_measure", lang)
         return RuleConclusion(key="onset", theme="onset", title=_t("title_onset_facts", lang),
                               text=text, state="facts_only", template_key="onset_no_measure",
                               facts_only=True, valid_nights=1)
-    last_sol = int(round(latest.onset))
+    last_sol = int(onset)
     scene_id = attribute_scene_to_night(profile.mindora_record, latest.timestamp)
     scene_uses = scene_uses_in_window(profile.mindora_record, scene_id, end_ts=latest.timestamp, days=7) if scene_id else 0
     scene_clause = ""
@@ -711,7 +713,7 @@ def rule_onset(profile: UserProfile, base: Baseline, data_state: str, lang: str)
                               valid_nights=len(base.nights_7d),
                               variables={"last_sol": last_sol})
 
-    delta = latest.onset - base.sol7
+    delta = onset - base.sol7
     thr = R["onset"]["delta_stable_min"]
     baseline7 = int(round(base.sol7))
     if delta <= -thr:
@@ -762,7 +764,7 @@ def rule_structure(profile: UserProfile, base: Baseline, data_state: str, lang: 
     # 基线门槛：近 7 日有效夜晚数（不含昨晚做基线的夜晚由 compute_baselines 控制；
     # 这里只要求窗口内总夜晚够门槛且昨晚有阶段数据），与 SOL 是否可测无关
     if len(base.nights_7d) < R["data_state"]["baseline7_min_nights"] or not summ:
-        tst_min = int(round((summ.get("time_in_bed", 0) - summ.get("night_awake_duration", 0)))) if summ else 0
+        tst_min = int(round(summ.get("total_sleep_duration", 0))) if summ else 0
         continuous = _longest_continuous(latest)
         hours, mins = divmod(max(tst_min, 0), 60)
         variables = {"tst": f"{hours}h{mins:02d}m" if hours else f"{mins}m", "continuous": continuous or 0}
@@ -1212,7 +1214,7 @@ def rule_trend(profile: UserProfile, base: Baseline, lang: str, days: int, *,
     max_items = R["trend"]["max_items_7d" if days == 7 else "max_items_30d"]
     title_key = "title_trend7" if days == 7 else "title_trend30"
 
-    if len(cur) < min_valid or not any(r.sleep_status or r.onset is not None for r in cur):
+    if len(cur) < min_valid or not any(r.sleep_status or resolve_sleep_onset(r) is not None for r in cur):
         insufficient = {
             "zh-Hans": f"本周期有 {len(cur)} 条有效睡眠记录，暂不足以判断趋势，继续记录后可进行比较。",
             "zh-Hant": f"本週期有 {len(cur)} 條有效睡眠記錄，暫不足以判斷趨勢，繼續記錄後可進行比較。",
@@ -1228,11 +1230,11 @@ def rule_trend(profile: UserProfile, base: Baseline, lang: str, days: int, *,
         for r in nights:
             s = r.sequence_summaries if r.sleep_status else {}
             if s:
-                tst.append((s.get("time_in_bed") or 0) - (s.get("night_awake_duration") or 0))
+                tst.append(s.get("total_sleep_duration") or 0)
                 waso.append(s.get("night_awake_duration") or 0)
                 awc.append(s.get("night_awake_count") or 0)
-            if r.onset is not None:
-                sol.append(r.onset)
+            if (onset := resolve_sleep_onset(r)) is not None:
+                sol.append(onset)
             if r.first_sleep_time:
                 fst.append(r.first_sleep_time)
         return {"tst": _mean(tst), "sol": _mean(sol), "waso": _mean(waso),
@@ -1244,7 +1246,7 @@ def rule_trend(profile: UserProfile, base: Baseline, lang: str, days: int, *,
 
     # 30d 前一窗口不足 → 分布 + 稳定性描述（规范 :3107）
     if days == 30 and len(prev) < R["trend"]["min_valid_30d"]:
-        mad = _mad([(r.sequence_summaries.get("time_in_bed", 0) - r.sequence_summaries.get("night_awake_duration", 0))
+        mad = _mad([r.sequence_summaries.get("total_sleep_duration", 0)
                     for r in cur if r.sleep_status])
         stability = _t("stability_high" if (mad or 0) < 45 else "stability_low", lang)
         text = _t("trend_dist_30d", lang).format(
@@ -1326,8 +1328,9 @@ def compute_insight_indices(profile: UserProfile, base: Baseline) -> dict:
 
     # 入睡表现：SOL 分 + 入睡前心率/呼吸趋势分（降级口径：昨晚 vs 基线 7 偏差）
     sol_s = hr_s = rr_s = None
-    if latest is not None and latest.onset is not None:
-        sol_s = _clamp(100 - max(0.0, latest.onset - p["sol_full_min"]) * p["sol_penalty_per_min"])
+    onset = resolve_sleep_onset(latest) if latest is not None else None
+    if onset is not None:
+        sol_s = _clamp(100 - max(0.0, onset - p["sol_full_min"]) * p["sol_penalty_per_min"])
         if base.hr_base7:
             dev = abs((latest.hr_before_sleep or base.hr_base7) - base.hr_base7) / base.hr_base7 * 100
             hr_s = _clamp(100 - dev / p["trend_dev_full_pct"] * 100)
@@ -1338,10 +1341,15 @@ def compute_insight_indices(profile: UserProfile, base: Baseline) -> dict:
 
     # 睡眠结构：时长分 + 连续性分 + 阶段稳定分
     dur_s = cont_s = stage_s = None
-    plan = getattr(profile, "sleep_plan", None)
-    target = getattr(plan, "target_duration_min", None) if plan else None
+    # 账号级计划（sleep_plans 里 active 的那条）优先；UserProfile.sleep_plan 是设备端
+    # 老字段、全仓无写入方，恒为 None，只作兼容兜底。没有 target 时时长分不参与打分。
+    plan = active_sleep_plan(profile)
+    target = plan.target_minutes if plan else None
+    if not target:
+      legacy = getattr(profile, "sleep_plan", None)
+      target = getattr(legacy, "target_duration_min", None) if legacy else None
     summ = latest.sequence_summaries if (latest and latest.sleep_status) else {}
-    tst = (summ.get("time_in_bed", 0) - summ.get("night_awake_duration", 0)) if summ else None
+    tst = summ.get("total_sleep_duration", 0) if summ else None
     if tst is not None and target:
         dur_s = _clamp(tst / target * 100)
     waso = summ.get("night_awake_duration") if summ else None

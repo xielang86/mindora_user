@@ -24,6 +24,7 @@ from common.jwt_keys import verify_token
 from profile_service import UserProfileServ
 from user_profile import (
   UserProfile, ProfileRequest, ProfileResponse, ProfileData,
+  ENGAGEMENT_RESPONSE_KEYS, keep_latest_engagement,
   InvalidOrExpiredTokenResp, InvalidReqFormatResp, BaseResponse,
   AnalysisRequest, AnalysisResponse,
   PopupRequest, SurveyRequest, FootprintRequest,
@@ -96,6 +97,22 @@ def save_popup_image(data: bytes) -> tuple[Optional[str], Optional[str]]:
 
 class MembershipLookupError(RuntimeError):
   """无法确认会员权益；不得当作免费用户继续同步。"""
+
+
+def _latest_reports(reports, limit: int):
+  """analysis_reports 单类截尾保留最新 limit 份。
+
+  排序键与写入侧 AnalysisContentService._upsert_analysis_report 完全一致
+  （end_date or date, generated_at）——写入侧已保证顺序，这里再排一次是为了
+  存量数据：盲切 [-N:] 一旦顺序不对就会把旧报告当成最新的返回。
+  """
+  if not isinstance(reports, list) or len(reports) <= limit:
+    return reports
+  ordered = sorted(
+    reports,
+    key=lambda r: (r.get("end_date") or r.get("date") or "", r.get("generated_at") or 0),
+  )
+  return ordered[-limit:]
 
 
 class UserServer:
@@ -241,6 +258,79 @@ class UserServer:
       return data.uid, None
     return None, None
 
+  # -------------------- 画像响应体（query_profile / update_profile 共用） --------------------
+  @staticmethod
+  def _profile_response_body(profile, data: ProfileData, apply_defaults: bool = True) -> dict:
+    """画像 → 响应 dict：注入 sequence_summaries 并按请求开关裁剪体积大头。
+
+    裁剪口径（query_profile 缺省生效）：
+      - sleep_data 限量（0=不携带，缺省 1=只回最近一晚）；顺序与存库/快照一致
+        （timestamp 升序，[-1] 是最新一晚），截尾保留最新 N 条
+      - engagement_count 限量 footprint_days / inbox_messages / popup_states /
+        survey_submissions（各按自己的时间戳截尾保留最新 N 条，缺省 1，0=均不携带）
+      - analysis_reports 每类截尾保留最新 N 份（缺省 1，0=不携带）
+      - include_behaviors=False 时同时去掉 health_sync_days（健康数据对账状态）
+      - include_mindora_record=False 去掉播放历史（behaviors.plays 的服务端聚合态）
+
+    sequence_summaries（各阶段时长/觉醒统计）是 SleepResult 的计算属性，property 不进
+    model_dump，必须手动注入——两个端点都注入，否则客户端拿不到 time_in_bed。
+
+    apply_defaults=False（update_profile 用）：只认客户端显式携带的开关，其余字段
+    全量返回。update_profile 的响应是客户端的本地快照基准（个人资料同步约定 §2/§3），
+    默认裁剪会让老客户端把没回来的 sleep_data / behaviors 当成「服务端没有」而抹掉本地历史。
+    """
+    profile_dict = profile.model_dump()
+    profile_dict.pop("health_sync_field_versions", None)
+    profile_dict.pop("health_sync_timezone", None)
+
+    def _switch(name):
+      """apply_defaults=False 时，客户端没显式传的开关一律按「不裁剪」处理。"""
+      if apply_defaults or name in data.model_fields_set:
+        return getattr(data, name)
+      return None
+
+    count = _switch("sleep_data_count")
+    if count is not None and count <= 0:
+      profile_dict.pop("sleep_data", None)
+    else:
+      # 落盘不变式是按 timestamp 升序（save_profile 收口），这里仍按时间戳再排一次：
+      # 上线前写入的存量行没有这条保证，盲切 [-N:] 会把中间那晚当成最新一晚返回。
+      records = sorted(profile.sleep_data, key=lambda r: r.timestamp)
+      if count is not None and len(records) > count:
+        records = records[-count:]
+      profile_dict["sleep_data"] = [
+        {**r.model_dump(), "sequence_summaries": r.sequence_summaries}
+        for r in records
+      ]
+
+    # 运营/陪伴四件套：画像里只是副本，完整数据走 /footprint、/popup、/survey，
+    # 所以这里缺省只回最新 1 条。各自按自己的时间戳排序后截尾。
+    engagement = _switch("engagement_count")
+    if engagement is not None:
+      for key in ENGAGEMENT_RESPONSE_KEYS:
+        profile_dict[key] = keep_latest_engagement(key, profile_dict.get(key), engagement)
+        if profile_dict[key] is None:
+          profile_dict.pop(key)
+
+    report_count = _switch("analysis_report_count")
+    if report_count is not None:
+      if report_count <= 0:
+        profile_dict.pop("analysis_reports", None)
+      else:
+        reports = profile_dict.get("analysis_reports")
+        if isinstance(reports, dict):
+          profile_dict["analysis_reports"] = {
+            k: _latest_reports(v, report_count) for k, v in reports.items()
+          }
+
+    if _switch("include_behaviors") is False:
+      profile_dict.pop("behaviors", None)
+      profile_dict.pop("health_sync_days", None)
+    # mindora_record 是 behaviors.plays 的服务端聚合态（设备端不展示，回传也不被采信）
+    if _switch("include_mindora_record") is False:
+      profile_dict.pop("mindora_record", None)
+    return profile_dict
+
   # -------------------- /user_profile --------------------
   def handle_query_profile(self, request: ProfileRequest) -> BaseResponse:
     logging.info("handle query_profile request=%s", self._request_for_log(request))
@@ -267,54 +357,7 @@ class UserServer:
     profile = self.user_serv.get_profile(uid)
     if profile:
       logging.info("profile found uid=%s summary=%s", uid, self.user_serv._profile_for_log(profile))
-      profile_dict = profile.model_dump()
-      # 按请求裁剪体积大头：sleep_data 限量（0=不携带，缺省 1=只回最近一晚），
-      # 同一数量同时裁剪 footprint_days / inbox_messages / survey_submissions（保持一致）。
-      # sleep_data 顺序与存库/快照一致（timestamp 升序，[-1] 是最新一晚），截尾保留最新 N 条；
-      # 每条附计算属性 sequence_summaries（各阶段时长/觉醒统计；property 不进 model_dump，需手动注入）。
-      # 不携带 behaviors 时同时去掉 health_sync_days（健康数据对账状态）
-      count = request.data.sleep_data_count
-      if count <= 0:
-        profile_dict.pop("sleep_data", None)
-        profile_dict.pop("footprint_days", None)
-        profile_dict.pop("inbox_messages", None)
-        profile_dict.pop("survey_submissions", None)
-      else:
-        records = profile.sleep_data
-        if len(records) > count:
-          records = records[-count:]
-        profile_dict["sleep_data"] = [
-          {**r.model_dump(), "sequence_summaries": r.sequence_summaries}
-          for r in records
-        ]
-        footprint = profile_dict.get("footprint_days")
-        if isinstance(footprint, dict) and len(footprint) > count:
-          keep_days = sorted(footprint)[-count:]
-          profile_dict["footprint_days"] = {k: footprint[k] for k in keep_days}
-        inbox = profile_dict.get("inbox_messages")
-        if isinstance(inbox, list) and len(inbox) > count:
-          profile_dict["inbox_messages"] = sorted(
-            inbox, key=lambda m: m.get("created_at") or 0)[-count:]
-        surveys = profile_dict.get("survey_submissions")
-        if isinstance(surveys, dict) and len(surveys) > count:
-          keep_ids = sorted(
-            surveys, key=lambda k: (surveys[k] or {}).get("submitted_at") or 0)[-count:]
-          profile_dict["survey_submissions"] = {k: surveys[k] for k in keep_ids}
-      # analysis_reports（LLM 日/周/月/总览文案报告，体积大头）同式限量：
-      # 缺省 1=每类只回最新一份，0=不携带；序列升序、最新在尾，截尾保留最新 N 份
-      report_count = request.data.analysis_report_count
-      if report_count <= 0:
-        profile_dict.pop("analysis_reports", None)
-      else:
-        reports = profile_dict.get("analysis_reports")
-        if isinstance(reports, dict):
-          profile_dict["analysis_reports"] = {
-            k: (v[-report_count:] if isinstance(v, list) and len(v) > report_count else v)
-            for k, v in reports.items()
-          }
-      if not request.data.include_behaviors:
-        profile_dict.pop("behaviors", None)
-        profile_dict.pop("health_sync_days", None)
+      profile_dict = self._profile_response_body(profile, request.data)
       return ProfileResponse(code=0, msg="succ", request_type=request.request_type, data={"user_profile": profile_dict})
     else:
       logging.warning("uid=%s query not found request=%s", uid, self._request_for_log(request))
@@ -422,11 +465,15 @@ class UserServer:
       request.data.skip_sleep_analysis_update,
     )
 
+    # 响应体与 query_profile 共用一套构造：注入 sequence_summaries（计算属性，
+    # 不注入客户端拿不到 time_in_bed 等阶段汇总），裁剪只认客户端显式携带的开关——
+    # 这份快照是客户端的本地基准（个人资料同步约定 §2/§3），默认裁剪会被老客户端
+    # 当成「服务端没有这些数据」而抹掉本地 sleep_data / behaviors 历史。
     return ProfileResponse(
       code=0,
       msg=f"update profile for '{uid}' succ",
       request_type=request.request_type,
-      data={"user_profile": merged.model_dump()} if merged else None,
+      data={"user_profile": self._profile_response_body(merged, request.data, apply_defaults=False)} if merged else None,
     )
 
   # -------------------- 活跃门（醒后预生成的成本闸门） --------------------

@@ -80,9 +80,12 @@ class UserServerClient:
     sleep_data_count: int = 1,
     include_behaviors: bool = True,
     analysis_report_count: int = 1,
+    include_mindora_record: bool = True,
+    engagement_count: int = 1,
   ) -> dict[str, Any]:
     # sleep_data / behaviors / analysis_reports 是画像体积大头；count=0 不携带，N=最近 N 条/份；
-    # 不携带 behaviors 时服务端会同时去掉 health_sync_days
+    # 不携带 behaviors 时服务端会同时去掉 health_sync_days；
+    # include_mindora_record=False 额外去掉播放历史（设备端不展示）
     payload = {
       "request_type": "query_profile",
       "timestamp": int(time.time()),
@@ -92,6 +95,8 @@ class UserServerClient:
         "sleep_data_count": sleep_data_count,
         "include_behaviors": include_behaviors,
         "analysis_report_count": analysis_report_count,
+        "include_mindora_record": include_mindora_record,
+        "engagement_count": engagement_count,
       },
     }
     return self._post("/user_profile", payload)

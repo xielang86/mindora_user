@@ -70,28 +70,15 @@ def _latest_valid_night(sleep_data: list) -> dict:
 
 
 def _effective_soe(record: dict) -> int | None:
-  """Mirror the server's persisted-SOE/deep-first compatibility behavior."""
-  soe = record.get("soe")
-  if soe is not None:
-    return int(soe)
-  first_stage = next(iter(record.get("sleep_status") or []), None)
-  if not isinstance(first_stage, dict) or first_stage.get("sleep_type") != "deep":
-    return None
+  from sleep_session_builder import resolve_sleep_onset_efficiency
+  value = resolve_sleep_onset_efficiency(SleepResult.model_validate(record)) if record else None
+  return int(value) if value is not None else None
 
-  # Keep this fallback aligned with sleep_session_builder:
-  # inferred light-sleep start = first deep-sleep start - 10 minutes.
-  onset_minutes = 10.0
-  if onset_minutes <= 7:
-    score = 100.0
-  elif onset_minutes <= 40:
-    score = 100.0 + (onset_minutes - 7) * (60.0 - 100.0) / (40.0 - 7)
-  elif onset_minutes <= 120:
-    score = 60.0 + (onset_minutes - 40) * (10.0 - 60.0) / (120.0 - 40)
-  elif onset_minutes <= 240:
-    score = 10.0 + (onset_minutes - 120) * (1.0 - 10.0) / (240.0 - 120)
-  else:
-    score = 1.0
-  return int(round(score, 1))
+
+def _effective_onset(record: dict) -> int | None:
+  from sleep_session_builder import resolve_sleep_onset
+  value = resolve_sleep_onset(SleepResult.model_validate(record)) if record else None
+  return int(value) if value is not None else None
 
 
 def _quality(record: dict) -> int | None:
@@ -273,7 +260,7 @@ def run_checks(profile: dict, responses: dict[str, dict], date: str, has_sleep_s
     hr_min, hr_max = latest.get("hr_min"), latest.get("hr_max")
     expected_hr = f"{int(hr_min)}-{int(hr_max)}bpm" if hr_min is not None and hr_max is not None else None
     check_sleep_eq("探索 explore", "night_fluctuation.heart_rate_range", nf.get("heart_rate_range"), expected_hr, "当夜 hr_min/hr_max")
-    check_sleep_eq("探索 explore", "onset_efficiency.onset_minutes", (d.get("onset_efficiency") or {}).get("onset_minutes"), latest.get("onset") and int(latest["onset"]), "当夜 onset")
+    check_sleep_eq("探索 explore", "onset_efficiency.onset_minutes", (d.get("onset_efficiency") or {}).get("onset_minutes"), _effective_onset(latest), "当夜合成器 onset（与 Home/Day 相同）")
     sp = d.get("scene_preference") or {}
     if sp.get("scene_name") is not None or week_top is not None:
       check_sleep_eq("探索 explore", "scene_preference.scene_name", sp.get("scene_name"), week_top, "锚定 7 天使用最多场景")

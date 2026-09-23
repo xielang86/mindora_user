@@ -205,9 +205,31 @@ class SleepResult(BaseModel):
 
   @property
   def sequence_summaries(self):
+    """阶段汇总（分钟）。property 不进 model_dump，响应由 user_server 手动注入。
+
+    三个时长口径不要混用：
+      - ``total_sleep_duration``：总睡眠 TST = 非 awake 段之和。要 TST 一律读这个，
+        别再用 ``time_in_bed - night_awake_duration`` 减出来——time_in_bed 现在可能是
+        真实卧床，减法会把睡前清醒时间算进睡眠里。
+      - ``sleep_span``：阶段序列覆盖的跨度（含觉醒段），阶段占比的分母。
+      - ``time_in_bed``：卧床时长，按健康数据同步接口_0814.md §10「Time In Bed =
+        sleep_in_bed 求和」优先取真实 inBed 样本（``in_bed_intervals``）；
+        没有 inBed 的用户（Apple Watch 不写 inBed，见 §5）退回 sleep_span，
+        由 ``time_in_bed_source`` 标明来源。
+    """
     # 觉醒类型由次数+总时长统计派生（原实现按 sleep_type 取众数，key 恒为 "awake"，恒返回 "awake"）
     awake_count = sum(1 for seq in self.sleep_status if seq.sleep_type == "awake")
     awake_duration = sum(seq.duration for seq in self.sleep_status if seq.sleep_type == "awake")
+    sleep_span = sum(seq.duration for seq in self.sleep_status)
+    total_sleep = sleep_span - awake_duration
+
+    bed_minutes = None
+    if self.in_bed_intervals:
+      bed_minutes = round(
+        sum(max(0, int(end) - int(start)) for start, end in self.in_bed_intervals) / 60.0, 2)
+      # 卧床短于实测睡眠 = 数据自相矛盾（inBed 半截值/时间戳错位），退回阶段跨度
+      if bed_minutes < total_sleep:
+        bed_minutes = None
 
     return {
       "rem_sleep_duration": sum(seq.duration for seq in self.sleep_status if seq.sleep_type == "rem"),
@@ -216,7 +238,10 @@ class SleepResult(BaseModel):
       "night_awake_duration": awake_duration,
       "night_awake_count": awake_count,
       "night_awake_type": _classify_awake_type(awake_count, awake_duration),
-      "time_in_bed": sum(seq.duration for seq in self.sleep_status)
+      "total_sleep_duration": total_sleep,
+      "sleep_span": sleep_span,
+      "time_in_bed": bed_minutes if bed_minutes is not None else sleep_span,
+      "time_in_bed_source": "in_bed" if bed_minutes is not None else "stage_span",
     }
 
 # -------------------------- 睡眠统计辅助 --------------------------
@@ -249,11 +274,12 @@ def compute_recent_sleep_stats(profile: "UserProfile", days: int = 7) -> Dict[st
     nums = [v for v in values if v is not None]
     return round(sum(nums) / len(nums), 1) if nums else None
 
+  from sleep_session_builder import resolve_sleep_onset, resolve_sleep_onset_efficiency
   stats: Dict[str, Any] = {
     "record_count": len(recent),
     "avg_sleep_quality": _avg([r.sleep_quality for r in recent]),
-    "avg_soe": _avg([r.soe for r in recent]),
-    "avg_onset_min": _avg([r.onset for r in recent]),
+    "avg_soe": _avg([resolve_sleep_onset_efficiency(r) for r in recent]),
+    "avg_onset_min": _avg([resolve_sleep_onset(r) for r in recent]),
     "avg_hr_before_sleep": _avg([r.hr_before_sleep for r in recent]),
     "avg_rr_before_sleep": _avg([r.rr_before_sleep for r in recent]),
     "avg_heart_rate": _avg([r.avg_heart_rate for r in recent]),
@@ -269,6 +295,8 @@ def compute_recent_sleep_stats(profile: "UserProfile", days: int = 7) -> Dict[st
 
   # Aggregate stage stats across the week.
   total_time_in_bed = 0.0
+  total_sleep_span = 0.0
+  total_sleep = 0.0
   total_deep = 0.0
   total_core = 0.0
   total_rem = 0.0
@@ -278,6 +306,8 @@ def compute_recent_sleep_stats(profile: "UserProfile", days: int = 7) -> Dict[st
   for record in recent:
     summ = record.sequence_summaries if record.sleep_status else {}
     total_time_in_bed += summ.get("time_in_bed", 0)
+    total_sleep_span += summ.get("sleep_span", 0)
+    total_sleep += summ.get("total_sleep_duration", 0)
     total_deep += summ.get("deep_sleep_duration", 0)
     total_core += summ.get("core_sleep_duration", 0)
     total_rem += summ.get("rem_sleep_duration", 0)
@@ -285,13 +315,16 @@ def compute_recent_sleep_stats(profile: "UserProfile", days: int = 7) -> Dict[st
     total_awake_count += summ.get("night_awake_count", 0)
 
   stats["avg_time_in_bed_min"] = round(total_time_in_bed / len(recent), 1) if recent else 0
+  stats["avg_total_sleep_min"] = round(total_sleep / len(recent), 1) if recent else 0
   stats["avg_deep_min"] = round(total_deep / len(recent), 1) if recent else 0
   stats["avg_core_min"] = round(total_core / len(recent), 1) if recent else 0
   stats["avg_rem_min"] = round(total_rem / len(recent), 1) if recent else 0
   stats["avg_awake_min"] = round(total_awake / len(recent), 1) if recent else 0
   stats["avg_awake_count"] = round(total_awake_count / len(recent), 1) if recent else 0
 
-  denom = total_time_in_bed or 1
+  # 阶段占比的分母是阶段跨度，不是卧床时长——卧床含睡前清醒，拿它做分母会让
+  # 各阶段占比凭空缩水（且有无 inBed 数据的用户口径不一致）
+  denom = total_sleep_span or 1
   stats["avg_deep_pct"] = round(total_deep / denom * 100, 1)
   stats["avg_rem_pct"] = round(total_rem / denom * 100, 1)
   stats["avg_core_pct"] = round(total_core / denom * 100, 1)
@@ -407,6 +440,61 @@ ANALYSIS_REPORT_KEYS = (
   "analysis_overview", "analysis_sleep_day", "analysis_explore",
   "analysis_sleep_week", "analysis_sleep_month",
 )
+# 运营/陪伴四件套：画像里只是副本，完整数据各有专用端点（/footprint、/popup、/survey）。
+# 存储上限（MAX_ENGAGEMENT_LEN）与 query_profile 响应截尾（engagement_count）共用
+# 同一套「最新优先」排序键，避免两边口径打架。
+def active_sleep_plan(profile) -> Optional["SyncedSleepPlan"]:
+  """当前生效的账号级睡眠计划（sleep_plans 里 status=active 的那条，至多 1 条）。
+
+  睡眠计划同步接口.md §6③ 保证同一 uid 至多 1 条 active，且 status != active 时
+  activated_at 必为 null。注意与 UserProfile.sleep_plan（设备端老字段，全仓无写入方）
+  不是一回事——分析链路要读计划，一律走这个函数。
+  """
+  for plan in (getattr(profile, "sleep_plans", None) or []):
+    if not plan.deleted and plan.status == "active" and plan.target_minutes:
+      return plan
+  return None
+
+
+ENGAGEMENT_RESPONSE_KEYS = (
+  "footprint_days", "inbox_messages", "popup_states", "survey_submissions",
+)
+
+
+def engagement_sort_value(key: str, item_key: Any, item: Any):
+  """四件套的新旧判定值；item 可以是 pydantic 模型，也可以是 model_dump 后的 dict。"""
+  def _get(name):
+    return item.get(name) if isinstance(item, dict) else getattr(item, name, None)
+
+  if key == "footprint_days":
+    return item_key or ""          # 键就是 yyyy-MM-dd，字典序即时间序
+  if key == "inbox_messages":
+    return _get("created_at") or 0
+  if key == "survey_submissions":
+    return _get("submitted_at") or 0
+  return _get("last_impression_at") or 0   # popup_states：没曝光过的最先被挤掉
+
+
+def keep_latest_engagement(key: str, container: Any, limit: int):
+  """按 key 的时间戳截尾保留最新 limit 条；limit<=0 返回 None（调用方据此整体丢弃）。
+
+  dict（footprint_days / survey_submissions / popup_states）与 list（inbox_messages）
+  两种形态都支持，返回同形态。
+  """
+  if limit <= 0:
+    return None
+  if isinstance(container, dict):
+    if len(container) <= limit:
+      return container
+    keep = sorted(container, key=lambda k: engagement_sort_value(key, k, container[k]))[-limit:]
+    return {k: container[k] for k in keep}
+  if isinstance(container, list):
+    if len(container) <= limit:
+      return container
+    return sorted(container, key=lambda it: engagement_sort_value(key, None, it))[-limit:]
+  return container
+
+
 ANALYSIS_REPORT_RETENTION = {
   "analysis_overview": 30,
   "analysis_sleep_day": 30,
@@ -567,10 +655,6 @@ class UserProfile(BaseModel):
   sleep_plans: List[SyncedSleepPlan] = Field(default_factory=list, description="账号级睡眠计划全量（含 deleted 墓碑）")
   sleep_plans_synced_at: Optional[int] = Field(None, description="最近一次计划同步的 server_time（秒）")
 
-  # App 端账号级睡眠计划（睡眠计划同步接口.md；服务端为唯一事实源，含墓碑记录）
-  sleep_plans: List[SyncedSleepPlan] = Field(default_factory=list, description="账号级睡眠计划全量（含 deleted 墓碑）")
-  sleep_plans_synced_at: Optional[int] = Field(None, description="最近一次计划同步的 server_time（秒）")
-
   # 洞察页 6 模块 LLM 分析结果（mindora_advice.md 模块0-5）
   sleep_insight: Optional[SleepInsightReport] = Field(None, description="洞察页6模块睡眠分析结果")
 
@@ -639,6 +723,10 @@ class UserProfile(BaseModel):
   # update_profile 时按请求 timezone 把 behaviors 时间戳归日写入；缺省/老数据按 1 处理。
   # 对账接口 query_health_sync_state 据此回答版本，"有哪些天"则按 behaviors 实际数据现算。
   health_sync_days: Dict[str, int] = Field(default_factory=dict)
+  # 服务端内部迁移进度：自然日 → 字段 → 口径版本。日级版本不足以区分分批迁移。
+  # 不接收客户端覆盖，不在 query/update_profile 响应中返回。
+  health_sync_field_versions: Dict[str, Dict[str, int]] = Field(default_factory=dict)
+  health_sync_timezone: Optional[str] = Field(None, description="内部版本登记使用的时区")
 
   # 画像变更版本号：服务端维护、单调递增，每次 save_profile 落盘前 +1（谁改的都会
   # 触发：App update、设备 update、后台 LLM 写回、读路径补缺）。设备端用
@@ -740,15 +828,23 @@ class ProfileData(BaseModel):
   )
   # query_profile 响应裁剪开关：sleep_data 和 behaviors 是画像的体积大头。
   # sleep_data_count：0=不携带 sleep_data；缺省 1=只回最近一晚；N=最近 N 晚。
-  # 同一数量同时裁剪 footprint_days / inbox_messages / survey_submissions（保持一致，
-  # 截尾保留最新 N 条；0 时三者也不携带）。返回的每条 sleep_data 附计算属性
-  # sequence_summaries（各阶段时长/觉醒统计）。
+  # 返回的每条 sleep_data 附计算属性 sequence_summaries（各阶段时长/觉醒统计）。
   # 旧布尔字段 include_sleep_data 由 before-validator 映射（false→0 / true→全部 30 晚）
-  sleep_data_count: int = Field(1, ge=0, description="query_profile 响应携带最近 N 晚 sleep_data（附 sequence_summaries），并同量裁剪 footprint_days/inbox_messages/survey_submissions；0=均不携带，缺省 1")
+  sleep_data_count: int = Field(1, ge=0, description="query_profile 响应携带最近 N 晚 sleep_data（附 sequence_summaries）；0=不携带，缺省 1")
   include_behaviors: bool = Field(True, description="query_profile 响应是否携带 behaviors，默认 True；为 False 时同时剔除 health_sync_days")
+  # mindora_record（场景/纯音乐播放历史，每个 cmd 最多 MAX_BEHAVIOR_LEN 条）是纯服务端
+  # 派生字段（由 behaviors.plays 的 sop_start 聚合而来，合并路径从不采信客户端回传值），
+  # 设备端只展示 sleep_analysis.recent_scene/most_used_scene，不需要原始历史。
+  include_mindora_record: bool = Field(True, description="query_profile 响应是否携带 mindora_record，默认 True；设备端可传 False 省流量")
   # analysis_reports（LLM 生成的日/周/月/总览文案报告）同式限量：各序列升序、最新在尾，
   # 截尾保留最新 N 份；缺省 1=每类只回最新一份；0=不携带 analysis_reports
   analysis_report_count: int = Field(1, ge=0, description="query_profile 响应中 analysis_reports 每类(day/week/month/overview/explore)携带最近 N 份报告，缺省 1；0=不携带")
+  # 运营/陪伴四件套（弹窗状态、站内消息、问卷提交、陪伴足迹）同式限量，各自独立按
+  # 自己的时间戳截尾保留最新 N 条：footprint_days 按日期键、inbox_messages 按 created_at、
+  # survey_submissions 按 submitted_at、popup_states 按 last_impression_at。
+  # 这四个在画像里只是副本，完整数据各有专用端点（/footprint、/popup、/survey），
+  # 所以缺省只回 1 条；0=四者均不携带。
+  engagement_count: int = Field(1, ge=0, description="query_profile 响应中 footprint_days/inbox_messages/popup_states/survey_submissions 各携带最近 N 条，缺省 1；0=均不携带")
 
   @model_validator(mode="before")
   @classmethod

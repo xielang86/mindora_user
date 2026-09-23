@@ -266,7 +266,7 @@ def _sleep_analysis_summary(profile: UserProfile, lang: str) -> str:
                 parts.append(f"onset={base.latest.onset:.0f}min")
             summ = base.latest.sequence_summaries if base.latest.sleep_status else {}
             if summ:
-                tst = (summ.get("time_in_bed") or 0) - (summ.get("night_awake_duration") or 0)
+                tst = summ.get("total_sleep_duration") or 0
                 parts.append(f"TST={tst:.0f}min")
                 parts.append(f"WASO={summ.get('night_awake_duration', 0):.0f}min")
                 parts.append(f"awakenings={summ.get('night_awake_count', 0)}")
