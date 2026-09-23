@@ -335,8 +335,7 @@ def build_sleep_day(d, profile: Optional[UserProfile]) -> dict:
 
   # 顶部为入睡效率（SOE），不是 sleep_quality；缺失时由客户端显示 --。
   from sleep_session_builder import resolve_sleep_onset_efficiency
-  metric_onset = metrics.get("sleep_onset_minutes") if metrics else None
-  soe = resolve_sleep_onset_efficiency(latest, metric_onset) if latest else None
+  soe = resolve_sleep_onset_efficiency(latest) if latest else None
   if soe is not None:
     result["score_summary"] = {"score": int(soe), "date": date}
 
@@ -506,15 +505,13 @@ def build_explore(d, profile: Optional[UserProfile]) -> dict:
   date = datetime.datetime.fromtimestamp(latest.timestamp, tz).date().isoformat()
   start = (datetime.date.fromisoformat(date) - datetime.timedelta(days=6)).isoformat()
   result: dict = {"data_ready": True}
-  metrics = build_sleep_metrics(latest, profile, tz)
 
   # 顶部摘要：纯文案（LLM 报告覆盖）
   result["header_summary"] = {"intro_text": "", "intro_detail_text": "", "date": date}
 
   # 顶部总分环：总分=当夜得分；三段分值 = soe / sleep_arch_index / night_var_index（缺哪个省哪个）
   from sleep_session_builder import resolve_sleep_onset_efficiency, resolve_sleep_structure_score
-  metric_onset = metrics.get("sleep_onset_minutes") if metrics else None
-  soe = resolve_sleep_onset_efficiency(latest, metric_onset)
+  soe = resolve_sleep_onset_efficiency(latest)
   structure_score = resolve_sleep_structure_score(latest)
   score_summary: dict = {"title": _localize("Sleep Score", d.language), "date": date}
   if latest.sleep_quality is not None:
