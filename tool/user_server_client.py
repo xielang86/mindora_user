@@ -82,6 +82,8 @@ class UserServerClient:
     analysis_report_count: int = 1,
     include_mindora_record: bool = True,
     engagement_count: int = 1,
+    include_sop_tag_profile: bool = False,
+    include_sop_recommendation_details: bool = False,
   ) -> dict[str, Any]:
     # sleep_data / behaviors / analysis_reports 是画像体积大头；count=0 不携带，N=最近 N 条/份；
     # 不携带 behaviors 时服务端会同时去掉 health_sync_days；
@@ -97,6 +99,8 @@ class UserServerClient:
         "analysis_report_count": analysis_report_count,
         "include_mindora_record": include_mindora_record,
         "engagement_count": engagement_count,
+        "include_sop_tag_profile": include_sop_tag_profile,
+        "include_sop_recommendation_details": include_sop_recommendation_details,
       },
     }
     return self._post("/user_profile", payload)
@@ -387,6 +391,8 @@ def build_parser() -> argparse.ArgumentParser:
   parser.add_argument("--timezone", default=DEFAULT_TIMEZONE)
   parser.add_argument("--device-id", default="cli-plan-query", help="睡眠计划查询的设备标识")
   parser.add_argument("--last-sync-at", type=int, default=None, help="睡眠计划上次同步的 Unix 秒时间戳（可选）")
+  parser.add_argument("--include-sop-tag-profile", action="store_true", help="query_profile 返回 SOP 标签画像")
+  parser.add_argument("--include-sop-recommendation-details", action="store_true", help="query_profile 返回 SOP 推荐详情")
   parser.add_argument("--focus", nargs="*", default=None)
   parser.add_argument("--modules", nargs="*", default=None)
   parser.add_argument("--skip-sleep-scenarios-reco-update", action="store_const", const=True, default=None,
@@ -414,7 +420,10 @@ def main():
   elif args.action == "login":
     result = client.login_with_jwt()
   elif args.action == "query_profile":
-    result = client.query_profile()
+    result = client.query_profile(
+      include_sop_tag_profile=args.include_sop_tag_profile,
+      include_sop_recommendation_details=args.include_sop_recommendation_details,
+    )
   elif args.action == "query_user_rights":
     result = client.query_user_rights()
   elif args.action == "query_plans":

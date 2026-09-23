@@ -271,6 +271,7 @@ class UserServer:
       - analysis_reports 每类截尾保留最新 N 份（缺省 1，0=不携带）
       - include_behaviors=False 时同时去掉 health_sync_days（健康数据对账状态）
       - include_mindora_record=False 去掉播放历史（behaviors.plays 的服务端聚合态）
+      - SOP 标签画像及推荐详情默认不携带，各自 include 开关为 True 时返回
 
     sequence_summaries（各阶段时长/觉醒统计）是 SleepResult 的计算属性，property 不进
     model_dump，必须手动注入——两个端点都注入，否则客户端拿不到 time_in_bed。
@@ -329,6 +330,9 @@ class UserServer:
     # mindora_record 是 behaviors.plays 的服务端聚合态（设备端不展示，回传也不被采信）
     if _switch("include_mindora_record") is False:
       profile_dict.pop("mindora_record", None)
+    for key in ("sop_tag_profile", "sop_recommendation_details"):
+      if _switch(f"include_{key}") is False:
+        profile_dict.pop(key, None)
     return profile_dict
 
   # -------------------- /user_profile --------------------

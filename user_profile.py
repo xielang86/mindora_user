@@ -832,6 +832,8 @@ class ProfileData(BaseModel):
   # 旧布尔字段 include_sleep_data 由 before-validator 映射（false→0 / true→全部 30 晚）
   sleep_data_count: int = Field(1, ge=0, description="query_profile 响应携带最近 N 晚 sleep_data（附 sequence_summaries）；0=不携带，缺省 1")
   include_behaviors: bool = Field(True, description="query_profile 响应是否携带 behaviors，默认 True；为 False 时同时剔除 health_sync_days")
+  include_sop_tag_profile: bool = Field(False, description="query_profile 响应是否携带 sop_tag_profile，默认 False")
+  include_sop_recommendation_details: bool = Field(False, description="query_profile 响应是否携带 sop_recommendation_details，默认 False")
   # mindora_record（场景/纯音乐播放历史，每个 cmd 最多 MAX_BEHAVIOR_LEN 条）是纯服务端
   # 派生字段（由 behaviors.plays 的 sop_start 聚合而来，合并路径从不采信客户端回传值），
   # 设备端只展示 sleep_analysis.recent_scene/most_used_scene，不需要原始历史。

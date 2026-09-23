@@ -10,7 +10,7 @@
   python tool/dump_analysis.py --jwt-token <token> --base-url http://127.0.0.1:9001
 
 输出目录（默认 out_analysis/<uid>_<ts>/）：
-  query_profile.json        完整画像（含 LLM 结果 sleep_insight / analysis_reports）
+  query_profile.json        画像（含 LLM 结果，SOP 标签画像/推荐详情需显式开启 include 开关）
   analysis_<type>.json      5 个 /analysis 响应（与 app 同参数）
   CHECK_REPORT.md           逐屏对照表 + 自动对账结果
 
@@ -328,6 +328,8 @@ def main():
   parser.add_argument("--date", default=datetime.date.today().isoformat(), help="与 app 展示日期保持一致")
   parser.add_argument("--language", default="zh-Hans")
   parser.add_argument("--timezone", default="Asia/Shanghai")
+  parser.add_argument("--include-sop-tag-profile", action="store_true", help="query_profile 返回 SOP 标签画像")
+  parser.add_argument("--include-sop-recommendation-details", action="store_true", help="query_profile 返回 SOP 推荐详情")
   parser.add_argument("--out", default=None)
   parser.add_argument("--include-sleep-data", action="store_true",
                       help="[已废弃] 现在默认就拉取 sleep_data，保留仅为兼容旧用法")
@@ -355,6 +357,8 @@ def main():
   print(f"target: {base_url}  uid={uid}  date={args.date}")
   profile_resp = _unwrap(client.query_profile(
     sleep_data_count=args.sleep_data_count, include_behaviors=False,
+    include_sop_tag_profile=args.include_sop_tag_profile,
+    include_sop_recommendation_details=args.include_sop_recommendation_details,
   ))
   profile = ((profile_resp.get("data") or {}).get("user_profile")) or {}
   (out_dir / "query_profile.json").write_text(json.dumps(profile_resp, ensure_ascii=False, indent=2))
