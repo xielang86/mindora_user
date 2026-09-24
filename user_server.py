@@ -280,6 +280,7 @@ class UserServer:
     全量返回。update_profile 的响应是客户端的本地快照基准（个人资料同步约定 §2/§3），
     默认裁剪会让老客户端把没回来的 sleep_data / behaviors 当成「服务端没有」而抹掉本地历史。
     """
+    from sleep_session_builder import resolve_sleep_onset, resolve_sleep_onset_efficiency
     profile_dict = profile.model_dump()
     profile_dict.pop("health_sync_field_versions", None)
     profile_dict.pop("health_sync_timezone", None)
@@ -300,7 +301,8 @@ class UserServer:
       if count is not None and len(records) > count:
         records = records[-count:]
       profile_dict["sleep_data"] = [
-        {**r.model_dump(), "sequence_summaries": r.sequence_summaries}
+        {**r.model_dump(), "onset": resolve_sleep_onset(r),
+         "soe": resolve_sleep_onset_efficiency(r), "sequence_summaries": r.sequence_summaries}
         for r in records
       ]
 

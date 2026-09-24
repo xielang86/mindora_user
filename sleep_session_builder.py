@@ -13,10 +13,10 @@ SleepResult 行（source="healthkit" 标记）。
   - 阶段映射：deep→deep / rem→rem / light→core / unspecified→core / awake→awake
     （SleepElement.duration 单位是分钟，behaviors 区间是秒）
   - onset 按 md §6.1：lightsOut = inBed 起点（严格早于会话起点才采用，否则取会话起点），
-    终点 = 首次累计睡够 5 分钟（≤1 分钟碎醒不打断）；第一段即睡着 → 不可测（None）；
+    终点 = 首次累计睡够 5 分钟（≤1 分钟碎醒不打断）；第一段即睡着 → 统一估计 10 分钟；
     上限 240 分钟
   - 得分为派生启发式（本文件底部注明公式）：sleep_quality 由时长/效率/结构加权，
-    soe 由 onset 推出，sleep_arch_index 由 deep/rem/core 三阶段均衡度，night_var_index 由觉醒情况
+    soe 由 onset 基础分和早期睡眠稳定性推出，sleep_arch_index 由 deep/rem/core 三阶段均衡度，night_var_index 由觉醒情况
   - hr_min/hr_max 不在这里填：profile_service._update_night_hr_range 按会话起点
     配对 v2 的 sleep_heart_rate_min/max 写入
   - 设备（Mindora）上报的 SleepResult 优先：会话窗口内已有非合成行则跳过该晚；
@@ -119,7 +119,7 @@ def derive_sessions(behaviors: dict) -> list[SleepSession]:
 
 
 def infer_light_sleep_start(deep_start: int) -> int:
-  """Temporary fallback for an unobserved light-sleep onset before deep sleep.
+  """Shared fallback when the first observed stage is already asleep.
 
   This deliberately has its own seam so a future per-user model can replace
   the fixed estimate without changing the onset/SOE calculation.
@@ -135,13 +135,10 @@ def _compute_onset(session: SleepSession) -> tuple[Optional[float], int]:
     if first_in_bed < session.start:  # 严格早于才采用；等于会话起点的包络写法弃用
       lights_out = first_in_bed
 
-  # 第一段就是睡着：通常无法知道何时入睡。首段为深睡时，
-  # 临时推断其前 10 分钟为浅睡开始，并将这段距离作为入睡耗时代理。
-  if session.intervals[0][2] != "awake" and lights_out >= session.start:
-    if session.intervals[0][2] == "deep":
-      inferred_light_start = infer_light_sleep_start(session.start)
-      return (session.start - inferred_light_start) / 60.0, inferred_light_start
-    return None, lights_out
+  # 首段 core/deep/rem 均视为已入睡；缺少更早卧床参照时统一用 10 分钟代理。
+  if session.intervals[0][2] in {"core", "deep", "rem"} and lights_out >= session.start:
+    inferred_start = infer_light_sleep_start(session.start)
+    return (session.start - inferred_start) / 60.0, inferred_start
 
   acc = 0.0
   endpoint: Optional[int] = None
@@ -200,8 +197,8 @@ def _score_sleep_onset_efficiency(onset_min: Optional[float]) -> Optional[float]
 def resolve_sleep_onset(record: SleepResult) -> Optional[float]:
   """统一的读路径：优先合成/设备记录的 onset；旧行缺失时复用同一合成算法。
 
-  不引入 Home/Day 专属的 15 分钟或个人基线估计。首段 core/rem 且没有更早
-  inBed 时仍未知；首段 deep 保留既有 10 分钟估计。只读，不改写历史记录。
+  不引入 Home/Day 专属的 15 分钟或个人基线估计。首段 core/deep/rem 且没有更早
+  inBed 时统一采用 10 分钟估计。只读，不改写历史记录。
   """
   if record.onset is not None:
     return record.onset if math.isfinite(record.onset) and 0 <= record.onset <= _ONSET_CAP_MINUTES else None
@@ -219,8 +216,55 @@ def resolve_sleep_onset(record: SleepResult) -> Optional[float]:
   return round(onset, 1) if onset is not None else None
 
 
+def _score_onset_with_stability(onset, intervals):
+  """产品启发式：入睡基础分 × 早期稳定系数；缺测空隙不当作清醒。
+
+  从首次睡眠起至少看 30 分钟，延伸至首段连续 >=10 分钟深睡的开始，
+  最多 60 分钟。清醒每分钟扣 2 点、每次 >1 分钟清醒扣 3 点，
+  首次睡着 5 分钟内出现 >1 分钟清醒额外扣 5 点，最多扣 50 点。
+  """
+  base = _score_sleep_onset_efficiency(onset)
+  if base is None:
+    return None
+  rows = [(a, b, t) for a, b, t in intervals
+          if t in {"awake", "core", "deep", "rem"} and a > 0 and b > a
+          and b-a <= MAX_INTERVAL_SECONDS]
+  asleep = [a for a, b, t in rows if t != "awake"]
+  if not asleep:
+    return base
+  start = min(asleep)
+  limit = start + 60 * 60
+  rows = [(max(a, start), min(b, limit), t) for a,b,t in rows if a < limit and b > start]
+  # 分割并归并重叠/相邻记录，避免重复清醒被重复扣分；清醒冲突优先。
+  points = sorted({v for a,b,t in rows for v in (a,b)})
+  timeline = []
+  for a,b in zip(points, points[1:]):
+    types = {t for x,y,t in rows if x < b and y > a}
+    if not types:
+      continue
+    stage = "awake" if "awake" in types else "deep" if types == {"deep"} else "sleep"
+    if timeline and timeline[-1][2] == stage and a-timeline[-1][1] <= 1:
+      timeline[-1] = (timeline[-1][0], b, stage)
+    else:
+      timeline.append((a,b,stage))
+  deep_start = next((a for a,b,t in timeline if t == "deep" and b-a >= 600), limit)
+  stop = min(limit, max(start+1800, deep_start))
+  wakes = [(a,min(b,stop)) for a,b,t in timeline if t == "awake" and a < stop]
+  awake_minutes = sum(b-a for a,b in wakes)/60
+  significant = [(a,b) for a,b in wakes if b-a > 60]
+  early = any(a-start < 300 for a,b in significant)
+  penalty = min(50, 2*awake_minutes + 3*len(significant) + (5 if early else 0))
+  return round(max(1, base * (1-penalty/100)), 1)
+
+
 def resolve_sleep_onset_efficiency(record: SleepResult) -> Optional[float]:
-  """统一读取已保存的 SOE；旧行缺失时用同一 onset 和分段评分公式补算。"""
+  """有阶段序列时统一重算，避免旧 SOE 绕过稳定性规则；仅得分记录保留原值。"""
+  intervals = [(x.start_time, x.start_time + round(x.duration*60), x.sleep_type)
+               for x in record.sleep_status if math.isfinite(x.duration)
+               and x.start_time > 0 and 0 < x.duration*60 <= MAX_INTERVAL_SECONDS
+               and x.sleep_type in {"awake", "core", "deep", "rem"}]
+  if intervals:
+    return _score_onset_with_stability(resolve_sleep_onset(record), intervals)
   if record.soe is not None:
     return record.soe
   return _score_sleep_onset_efficiency(resolve_sleep_onset(record))
@@ -334,7 +378,7 @@ def build_sleep_result(session: SleepSession, behaviors: dict, tz: datetime.tzin
 
   # SOE（入睡效率）：7 分钟内满分；7→40 分钟 100→60；
   # 40→120 分钟 60→10；120→240 分钟 10→1，分段线性。
-  soe = _score_sleep_onset_efficiency(onset_min)
+  soe = _score_onset_with_stability(onset_min, session.intervals)
 
   # night_var_index（夜间波动分）：觉醒次数与觉醒时长占比罚分
   span_sec = asleep_sec + awake_sec

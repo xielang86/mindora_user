@@ -94,7 +94,7 @@ def _active_plan_digest(profile: UserProfile) -> Optional[dict]:
 def explore_input_fingerprint(profile: UserProfile, language: str) -> str:
   """Invalidate same-day cached prose when source data or scoring rules change."""
   payload = {
-    "version": "analysis-builder-onset-v4",
+    "version": "analysis-builder-onset-stability-v6",
     "language": language,
     "timezone": str(_resolve_tz(profile.last_request_timezone)),
     "sleep_data": [r.model_dump(mode="json") for r in profile.sleep_data],
