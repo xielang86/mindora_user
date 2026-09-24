@@ -28,6 +28,7 @@ from user_profile import (
   InvalidOrExpiredTokenResp, InvalidReqFormatResp, BaseResponse,
   AnalysisRequest, AnalysisResponse,
   PopupRequest, SurveyRequest, FootprintRequest,
+  bedtime_advice_due,
 )
 from auth import AuthRequest, AuthData
 from ops_config import append_popup, save_survey
@@ -569,13 +570,16 @@ class UserServer:
         logging.info("skip auto llm for uid=%s: inactive (no /analysis or plays in window)", uid)
         auto_needed = False
 
+    # 睡前建议独立按七天检查；即使本次没有新的睡眠夜晚，也可单独调度。
+    run_advice = bool(profile is not None and bedtime_advice_due(profile)
+                      and getattr(self, "llm", None) and self.llm.enabled)
     run_reco = skip_reco is False or (auto_needed and skip_reco is not True)
     run_analysis = skip_analysis is False or (auto_needed and skip_analysis is not True)
-    if not (run_reco or run_analysis):
+    if not (run_reco or run_analysis or run_advice):
       return
 
     forced = skip_reco is False or skip_analysis is False
-    delay = 0 if forced else Config.LLM_ANALYSIS_DEBOUNCE_SECONDS
+    delay = 0 if forced or (run_advice and not auto_needed) else Config.LLM_ANALYSIS_DEBOUNCE_SECONDS
     if auto_needed and newest_ts is not None:
       self._llm_last_attempt[uid] = newest_ts
     await self._schedule_llm_update_if_needed(uid, not run_reco, not run_analysis, delay=delay)

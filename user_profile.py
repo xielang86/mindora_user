@@ -418,6 +418,23 @@ class SleepInsightReport(BaseModel):
     description="模块5｜轻量睡眠知识提示（Micro Education，可选）",
   )
 
+
+class BedtimeAdvice(BaseModel):
+  """画像中的睡前建议；生成时间用于七天更新间隔。"""
+  content: str = Field(..., description="睡前可执行建议")
+  language: str = Field("en", description="建议语言代码")
+  generated_at: int = Field(..., description="生成时间戳（秒级）")
+
+
+BEDTIME_ADVICE_INTERVAL_SECONDS = 7 * 86400
+
+
+def bedtime_advice_due(profile: "UserProfile", now: Optional[int] = None) -> bool:
+  advice = getattr(profile, "bedtime_advice", None) if profile else None
+  if advice is None or not advice.content.strip() or not advice.generated_at:
+    return True
+  return (int(time.time()) if now is None else now) - advice.generated_at >= BEDTIME_ADVICE_INTERVAL_SECONDS
+
 # -------------------------- /analysis 文案报告（LLM 异步生成，按周期序列存储） --------------------------
 class AnalysisTextReport(BaseModel):
   """单个周期（日/周/月）的 /analysis 文案报告。
@@ -657,6 +674,7 @@ class UserProfile(BaseModel):
 
   # 洞察页 6 模块 LLM 分析结果（mindora_advice.md 模块0-5）
   sleep_insight: Optional[SleepInsightReport] = Field(None, description="洞察页6模块睡眠分析结果")
+  bedtime_advice: Optional[BedtimeAdvice] = Field(None, description="LLM 生成的睡前建议；缺失或生成满七天后更新")
 
   # /analysis 文案报告序列（LLM 异步生成；日级保留30、周10、月12，见 ANALYSIS_REPORT_RETENTION）
   analysis_reports: Dict[str, List[AnalysisTextReport]] = Field(

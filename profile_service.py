@@ -34,6 +34,7 @@ from llm import SleepAnalysisLLM
 from user_profile import (
   UserProfile, SleepScenario, Profile, SCENE_CMD_PREFIXES, short_scene_id,
   ENGAGEMENT_RESPONSE_KEYS, keep_latest_engagement, active_sleep_plan,
+  bedtime_advice_due,
 )
 from sop_tag_profile import rebuild_sop_tag_profile
 
@@ -1203,6 +1204,9 @@ class UserProfileServ:
       analysis_reports = self.calc_analysis_reports(uid, profile)
       if analysis_reports is not None:
         profile.analysis_reports = analysis_reports
+    bedtime_advice = self.content.calc_bedtime_advice(uid, profile)
+    if bedtime_advice is not None:
+      profile.bedtime_advice = bedtime_advice
 
   def update_profile(
     self,
@@ -1308,6 +1312,7 @@ class UserProfileServ:
     else:
       sleep_insight = self.calc_sleep_insight(uid, llm_profile)
       analysis_reports = self.calc_analysis_reports(uid, llm_profile)
+    bedtime_advice = self.content.calc_bedtime_advice(uid, llm_profile)
 
     with self.lock:
       profile = self.get_profile(uid)
@@ -1326,6 +1331,8 @@ class UserProfileServ:
         profile.sleep_insight = sleep_insight
       if analysis_reports is not None:
         profile.analysis_reports = analysis_reports
+      if bedtime_advice is not None and bedtime_advice_due(profile):
+        profile.bedtime_advice = bedtime_advice
       self.save_profile(uid, profile)
       logging.info("Profile llm updated uid=%s", uid)
       return True

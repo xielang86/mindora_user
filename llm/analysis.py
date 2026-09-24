@@ -494,6 +494,23 @@ Return ONLY a JSON object (no markdown, no explanation) with exactly these six m
 }}"""
 
 
+def _prompt_bedtime_advice(ctx: dict) -> str:
+    return f"""{_lang_instruction(ctx.get('language', 'en'))}
+
+Write one practical bedtime suggestion for the coming week, based only on the available information below.
+- Nights with sleep data in the last 7 days: {ctx.get('record_count', 0)}
+- Typical bedtime: {ctx.get('typical_bed_time', 'unknown')}
+- Typical first sleep time: {ctx.get('typical_first_sleep_time', 'unknown')}
+- Average sleep onset: {ctx.get('avg_onset_min', 'unknown')} minutes
+- Average sleep quality: {ctx.get('avg_sleep_quality', 'unknown')} / 100
+- Most used sleep scene: {ctx.get('weekly_top_scene_title', 'unknown')}
+- User's improvement goal: {ctx.get('improvement_goal', 'unknown')}
+- Preferred sleep-mode start time: {ctx.get('sleep_mode_start_time', 'unknown')}
+
+Give a specific, gentle action the user can try before bed. If data is sparse, use a general bedtime habit and do not claim a personal pattern. Do not diagnose, prescribe treatment, or promise results. Keep it to one or two short sentences.
+Return ONLY JSON: {{"content": "<bedtime suggestion>"}}"""
+
+
 # ──────────────────────────────────────────────────────────────
 # SleepAnalysisLLM
 # ──────────────────────────────────────────────────────────────
@@ -617,6 +634,7 @@ class SleepAnalysisLLM:
             "analysis_sleep_month":    lambda: _prompt_sleep_month(ctx),
             "analysis_explore":        lambda: _prompt_explore(ctx, modules),
             "sleep_insight_report":    lambda: _prompt_sleep_insight(ctx),
+            "bedtime_advice":         lambda: _prompt_bedtime_advice(ctx),
             "sleep_insight_polish":    lambda: _prompt_conclusion_polish(ctx),
             "insight_polish":          lambda: _prompt_conclusion_polish(ctx),
         }.get(request_type)
@@ -665,6 +683,7 @@ class SleepAnalysisLLM:
             "analysis_sleep_month":    lambda: _prompt_sleep_month(ctx),
             "analysis_explore":        lambda: _prompt_explore(ctx, modules),
             "sleep_insight_report":    lambda: _prompt_sleep_insight(ctx),
+            "bedtime_advice":         lambda: _prompt_bedtime_advice(ctx),
             "sleep_insight_polish":    lambda: _prompt_conclusion_polish(ctx),
             "insight_polish":          lambda: _prompt_conclusion_polish(ctx),
         }.get(request_type)

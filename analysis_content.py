@@ -25,7 +25,7 @@ from analysis_fallback import (
 from llm import extract_sleep_context
 from llm.analysis import polish_output_ok as _polish_output_ok
 from user_profile import (
-  UserProfile, SleepInsightReport, AnalysisTextReport,
+  UserProfile, SleepInsightReport, AnalysisTextReport, BedtimeAdvice, bedtime_advice_due,
   ANALYSIS_REPORT_KEYS, ANALYSIS_REPORT_RETENTION,
   compute_recent_sleep_stats, active_sleep_plan,
 )
@@ -114,6 +114,35 @@ class AnalysisContentService:
   @property
   def llm(self):
     return self._get_llm()
+
+  def calc_bedtime_advice(self, uid: str, profile: UserProfile) -> Optional[BedtimeAdvice]:
+    """Generate one advice item when absent or at least seven days old."""
+    if not bedtime_advice_due(profile) or not self.llm or not self.llm.enabled:
+      return None
+    language = _profile_language(profile)
+
+    class _AdviceData:
+      date = ""
+      start_date = ""
+      end_date = ""
+
+    data = _AdviceData()
+    data.language = language
+    ctx = extract_sleep_context(profile, data)
+    if profile.sleep_health and profile.sleep_health.improvement_goal:
+      ctx["improvement_goal"] = profile.sleep_health.improvement_goal
+    if profile.sleep_mode and profile.sleep_mode.start_time:
+      ctx["sleep_mode_start_time"] = profile.sleep_mode.start_time
+    try:
+      result = self.llm.generate_sync("bedtime_advice", ctx, language, [])
+    except Exception as e:
+      logging.error("bedtime advice generation failed for uid=%s: %s", uid, e)
+      return None
+    content = result.get("content") if isinstance(result, dict) else None
+    if not isinstance(content, str) or not content.strip() or len(content) > 500:
+      logging.warning("bedtime advice rejected for uid=%s: empty or invalid content", uid)
+      return None
+    return BedtimeAdvice(content=content.strip(), language=language, generated_at=int(time.time()))
 
   _INSIGHT_MODULE_KEYS = [
     ("greeting", 0),
