@@ -18,7 +18,7 @@ from aiohttp import ClientSession, web
 
 import analysis_builders
 import profile_query_gate
-from analysis_content import AnalysisContentService
+from analysis_content import AnalysisContentService, explore_input_fingerprint
 from config import Config
 from common.jwt_keys import verify_token
 from profile_service import UserProfileServ
@@ -540,6 +540,8 @@ class UserServer:
     if latest_report is None:
       return True, newest_ts
     if newest_night > latest_report.date:
+      return True, newest_ts
+    if latest_report.input_fingerprint != explore_input_fingerprint(profile, latest_report.language):
       return True, newest_ts
     if not latest_report.llm_used:
       return True, newest_ts

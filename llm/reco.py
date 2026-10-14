@@ -260,8 +260,10 @@ def _sleep_analysis_summary(profile: UserProfile, lang: str) -> str:
         )
         if base.latest is not None:
             parts = []
-            if base.latest.sleep_quality is not None:
-                parts.append(f"score={base.latest.sleep_quality:.0f}/100")
+            from analysis_score import daily_score
+            scored = daily_score(base.latest, profile)
+            if scored is not None:
+                parts.append(f"score={scored['score']}/100 ({scored['score_version']})")
             if base.latest.onset is not None:
                 parts.append(f"onset={base.latest.onset:.0f}min")
             summ = base.latest.sequence_summaries if base.latest.sleep_status else {}
@@ -282,7 +284,7 @@ def _sleep_analysis_summary(profile: UserProfile, lang: str) -> str:
             lines.append("scene usage last 7d: " + ", ".join(f"{s}×{n}" for s, n in top))
         sa = profile.sleep_analysis or {}
         best = sa.get("best_sleep_quality_scene_7d")
-        if best:
+        if best and best.get("score_version"):
             lines.append(
                 f"best associated scene 7d: {best.get('scene_name')} "
                 f"(avg score {best.get('avg_sleep_quality')}, {best.get('nights')} nights)"

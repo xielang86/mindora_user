@@ -112,7 +112,7 @@ class Config:
   # 这是内置默认值：运营可在不部署代码的情况下，通过运营平台上传
   # data/insight_rules.json 覆盖任意子项（按 key 深度合并，见 insight_rules_config.py，
   # 可用 INSIGHT_RULES_CONFIG_PATH 环境变量改文件路径），热加载无需重启。
-  # AN_SCORE 综合评分 v1 公式不采纳（不动现有 sleep_quality 计算），故无此项。
+  # AN_SCORE 使用 analysis_score.py 的版本化产品分；旧 sleep_quality 仅保留历史兼容。
   INSIGHT_RULES_DEFAULT = {
     # AN_DATA_STATE：数据状态机门槛
     "data_state": {"baseline7_min_nights": 4, "baseline30_min_nights": 15},

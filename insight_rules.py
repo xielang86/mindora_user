@@ -20,6 +20,8 @@ from zoneinfo import ZoneInfo
 
 from analysis_fallback import _canonical_lang, _nickname
 from sleep_session_builder import resolve_sleep_onset
+from sleep_metrics import build_sleep_metrics, has_unspecified_stage
+from analysis_score import daily_score, effective_sleep_plan
 from insight_rules_config import get_insight_rules
 from user_profile import UserProfile, SleepResult, short_scene_id, active_sleep_plan
 
@@ -602,7 +604,7 @@ def scene_uses_in_window(mindora_record: dict, scene_id: str, *, end_ts: int, da
     for entry in (mindora_record or {}).get(scene_id) or []:
         if isinstance(entry, (list, tuple)) and entry:
             try:
-                if int(entry[0]) >= cutoff:
+                if cutoff <= int(entry[0]) <= end_ts:
                     count += 1
             except (TypeError, ValueError):
                 continue
@@ -617,7 +619,7 @@ def top_scenes_in_window(mindora_record: dict, *, end_ts: int, days: int, limit:
         for entry in records or []:
             if isinstance(entry, (list, tuple)) and entry:
                 try:
-                    if int(entry[0]) >= cutoff:
+                    if cutoff <= int(entry[0]) <= end_ts:
                         n += 1
                 except (TypeError, ValueError):
                     continue
@@ -637,11 +639,12 @@ def scene_night_stats(profile: UserProfile, scene_id: str, *, end_date: datetime
         s = attribute_scene_to_night(profile.mindora_record, r.timestamp)
         if s and short_scene_id(s) == short:
             n += 1
-            if r.sleep_quality is not None:
-                scores.append(r.sleep_quality)
+            scored = daily_score(r, profile)
+            if scored is not None:
+                scores.append(scored["score"])
             if (onset := resolve_sleep_onset(r)) is not None:
                 onsets.append(onset)
-    return {"nights": n, "avg_score": _mean(scores), "avg_sol": _mean(onsets),
+    return {"nights": n, "scored_nights": len(scores), "avg_score": _mean(scores), "avg_sol": _mean(onsets),
             "end_ts": today_ts}
 
 
@@ -687,13 +690,32 @@ def _vitals_direction(last_val, base_val) -> Optional[tuple[str, str]]:
 
 def rule_onset(profile: UserProfile, base: Baseline, data_state: str, lang: str) -> RuleConclusion:
     latest = base.latest
-    onset = resolve_sleep_onset(latest) if latest is not None else None
+    from sleep_metrics import build_sleep_metrics
+    provenance = build_sleep_metrics(latest, profile, base.tz) if latest is not None else None
+    onset = (provenance or {}).get("sleep_onset_minutes")
     if onset is None:
         text = _t("onset_no_measure", lang)
         return RuleConclusion(key="onset", theme="onset", title=_t("title_onset_facts", lang),
                               text=text, state="facts_only", template_key="onset_no_measure",
                               facts_only=True, valid_nights=1)
     last_sol = int(onset)
+    provenance = provenance or {}
+    if provenance.get("sleep_onset_source") in ("estimated", "mindora_play"):
+        if provenance["sleep_onset_source"] == "mindora_play":
+            text = {
+                "zh-Hans": f"从最近一次 Mindora 播放到首次睡眠阶段约 {last_sol} 分钟，可作为上床到入睡时长的估算。",
+                "zh-Hant": f"從最近一次 Mindora 播放到首次睡眠階段約 {last_sol} 分鐘，可作為上床到入睡時長的估算。",
+                "en": f"About {last_sol} minutes passed between the latest Mindora playback and the first sleep stage; this estimates time to sleep.",
+            }.get(_canonical_lang(lang), f"About {last_sol} minutes passed between playback and the first sleep stage.")
+        else:
+            text = {
+                "zh-Hans": f"昨晚入睡用时约 {last_sol} 分钟，依据首次睡眠阶段起点估算；暂不与实测入睡用时比较。",
+                "zh-Hant": f"昨晚入睡用時約 {last_sol} 分鐘，依據首次睡眠階段起點估算；暫不與實測入睡用時比較。",
+                "en": f"Sleep onset was estimated at about {last_sol} minutes from the first sleep stage; it is not compared with measured onset times.",
+            }.get(_canonical_lang(lang), f"Sleep onset was estimated at about {last_sol} minutes from the first sleep stage.")
+        return RuleConclusion(key="onset", theme="onset", title=_t("title_onset_facts", lang),
+                              text=text, state="facts_only", facts_only=True,
+                              valid_nights=len(base.nights_7d), variables={"last_sol": last_sol})
     scene_id = attribute_scene_to_night(profile.mindora_record, latest.timestamp)
     scene_uses = scene_uses_in_window(profile.mindora_record, scene_id, end_ts=latest.timestamp, days=7) if scene_id else 0
     scene_clause = ""
@@ -760,6 +782,16 @@ def rule_structure(profile: UserProfile, base: Baseline, data_state: str, lang: 
     if latest is None:
         return RuleConclusion(key="architecture", theme="structure", title=_t("title_structure_facts", lang),
                               text="", visible=False, state="facts_only", facts_only=True)
+    from sleep_metrics import has_unspecified_stage
+    if has_unspecified_stage(latest, profile):
+        text = {
+            "zh-Hans": "昨晚包含未分期睡眠，暂不对核心、深睡和 REM 的占比作结构判断。",
+            "zh-Hant": "昨晚包含未分期睡眠，暫不對核心、深睡和 REM 的佔比作結構判斷。",
+            "en": "This night contains unclassified sleep, so stage proportions are not classified as a structure change.",
+        }.get(_canonical_lang(lang), "This night contains unclassified sleep, so stage proportions are not classified as a structure change.")
+        return RuleConclusion(key="architecture", theme="structure", title=_t("title_structure_facts", lang),
+                              text=text, state="facts_only", facts_only=True,
+                              valid_nights=len(base.nights_7d))
     summ = latest.sequence_summaries if latest.sleep_status else {}
     # 基线门槛：近 7 日有效夜晚数（不含昨晚做基线的夜晚由 compute_baselines 控制；
     # 这里只要求窗口内总夜晚够门槛且昨晚有阶段数据），与 SOL 是否可测无关
@@ -913,7 +945,7 @@ def rule_scene(profile: UserProfile, base: Baseline, data_state: str, lang: str)
     name = scene_display_name(scene_id)
     uses_7d = scene_uses_in_window(profile.mindora_record, scene_id, end_ts=latest.timestamp, days=7)
     stats = scene_night_stats(profile, scene_id, end_date=base.today, days=7, tz=base.tz)
-    assoc_ok = stats["nights"] >= R["scene"]["assoc_min_uses_7d"] and stats["avg_score"] is not None
+    assoc_ok = stats["scored_nights"] >= R["scene"]["assoc_min_uses_7d"]
 
     segments = [_t("scene_facts", lang).format(scene=name)]
     stype = scene_type_label(scene_id, lang)
@@ -983,6 +1015,13 @@ def build_sleep_day_modules(profile: UserProfile, base: Baseline, lang: str) -> 
             {"stage": stage_names[stage].get(canonical, stage_names[stage]["en"]),
              "minutes": int(round(summ.get(duration_key) or 0))},
             lang, "")
+    from sleep_metrics import has_unspecified_stage
+    if has_unspecified_stage(latest, profile):
+        stage_descriptions["core"] = {
+            "zh-Hans": "这晚含未分期睡眠，暂不单独解读核心睡眠时长。",
+            "zh-Hant": "這晚含未分期睡眠，暫不單獨解讀核心睡眠時長。",
+            "en": "This night includes unclassified sleep; core sleep duration is not interpreted separately.",
+        }.get(canonical, "This night includes unclassified sleep; core sleep duration is not interpreted separately.")
     return {
         "sleep_scenarios": {"title": scene_display_name(scene_id) if scene_id else "",
                             "description": scene_description},
@@ -1320,22 +1359,27 @@ def _clamp(v: float, lo: float = 0.0, hi: float = 100.0) -> float:
 
 
 def compute_insight_indices(profile: UserProfile, base: Baseline) -> dict:
-    """三个展示指数（建议 v1 公式，权重/常量在 config.INSIGHT_RULES['indices']）。
-    缺失子分按剩余权重归一；全部缺失返回 None。不动现有 sleep_quality 总分。"""
+    """三个展示指数；缺失子分按剩余权重归一，缺失全部返回 None。"""
     p = R["indices"]["subscore_params"]
     latest = base.latest
     sub: dict[str, Optional[float]] = {}
 
     # 入睡表现：SOL 分 + 入睡前心率/呼吸趋势分（降级口径：昨晚 vs 基线 7 偏差）
     sol_s = hr_s = rr_s = None
-    onset = resolve_sleep_onset(latest) if latest is not None else None
+    onset_metrics = build_sleep_metrics(latest, profile, base.tz) if latest is not None else None
+    onset_source = (onset_metrics or {}).get("sleep_onset_source")
+    onset = (onset_metrics or {}).get("sleep_onset_minutes")
     if onset is not None:
         sol_s = _clamp(100 - max(0.0, onset - p["sol_full_min"]) * p["sol_penalty_per_min"])
-        if base.hr_base7:
-            dev = abs((latest.hr_before_sleep or base.hr_base7) - base.hr_base7) / base.hr_base7 * 100
+        if onset_source == "estimated":
+            sol_s = min(sol_s, 85)
+        elif onset_source in {"mindora_play", "reported"}:
+            sol_s = min(sol_s, 95)
+        if base.hr_base7 and latest.hr_before_sleep is not None:
+            dev = abs(latest.hr_before_sleep - base.hr_base7) / base.hr_base7 * 100
             hr_s = _clamp(100 - dev / p["trend_dev_full_pct"] * 100)
-        if base.rr_base7:
-            dev = abs((latest.rr_before_sleep or base.rr_base7) - base.rr_base7) / base.rr_base7 * 100
+        if base.rr_base7 and latest.rr_before_sleep is not None:
+            dev = abs(latest.rr_before_sleep - base.rr_base7) / base.rr_base7 * 100
             rr_s = _clamp(100 - dev / p["trend_dev_full_pct"] * 100)
     sub["onset"] = {"sol": sol_s, "hr_trend": hr_s, "rr_trend": rr_s}
 
@@ -1343,21 +1387,20 @@ def compute_insight_indices(profile: UserProfile, base: Baseline) -> dict:
     dur_s = cont_s = stage_s = None
     # 账号级计划（sleep_plans 里 active 的那条）优先；UserProfile.sleep_plan 是设备端
     # 老字段、全仓无写入方，恒为 None，只作兼容兜底。没有 target 时时长分不参与打分。
-    plan = active_sleep_plan(profile)
-    target = plan.target_minutes if plan else None
-    if not target:
-      legacy = getattr(profile, "sleep_plan", None)
-      target = getattr(legacy, "target_duration_min", None) if legacy else None
+    plan = effective_sleep_plan(profile, min(s.start_time for s in latest.sleep_status)) if latest is not None and latest.sleep_status else None
+    target = getattr(plan, "target_minutes", None) or getattr(plan, "target_duration_min", None)
     summ = latest.sequence_summaries if (latest and latest.sleep_status) else {}
     tst = summ.get("total_sleep_duration", 0) if summ else None
     if tst is not None and target:
-        dur_s = _clamp(tst / target * 100)
+        dur_s = _clamp(100 - abs(tst - target) / 1.5)
     waso = summ.get("night_awake_duration") if summ else None
     awc = summ.get("night_awake_count") if summ else None
     if waso is not None and awc is not None:
         cont_s = _clamp(100 - waso * p["waso_penalty_per_min"] - p["awake_extra_penalty"] * max(awc - 1, 0))
     deltas = []
-    if latest is not None and summ:
+    prior_nights = len([r for r in base.nights_7d if r is not latest])
+    if (latest is not None and summ and not has_unspecified_stage(latest, profile)
+        and prior_nights >= R["data_state"]["baseline7_min_nights"]):
         for stage, base_mean in base.stage7.items():
             if base_mean:
                 key = {"rem": "rem_sleep_duration", "core": "core_sleep_duration",

@@ -93,11 +93,13 @@ def _active_plan_digest(profile: UserProfile) -> Optional[dict]:
 
 def explore_input_fingerprint(profile: UserProfile, language: str) -> str:
   """Invalidate same-day cached prose when source data or scoring rules change."""
+  from analysis_score import SCORE_VERSION, INDEX_VERSION
   payload = {
-    "version": "analysis-builder-onset-stability-v6",
+    "version": ["analysis-v3-score-and-provenance-v2", SCORE_VERSION, INDEX_VERSION],
     "language": language,
     "timezone": str(_resolve_tz(profile.last_request_timezone)),
     "sleep_data": [r.model_dump(mode="json") for r in profile.sleep_data],
+    "behaviors": profile.behaviors,
     "mindora_record": profile.mindora_record,
     # 账号级计划（active 那条）：目标时长变了，goal_achieved 与时长分都会变，
     # 必须进指纹，否则改目标当天的缓存文案不会刷新
@@ -245,8 +247,8 @@ class AnalysisContentService:
             continue
           if m.get("title"):
             module.title = m["title"]
-          if m.get("content"):
-            module.content = m["content"]
+          if m.get("text"):
+            module.content = m["text"]
         report.llm_used = True
       elif llm_result:
         logging.info(f"sleep_insight polish rejected by validator for uid={uid}, keeping rule text")
@@ -349,7 +351,7 @@ class AnalysisContentService:
     for report in reversed(profile.analysis_reports.get(request_type, []) or []):
       if report.start_date != start or report.end_date != end or report.language != language:
         continue
-      if report.input_fingerprint and report.input_fingerprint != fingerprint:
+      if report.input_fingerprint != fingerprint:
         continue
       for key, fields in modules.items():
         values = report.modules.get(key)
@@ -503,8 +505,7 @@ class AnalysisContentService:
       # 规则模板报告（llm_used=False）不算——下次周期自然重算并尝试 LLM 润色
       current = _current_report(request_type, start_date, end_date, date)
       if current is not None and current.llm_used and current.language == language \
-          and (request_type not in {"analysis_explore", "analysis_sleep_week", "analysis_sleep_month"} or
-               current.input_fingerprint == explore_input_fingerprint(profile, language)):
+          and current.input_fingerprint == explore_input_fingerprint(profile, language):
         continue
 
       rule_conclusions, rule_modules = _rule_group(request_type)
@@ -531,6 +532,7 @@ class AnalysisContentService:
         report = AnalysisTextReport(
           request_type=request_type, date=date, start_date=start_date, end_date=end_date,
           language=language, generated_at=now, llm_used=True, modules=llm_result,
+          input_fingerprint=explore_input_fingerprint(profile, language),
         )
         reports[request_type] = self._upsert_analysis_report(
           reports[request_type], report, ANALYSIS_REPORT_RETENTION[request_type])
@@ -541,7 +543,7 @@ class AnalysisContentService:
       report = AnalysisTextReport(
         request_type=request_type, date=date, start_date=start_date, end_date=end_date,
         language=language, generated_at=now, llm_used=False, modules=rule_modules,
-        input_fingerprint=explore_input_fingerprint(profile, language) if request_type in {"analysis_explore", "analysis_sleep_week", "analysis_sleep_month"} else None,
+        input_fingerprint=explore_input_fingerprint(profile, language),
       )
 
       # ── LLM 润色（可选）：只重写文本字段，校验失败保留模板 ──
@@ -653,7 +655,11 @@ class AnalysisContentService:
     today = ir.anchor_date(profile, tz)
 
     def _fresh(r: AnalysisTextReport) -> bool:
-      return AnalysisContentService._report_window_fresh(request_type, r, today)
+      if not AnalysisContentService._report_window_fresh(request_type, r, today):
+        return False
+      if profile.sleep_data and r.input_fingerprint != explore_input_fingerprint(profile, r.language):
+        return False
+      return True
 
     for r in reversed(reports):
       if start_date is not None or end_date is not None:
@@ -713,7 +719,10 @@ class AnalysisContentService:
     import insight_rules as ir  # 延迟 import 避免顶层循环依赖
     tz = _resolve_tz(getattr(profile, "last_request_timezone", None))
     today = ir.anchor_date(profile, tz)
-    if profile.sleep_data and report.date != today.isoformat():
+    language = _profile_language(profile)
+    if profile.sleep_data and (report.date != today.isoformat() or
+                               report.language != language or
+                               report.input_fingerprint != explore_input_fingerprint(profile, language)):
       # 后台报告尚未更新：用当前画像生成同一夜的规则文案，不调用 LLM、不修改库存。
       current_profile = profile.model_copy(update={"sleep_insight": None})
       report = AnalysisContentService(lambda: None).calc_sleep_insight("", current_profile)

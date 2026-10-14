@@ -27,6 +27,7 @@ except ImportError:
   plyvel = None
 
 from analysis_content import AnalysisContentService
+from analysis_score import SCORE_VERSION, daily_score
 from common import util
 from config import Config
 from engagement_service import EngagementService
@@ -664,7 +665,8 @@ class UserProfileServ:
     ``days`` days are counted. 窗口终点默认当前时刻；读路径传 ``end_ts``
     锚定最近有效夜（与 analysis_builders 的 anchor 口径一致）。
     """
-    cutoff_ts = (int(end_ts) if end_ts else int(time.time())) - days * 86400 if days else 0
+    window_end = int(end_ts) if end_ts is not None else int(time.time())
+    cutoff_ts = window_end - days * 86400 if days else 0
     stats: dict[str, dict] = {}
     for scene_id, records in (mindora_record or {}).items():
       if not isinstance(records, list) or not records:
@@ -677,7 +679,7 @@ class UserProfileServ:
             ts = int(entry[0])
           except (TypeError, ValueError):
             continue
-          if ts < cutoff_ts:
+          if ts < cutoff_ts or ts > window_end:
             continue
           count += 1
           if len(entry) >= 2 and entry[1] is not None:
@@ -770,7 +772,7 @@ class UserProfileServ:
 
   @staticmethod
   def _pick_best_sleep_quality_scene(profile: UserProfile, days: int = 7) -> Optional[dict]:
-    """Return the scene whose usage before sleep produced the highest avg sleep_quality.
+    """Return the scene with the highest average displayable Mindora score.
 
     For each sleep night in the last ``days`` days:
       - Look at scene usages within USAGE_SLEEP_LOOKBACK_SEC before the sleep
@@ -779,7 +781,7 @@ class UserProfileServ:
         ~15:00–18:30, an observed gap of ~12.7–16 h).
       - Pick the scene usage closest to (but not after) the record timestamp
         as the "effective" scene for that night.
-      - Attribute that night's sleep_quality to that scene.
+      - Attribute that night's versioned product score to that scene.
 
     Note: first_sleep_time is NOT used for alignment — in real data it is None
     for most records, which previously caused every night to be skipped and
@@ -817,14 +819,15 @@ class UserProfileServ:
     if not usages:
       return None
 
-    # Attribute sleep_quality to the effective scene per night.
+    # Attribute only displayable product scores to the effective scene.
     # 不按记录条数切片（一晚可能多条记录，条数切片会缩短实际天数窗口），
     # 窗口完全由上面的 cutoff_ts（自然时间）控制
     scene_qualities: dict[str, list[float]] = {}
     for record in profile.sleep_data:
       if record.timestamp < cutoff_ts:
         continue
-      if record.sleep_quality is None:
+      scored = daily_score(record, profile)
+      if scored is None:
         continue
 
       # Pick the scene usage closest to (but not after) the record timestamp,
@@ -842,8 +845,11 @@ class UserProfileServ:
       if best_usage is None:
         continue
 
-      scene_qualities.setdefault(best_usage["scene_id"], []).append(record.sleep_quality)
+      scene_qualities.setdefault(best_usage["scene_id"], []).append(scored["score"])
 
+    # A single associated night is a usage observation, not a best-effect scene.
+    scene_qualities = {scene_id: values for scene_id, values in scene_qualities.items()
+                       if len(values) >= 2}
     if not scene_qualities:
       return None
 
@@ -865,6 +871,7 @@ class UserProfileServ:
       "scene_id": best_scene_id,
       "scene_name": scene_name,
       "avg_sleep_quality": avg_quality,
+      "score_version": SCORE_VERSION,
       "nights": len(qualities),
       "updated_at": now_ts,
     }

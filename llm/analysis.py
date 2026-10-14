@@ -20,6 +20,7 @@ Usage (from user_server.py):
 """
 
 import asyncio
+import datetime
 import json
 import logging
 import os
@@ -32,7 +33,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from llm.ark_chat import VolcEngineArkChat
 from llm.router import ModelRouter
 from config import Config
-from sleep_session_builder import resolve_sleep_onset, resolve_sleep_onset_efficiency
+from sleep_session_builder import resolve_sleep_onset
 from insight_rules_config import get_insight_rules as _get_insight_rules
 
 
@@ -70,6 +71,27 @@ def extract_sleep_context(profile, data) -> dict:
     # Locally computed 7-day sleep statistics (no raw sequences).
     stats = compute_recent_sleep_stats(profile, days=7)
     ctx.update(stats)
+    # Raw sleep_quality is a historical heuristic. Prompts must describe the
+    # same versioned product score that /analysis can actually display.
+    from analysis_score import daily_score, period_score
+    from zoneinfo import ZoneInfo
+    try:
+        tz = ZoneInfo(getattr(data, "timezone", None) or profile.last_request_timezone or "UTC")
+    except (KeyError, ValueError):
+        tz = datetime.timezone.utc
+    scored_nights = sorted(profile.sleep_data, key=lambda r: r.timestamp)
+    anchor = scored_nights[-1].timestamp if scored_nights else None
+    if anchor is not None:
+        def _period(days):
+            nights = [r for r in scored_nights if 0 <= anchor - r.timestamp < days * 86400]
+            return period_score(nights, profile)
+        weekly = _period(7)
+        monthly = _period(30)
+        ctx["avg_sleep_quality"] = weekly["score"] if weekly else None
+        ctx["avg_sleep_score_30d"] = monthly["score"] if monthly else None
+    else:
+        ctx["avg_sleep_quality"] = None
+        ctx["avg_sleep_score_30d"] = None
 
     # 当夜明细（sleep_data 最后一条）——日视图 / 探索页的 prompt 需要夜级数据。
     latest = profile.sleep_data[-1] if profile.sleep_data else None
@@ -77,11 +99,8 @@ def extract_sleep_context(profile, data) -> dict:
         summaries = latest.sequence_summaries if latest.sleep_status else {}
         tb = summaries.get("sleep_span") or 0   # 阶段占比分母，见 sequence_summaries
         ctx.update({
-            "latest_score":           latest.sleep_quality,
-            "latest_soe":             resolve_sleep_onset_efficiency(latest),
+            "latest_score":           (daily_score(latest, profile) or {}).get("score"),
             "latest_onset_min":       resolve_sleep_onset(latest),
-            "latest_sleep_arch":      latest.sleep_arch_index,
-            "latest_night_var":       latest.night_var_index,
             "latest_first_sleep_time": latest.first_sleep_time,
             "latest_hr_before_sleep": latest.hr_before_sleep,
             "latest_rr_before_sleep": latest.rr_before_sleep,
@@ -186,8 +205,9 @@ def _prompt_overview(ctx: dict) -> str:
 
 Sleep data summary:
 - Date: {ctx.get('date')}
-- 7-day average sleep quality: {ctx.get('avg_sleep_quality','—')} / 100
-- Last night's quality: {ctx.get('latest_score','—')} / 100
+- 7-day Mindora product score: {ctx.get('avg_sleep_quality','unavailable')}
+- Last night's Mindora product score: {ctx.get('latest_score','unavailable')}
+- If a score is unavailable, do not describe or infer its value.
 - Most-used scene (7 days): {ctx.get('scene_name','—')} × {ctx.get('used_times','—')} times
 - Weekly-best audio (raw name): {ctx.get('weekly_best_audio_name') or ctx.get('scene_name','—')}
 
@@ -207,7 +227,7 @@ def _prompt_sleep_day(ctx: dict) -> str:
     return f"""{_lang_instruction(ctx.get('language','en'))}
 
 Sleep data for {ctx.get('date')}:
-- Quality score: {ctx.get('latest_score','—')} / 100
+- Mindora product score: {ctx.get('latest_score','unavailable')}; if unavailable, do not infer one.
 - First sleep time: {ctx.get('latest_first_sleep_time','—')}
 - Pre-sleep HR: {ctx.get('latest_hr_before_sleep','—')} bpm  RR: {ctx.get('latest_rr_before_sleep','—')} brpm
 - Deep: {ctx.get('latest_deep_min','—')} min ({ctx.get('latest_deep_pct','—')}%)  REM: {ctx.get('latest_rem_min','—')} min ({ctx.get('latest_rem_pct','—')}%)
@@ -231,12 +251,12 @@ Return JSON with exactly these keys:
 
 def _prompt_sleep_week(ctx: dict) -> str:
     score = ctx.get('avg_sleep_quality')
-    label = "Excellent" if score and score >= 80 else "Good" if score and score >= 60 else "Fair"
-    score = score if score is not None else '—'
+    label = "Excellent" if score is not None and score >= 80 else "Good" if score is not None and score >= 60 else "Fair" if score is not None else "Unavailable"
+    score = score if score is not None else 'unavailable'
     return f"""{_lang_instruction(ctx.get('language','en'))}
 
 Weekly sleep summary ({ctx.get('start_date')} – {ctx.get('end_date')}):
-- Average quality score: {score} / 100  (baseline label: {label})
+- Average Mindora product score: {score}  (label: {label}); do not infer a missing score.
 - Most-used scene: {ctx.get('scene_name','—')} × {ctx.get('used_times','—')} times
 - Best onset-efficiency scene this week (raw name): {ctx.get('onset_scenario_name') or ctx.get('scene_name','—')}
 - Typical first-sleep time: {ctx.get('typical_first_sleep_time','—')}
@@ -258,14 +278,14 @@ Return JSON with exactly these keys:
 
 
 def _prompt_sleep_month(ctx: dict) -> str:
-    score = ctx.get('avg_sleep_quality')
+    score = ctx.get('avg_sleep_score_30d')
     scene_name = ctx.get('scene_name') or '—'
     scene_list = ctx.get('onset_scenario_list') or '—'
-    score = score if score is not None else '—'
+    score = score if score is not None else 'unavailable'
     return f"""{_lang_instruction(ctx.get('language','en'))}
 
 Monthly sleep summary ({ctx.get('start_date')} – {ctx.get('end_date')}):
-- Average quality score: {score} / 100
+- Average Mindora product score: {score}; do not infer a missing score.
 - Top sleep scene: {scene_name}
 - Top scenes this month (raw names, keep this order): {scene_list}
 - Average deep sleep: {ctx.get('avg_deep_pct','—')}%  REM: {ctx.get('avg_rem_pct','—')}%
@@ -335,8 +355,8 @@ def _prompt_explore(ctx: dict, modules: list) -> str:
     return f"""{_lang_instruction(ctx.get('language','en'))}
 
 Last-night sleep analysis ({ctx.get('date')}):
-- Overall score: {ctx.get('latest_score','—')} / 100
-- Onset efficiency (SOE): {ctx.get('latest_soe','—')} / 100,  fell asleep in ~{ctx.get('latest_onset_min','?')} min at {ctx.get('latest_first_sleep_time','—')}
+- Mindora product score: {ctx.get('latest_score','unavailable')}; do not infer a missing score.
+- Reported onset duration: {ctx.get('latest_onset_min','—')} min at {ctx.get('latest_first_sleep_time','—')}; this duration may be estimated when no inBed start was recorded.
 - Pre-sleep HR: {ctx.get('latest_hr_before_sleep','—')} bpm   RR: {ctx.get('latest_rr_before_sleep','—')} brpm
 - Deep: {ctx.get('latest_deep_pct','—')}%   REM: {ctx.get('latest_rem_pct','—')}%   Core: {ctx.get('latest_core_pct','—')}%
 - Night wakings: {ctx.get('latest_awake_count','—')} × {ctx.get('latest_awake_min','—')} min   type: {ctx.get('latest_awake_type','—')}
@@ -360,14 +380,14 @@ def _prompt_conclusion_polish(ctx: dict) -> str:
 
 You are polishing pre-computed sleep insight conclusions for the Mindora app.
 The conclusions below were computed by deterministic rules from the user's own data.
-Your ONLY job is to rewrite the "title" and "text" of each conclusion to read more
-naturally and warmly — the facts, numbers, states and judgments are already final.
+Your ONLY job is to adjust terminal punctuation and surrounding spaces in the
+"title" and "text" of each conclusion. Keep all other characters unchanged.
 
 Conclusions (JSON):
 {conclusions_json}
 
 Hard constraints (violating any → output is rejected):
-- Do NOT add, remove or change any number, time, scene name, or factual claim.
+- Do NOT add, remove, reorder or change any word, number, time, scene name, or factual claim.
 - Do NOT add new conclusions, diagnoses, causes, or effectiveness claims.
 - Do NOT use any of these forbidden terms: {forbidden}
 - Keep "title" ≤ 8 words and "text" ≤ 4 sentences.
@@ -377,8 +397,7 @@ Hard constraints (violating any → output is rejected):
 
 def polish_output_ok(result: dict, conclusions: list, language: str) -> bool:
     """LLM 润色输出校验（校验失败 → 保留规则模板文案）：
-    1) key 集合匹配；2) 语言校验；3) 禁用词；4) 输出数字必须能在输入中找到（防幻觉）；
-    5) 单字段长度上限。"""
+    仅接受同键、同语言、无禁用词且事实文本相同的输出；允许末尾标点和首尾空白变化。"""
     if not isinstance(result, dict):
         return False
     keys = {getattr(c, "key", None) for c in conclusions}
@@ -391,22 +410,23 @@ def polish_output_ok(result: dict, conclusions: list, language: str) -> bool:
     for term in _get_insight_rules()["forbidden_terms"]:
         if term.lower() in text_all:
             return False
-    input_nums: set = set()
-    for c in conclusions:
-        input_nums |= set(re.findall(r"\d+", _json.dumps(getattr(c, "to_llm_dict", lambda: {})(), ensure_ascii=False)))
-        input_nums |= set(re.findall(r"\d+", str(getattr(c, "title", "")) + str(getattr(c, "text", ""))))
-    for v in result.values():
-        if not isinstance(v, dict):
+    # A prompt and a number whitelist cannot prove that prose preserves facts.
+    # Until an approved phrase grammar exists, permit terminal punctuation and
+    # boundary whitespace only. Internal punctuation can change numeric meaning
+    # (for example -3 vs 3 or 20-30 vs 2030), so it must remain exact.
+    def semantic_text(value: str) -> str:
+        return value.strip().rstrip("。！？!?.,;； ")
+    by_key = {c.key: c for c in conclusions}
+    for key, v in result.items():
+        if not isinstance(v, dict) or set(v) != {"title", "text"}:
             return False
         for field in ("title", "text"):
             s = v.get(field)
-            if s is None:
-                continue
-            if len(s) > _get_insight_rules()["polish_max_chars"] * 3:
+            original = getattr(by_key[key], field)
+            if not isinstance(s, str) or len(s) > _get_insight_rules()["polish_max_chars"] * 3:
                 return False
-            for num in re.findall(r"\d+", s):
-                if num not in input_nums:
-                    return False
+            if semantic_text(s) != semantic_text(original):
+                return False
     return True
 
 
@@ -432,7 +452,7 @@ You are writing the Mindora insight page. Every sentence must answer:
 
 Recent 7-day sleep statistics (aggregated locally):
 - Records used: {ctx.get('record_count', '—')}
-- Average sleep quality: {_fmt(ctx.get('avg_sleep_quality'))} / 100
+- Average Mindora product score: {_fmt(ctx.get('avg_sleep_quality'))}; do not infer a missing score.
 - Average sleep-onset latency: {_fmt(ctx.get('avg_onset_min'), ' min')}
 - Typical first sleep time: {ctx.get('typical_first_sleep_time', '—')}
 - Typical bed time: {ctx.get('typical_bed_time', '—')}   wake time: {ctx.get('typical_wake_time', '—')}
@@ -502,7 +522,7 @@ Write one practical bedtime suggestion for the coming week, based only on the av
 - Typical bedtime: {ctx.get('typical_bed_time', 'unknown')}
 - Typical first sleep time: {ctx.get('typical_first_sleep_time', 'unknown')}
 - Average sleep onset: {ctx.get('avg_onset_min', 'unknown')} minutes
-- Average sleep quality: {ctx.get('avg_sleep_quality', 'unknown')} / 100
+- Average Mindora product score: {ctx.get('avg_sleep_quality', 'unavailable')}; do not infer a missing score.
 - Most used sleep scene: {ctx.get('weekly_top_scene_title', 'unknown')}
 - User's improvement goal: {ctx.get('improvement_goal', 'unknown')}
 - Preferred sleep-mode start time: {ctx.get('sleep_mode_start_time', 'unknown')}
