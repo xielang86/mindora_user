@@ -270,7 +270,7 @@ class UserServer:
       return None
 
 
-    logging.info(f"payload: {payload}")
+    logging.debug("verified jwt payload uid=%s", payload.get("uid"))
     return payload
 
   def _parse_for_uid(self, data: Any):
@@ -628,6 +628,12 @@ class UserServer:
     delay: float = 0,
   ) -> None:
     """Schedule a background LLM update for uid unless one ran recently or is pending."""
+    skip_sleep_scenarios_reco_update = (
+      skip_sleep_scenarios_reco_update or not Config.ENABLE_SLEEP_RECO
+    )
+    skip_sleep_analysis_update = skip_sleep_analysis_update or not Config.ENABLE_LLM
+    if skip_sleep_scenarios_reco_update and skip_sleep_analysis_update:
+      return
     async with self._llm_tracker_lock:
       pending = self._llm_pending.get(uid)
       if pending is not None and not pending.done():
@@ -747,14 +753,14 @@ class UserServer:
 
     def _respond(response_obj: BaseResponse, status: int | None = None) -> web.Response:
       http_status = status if status is not None else get_http_status(response_obj)
-      logging.info(
+      logging.debug(
         "analysis response: client_request_id=%s status=%s code=%s request_type=%s",
         client_request_id, http_status, response_obj.code,
         getattr(response_obj, "request_type", None),
       )
       return web.json_response(response_obj.model_dump(), status=http_status)
 
-    logging.info("analysis request received: client_request_id=%s", client_request_id)
+    logging.debug("analysis request received: client_request_id=%s", client_request_id)
     try:
       body = await request.json()
       req = AnalysisRequest.model_validate(body)
@@ -1501,11 +1507,15 @@ class UserServer:
 
   async def start_http(self):
     """启动HTTP服务器"""
-    runner = web.AppRunner(self.app)
+    access_log = logging.getLogger("aiohttp.access") if Config.USER_SERVER_ACCESS_LOG_ENABLED else None
+    runner = web.AppRunner(self.app, access_log=access_log)
     await runner.setup()
     site = web.TCPSite(runner, self.host, self.port)
     await site.start()
-    logging.info(f"UserServer (LevelDB) started on http://{self.host}:{self.port}")
+    logging.info(
+      "UserServer (LevelDB) started on http://%s:%s access_log=%s",
+      self.host, self.port, "enabled" if access_log is not None else "disabled",
+    )
     self._startup_self_check()
     self._sweeper_task = asyncio.create_task(self._analysis_sweeper())
     self._activity_log_task = asyncio.create_task(self._activity_logger())

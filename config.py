@@ -9,8 +9,13 @@ def _parse_comma_list(value: str | None) -> list[str]:
 
 
 class Config:
-  HOST="0.0.0.0"
-  PORT = 9001
+  HOST = os.getenv("USER_SERVER_HOST", "0.0.0.0")
+  PORT = int(os.getenv("USER_SERVER_PORT", "9001"))
+  # aiohttp 每请求 access log 在高 QPS 下会同步写文件/stdout并阻塞 event loop。
+  # 默认关闭；排障时可临时设置 USER_SERVER_ACCESS_LOG_ENABLED=true 开启。
+  USER_SERVER_ACCESS_LOG_ENABLED = (
+    os.getenv("USER_SERVER_ACCESS_LOG_ENABLED", "false").strip().lower() == "true"
+  )
   IS_DEBUG = True
   AUTH_PORT=9103
   # auth_server 地址（user_server 校验运营角色 / 运营后台登录都走它）
@@ -38,8 +43,8 @@ class Config:
   JWT_PRIVATE_KEY_PATH = "jwt_private.pem"
   JWT_PUBLIC_KEY_PATH = "jwt_public.pem"
   # 边缘端轻量化开关：关闭后 user_server 不会 import/实例化 LLM 与推荐引擎
-  ENABLE_LLM = True
-  ENABLE_SLEEP_RECO = True
+  ENABLE_LLM = os.getenv("ENABLE_LLM", "true").strip().lower() == "true"
+  ENABLE_SLEEP_RECO = os.getenv("ENABLE_SLEEP_RECO", "true").strip().lower() == "true"
 
   # ── 高级会员体验期（高级会员体验期接口.md §4）──────────────────────────────
   # Basic 档（普通会员）内购 product_id 白名单：report_subscription 仅对它们盖第②段体验期；

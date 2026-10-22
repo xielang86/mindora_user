@@ -1,5 +1,6 @@
 """Workbook-backed content metadata; exact mappings only, no name guessing."""
 import json
+import logging
 from functools import lru_cache
 from pathlib import Path
 
@@ -44,6 +45,14 @@ def tags_for(cells, columns):
 
 @lru_cache(maxsize=1)
 def load_catalog():
+    required = (DATA / "sop_source.json", DATA / "audio_source.json")
+    missing = [str(path) for path in required if not path.exists()]
+    if missing:
+        # Content metadata enriches recommendation evidence but is not required
+        # for accepting profile updates.  Deployment omissions must degrade to
+        # unmapped commands instead of turning every new-user update into 500.
+        logging.warning("content tag catalog unavailable; using empty catalog: %s", missing)
+        return []
     entries = []
     for filename, sheet_name, kind, columns in [
         ("sop_source.json", "02_sop内容分层标签", "sop", SOP_TAGS),
