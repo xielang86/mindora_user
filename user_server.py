@@ -9,6 +9,8 @@
   - ops_config.py          弹窗问卷运营配置加载
 """
 import asyncio,copy,datetime,hashlib,json,logging,os,re,time
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from typing import Any, Optional
 from uuid import uuid4
 from dotenv import load_dotenv
@@ -167,6 +169,15 @@ class UserServer:
     self.port = Config.PORT
     self.llm = SleepAnalysisLLM()
     self.user_serv = UserProfileServ(llm=self.llm)
+    self._query_executor = ThreadPoolExecutor(
+      max_workers=Config.QUERY_EXECUTOR_WORKERS, thread_name_prefix="profile-query",
+    )
+    self._update_executor = ThreadPoolExecutor(
+      max_workers=Config.UPDATE_EXECUTOR_WORKERS, thread_name_prefix="profile-update",
+    )
+    self._llm_executor = ThreadPoolExecutor(
+      max_workers=Config.MAX_LLM_BACKGROUND_TASKS, thread_name_prefix="profile-llm",
+    )
     self.app = web.Application()
     self.system_uid = get_or_create_uuid()
     self.debug_uid_set = {"mindora_test_uid1", "mindora_test_uid2", "mindora_test_uid3", "test_debug_user_001"}
@@ -198,6 +209,32 @@ class UserServer:
     for task in list(self._llm_tasks):
       task.cancel()
     self._llm_tasks.clear()
+    self._query_executor.shutdown(wait=False, cancel_futures=True)
+    self._update_executor.shutdown(wait=False, cancel_futures=True)
+    self._llm_executor.shutdown(wait=False, cancel_futures=True)
+
+  async def _run_query(self, func, *args, **kwargs):
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(self._query_executor, partial(func, *args, **kwargs))
+
+  async def _run_update(self, func, *args, **kwargs):
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(self._update_executor, partial(func, *args, **kwargs))
+
+  async def _run_llm_work(self, func, *args, **kwargs):
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(self._llm_executor, partial(func, *args, **kwargs))
+
+  async def _query_response(self, response_obj: BaseResponse) -> web.Response:
+    """Dump and JSON-encode potentially large query responses off the event loop."""
+    body = await self._run_query(
+      lambda: json.dumps(
+        response_obj.model_dump(mode="json"), ensure_ascii=False, separators=(",", ":"),
+      ).encode("utf-8")
+    )
+    return web.Response(
+      body=body, status=get_http_status(response_obj), content_type="application/json",
+    )
 
   def setup_routes(self):
     """设置HTTP路由"""
@@ -340,14 +377,14 @@ class UserServer:
 
   # -------------------- /user_profile --------------------
   def handle_query_profile(self, request: ProfileRequest) -> BaseResponse:
-    logging.info("handle query_profile request=%s", self._request_for_log(request))
+    logging.debug("handle query_profile request=%s", self._request_for_log(request))
     """查询用户画像（从LevelDB按需读取）"""
     if request.data is None:
       logging.error("query request without any data")
       return InvalidOrExpiredTokenResp()
 
     uid = self._parse_for_uid(request.data)
-    logging.info(f"get uid: {uid}")
+    logging.debug("query_profile uid=%s", uid)
 
     if uid is None:
       return InvalidOrExpiredTokenResp()
@@ -363,7 +400,7 @@ class UserServer:
 
     profile = self.user_serv.get_profile(uid)
     if profile:
-      logging.info("profile found uid=%s summary=%s", uid, self.user_serv._profile_for_log(profile))
+      logging.debug("profile found uid=%s", uid)
       profile_dict = self._profile_response_body(profile, request.data)
       return ProfileResponse(code=0, msg="succ", request_type=request.request_type, data={"user_profile": profile_dict})
     else:
@@ -374,7 +411,7 @@ class UserServer:
   def handle_query_revision(self, request: ProfileRequest) -> BaseResponse:
     """轻量变更探测：只返回画像当前 revision（几十字节）。
 
-    设备端两级刷新：3s 探测本接口，revision 与本地基线一致则不动作，变了才全量
+    设备端两级刷新：60s 探测本接口，revision 与本地基线一致则不动作，变了才全量
     query_profile + LWW 合并；300s 强制全量兜底。设备自己推云成功后以 update_profile
     响应里的新 revision 为基线（回显过滤）。未知用户返回 revision=0。
     """
@@ -383,10 +420,9 @@ class UserServer:
     uid = self._parse_for_uid(request.data)
     if uid is None:
       return InvalidOrExpiredTokenResp()
-    profile = self.user_serv.get_profile(uid)
     return ProfileResponse(
       code=0, msg="success", request_type=request.request_type,
-      data={"revision": profile.revision if profile else 0},
+      data={"revision": self.user_serv.get_revision(uid)},
     )
 
   def handle_query_health_sync_state(self, request: ProfileRequest) -> BaseResponse:
@@ -444,7 +480,7 @@ class UserServer:
       return InvalidOrExpiredTokenResp()
 
     async with self.server_semaphore:
-      succ = await asyncio.to_thread(
+      merged = await self._run_update(
         self.user_serv.update_profile_basic,
         uid,
         request.data.user_profile,
@@ -452,19 +488,21 @@ class UserServer:
         request.data.timezone,
         request.data.language,
       )
-    if not succ:
+    if merged is None:
       return ProfileResponse(code=500, msg=f"update profile failed", request_type=request.request_type, data=None)
-
-    # 个人资料同步约定 §2/§3：msg 回显 uid（不用 timestamp）；返回合并后的完整 profile，
-    # 客户端用它更新本地快照基准（服务端归一化后两边才对得上）
-    merged = await asyncio.to_thread(self.user_serv.get_profile, uid)
 
     # 本批含 plays（场景/设备真实使用）→ 记活跃信号
     up = request.data.user_profile
     if up is not None and (up.behaviors or {}).get("plays"):
       self._mark_activity(uid)
 
-    # LLM 触发（方案A：醒后每天一次）：客户端不传开关时由服务端按数据自动决策
+    needed, newest_ts = self._analysis_needed(merged)
+    if needed and newest_ts is not None:
+      due_at = int(time.time()) + Config.LLM_ANALYSIS_DEBOUNCE_SECONDS
+      await self._run_update(self.user_serv.mark_analysis_pending, uid, newest_ts, due_at)
+
+    # Persist the recovery job before creating an in-memory task, so a very
+    # fast task cannot finish and clear the job before it has been recorded.
     await self._maybe_schedule_llm_update(
       uid,
       merged,
@@ -472,15 +510,11 @@ class UserServer:
       request.data.skip_sleep_analysis_update,
     )
 
-    # 响应体与 query_profile 共用一套构造：注入 sequence_summaries（计算属性，
-    # 不注入客户端拿不到 time_in_bed 等阶段汇总），裁剪只认客户端显式携带的开关——
-    # 这份快照是客户端的本地基准（个人资料同步约定 §2/§3），默认裁剪会被老客户端
-    # 当成「服务端没有这些数据」而抹掉本地 sleep_data / behaviors 历史。
     return ProfileResponse(
       code=0,
       msg=f"update profile for '{uid}' succ",
       request_type=request.request_type,
-      data={"user_profile": self._profile_response_body(merged, request.data, apply_defaults=False)} if merged else None,
+      data={"accepted": True, "revision": merged.revision},
     )
 
   # -------------------- 活跃门（醒后预生成的成本闸门） --------------------
@@ -629,12 +663,19 @@ class UserServer:
       if delay > 0:
         await asyncio.sleep(delay)  # 防抖：等醒后的零散健康数据/修正包落地
       async with self._llm_semaphore:
-        await asyncio.to_thread(
+        updated = await self._run_llm_work(
           self.user_serv.update_profile_llm,
           uid,
           skip_sleep_scenarios_reco_update,
           skip_sleep_analysis_update,
         )
+      if not updated:
+        logging.warning("background llm update did not persist uid=%s", uid)
+        return
+      profile = await self._run_query(self.user_serv.get_profile, uid)
+      needed, newest_ts = self._analysis_needed(profile)
+      if not needed:
+        await self._run_update(self.user_serv.clear_analysis_pending, uid, newest_ts)
       logging.info("background llm update done for uid=%s", uid)
     except asyncio.CancelledError:
       logging.info("background llm update cancelled for uid=%s", uid)
@@ -649,20 +690,20 @@ class UserServer:
       # logging.info("request %s", self._request_for_log(req))
 
       if req.request_type == "query_profile":
-        response_obj = self.handle_query_profile(req)
-        return web.json_response(response_obj.model_dump(), status=get_http_status(response_obj))
+        response_obj = await self._run_query(self.handle_query_profile, req)
+        return await self._query_response(response_obj)
 
       elif req.request_type == "update_profile":
         response_obj = await self.handle_update_profile(req)
         return web.json_response(response_obj.model_dump(), status=get_http_status(response_obj))
 
       elif req.request_type == "query_revision":
-        response_obj = self.handle_query_revision(req)
-        return web.json_response(response_obj.model_dump(), status=get_http_status(response_obj))
+        response_obj = await self._run_query(self.handle_query_revision, req)
+        return await self._query_response(response_obj)
 
       elif req.request_type == "query_health_sync_state":
-        response_obj = self.handle_query_health_sync_state(req)
-        return web.json_response(response_obj.model_dump(), status=get_http_status(response_obj))
+        response_obj = await self._run_query(self.handle_query_health_sync_state, req)
+        return await self._query_response(response_obj)
 
       # client_request.md：/user_profile 只承载 query_profile / update_profile /
       # query_revision / query_health_sync_state，分析类请求统一走 /analysis，洞察报告由 analysis_explore 出口
@@ -726,29 +767,30 @@ class UserServer:
       # 用户在看法分析页 = 活跃信号（收窄后只认 /analysis 和 plays）
       self._mark_activity(uid)
 
-      # 读路径登记请求环境（fill_only：只补缺，不覆盖 update 路径记下的真实值；
-      # 每日触发门的自然日口径与文案语言都以画像上的这个值为准）
-      await asyncio.to_thread(
-        self.user_serv.note_request_meta, uid, req.data.timezone, req.data.language,
+      # One UID-locked read supplies both request-meta persistence and the
+      # analysis builders. The steady-state path performs exactly one DB get.
+      profile = await self._run_query(
+        self.user_serv.get_profile_and_note_request_meta,
+        uid, req.data.timezone, req.data.language,
       )
-      profile = await asyncio.to_thread(self.user_serv.get_profile, uid)
 
       # 零睡眠记录用户：读路径即时补齐兜底建议（模板，无 LLM 成本），
       # 首次请求就能见到内容；有真实数据后由后台 LLM 更新自然替换（兜底 llm_used=False）
       if profile is not None and not profile.sleep_data:
-        fallback_changed = await asyncio.to_thread(
-          self.user_serv.content.ensure_fallback_content, uid, profile,
+        profile = await self._run_update(
+          self.user_serv.ensure_fallback_content_for_uid, uid,
         )
-        if fallback_changed:
-          await asyncio.to_thread(self.user_serv.save_profile, uid, profile)
 
-      response_data = self._build_analysis_data(req, profile)
+      response_data = await self._run_query(self._build_analysis_data, req, profile)
 
       # 读路径懒触发：有未分析的新夜晚 → 立即后台生成（本次先回骨架，
       # 文案下次刷新自然出现）。兜住活跃门漏判/预生成未覆盖的活跃用户。
       needed, newest_ts = self._analysis_needed(profile)
       if needed and newest_ts is not None:
         self._llm_last_attempt[uid] = newest_ts
+        await self._run_update(
+          self.user_serv.mark_analysis_pending, uid, newest_ts, int(time.time()),
+        )
         await self._schedule_llm_update_if_needed(uid, delay=0)
 
       # LLM 文案全部来自 update_profile 时异步生成、按日/周/月序列存储的报告，
@@ -833,13 +875,13 @@ class UserServer:
         # scope=history（popup_survey.md 2.1 历史消息恢复）：不做定向/频控/优先级，
         # 不带 next_query_after（非轮询，客户端仅登录后调一次）
         if req.data.scope == "history":
-          messages = await asyncio.to_thread(
+          messages = await self._run_query(
             self.user_serv.query_message_history, uid, req.data.language, req.data.popup_ids,
           )
           resp = BaseResponse(code=0, msg="ok")
           return web.json_response({**resp.model_dump(), "data": {"popups": messages}})
 
-        result = await asyncio.to_thread(
+        result = await self._run_update(
           self.user_serv.query_popups, uid, req.data.language, req.data.placement,
         )
         # next_query_after 未配置时不下发该字段，客户端用默认 300s
@@ -851,7 +893,7 @@ class UserServer:
 
       # report_popup
       event_at = req.data.event_at or req.timestamp
-      ok = await asyncio.to_thread(
+      ok = await self._run_update(
         self.user_serv.report_popup_event, uid, req.data.popup_id, req.data.event, event_at,
       )
       if not ok:
@@ -876,14 +918,16 @@ class UserServer:
         return web.json_response(InvalidOrExpiredTokenResp().model_dump(), status=401)
 
       if req.request_type == "query_survey":
-        survey = self.user_serv.get_survey(req.data.survey_id, req.data.language)
+        survey = await self._run_query(
+          self.user_serv.get_survey, req.data.survey_id, req.data.language,
+        )
         if survey is None:
           return web.json_response(BaseResponse(code=404, msg="survey not found").model_dump(), status=404)
         resp = BaseResponse(code=0, msg="ok")
         return web.json_response({**resp.model_dump(), "data": survey})
 
       # submit_survey（email 存入全量记录，供运营后台展示）
-      data, code = await asyncio.to_thread(self.user_serv.submit_survey, uid, req.data, email)
+      data, code = await self._run_update(self.user_serv.submit_survey, uid, req.data, email)
       if data is None:
         msg = "survey not found" if code == 404 else "invalid survey answers"
         return web.json_response(BaseResponse(code=code, msg=msg).model_dump(), status=code)
@@ -907,12 +951,12 @@ class UserServer:
         return web.json_response(InvalidOrExpiredTokenResp().model_dump(), status=401)
 
       if req.request_type == "upload_footprint":
-        accepted = await asyncio.to_thread(self.user_serv.merge_footprint_days, uid, req.data.days)
+        accepted = await self._run_update(self.user_serv.merge_footprint_days, uid, req.data.days)
         resp = BaseResponse(code=0, msg="ok")
         return web.json_response({**resp.model_dump(), "data": {"accepted_days": accepted}})
 
       # query_footprint
-      data = await asyncio.to_thread(
+      data = await self._run_query(
         self.user_serv.query_footprint,
         uid, req.data.scope, req.data.year, req.data.month, req.data.timezone,
       )
@@ -1025,28 +1069,29 @@ class UserServer:
       effective_level = await self._get_effective_level(uid, d.jwt_token)
 
       def _do_sync() -> sleep_plan_service.SyncResult:
-        profile = self.user_serv.get_profile(uid)
-        stored = list(profile.sleep_plans) if profile else []
-        result = sleep_plan_service.sync_plans(
-          stored, incoming,
-          effective_level=effective_level,
-          tz_name=d.timezone,
-        )
-        # 环境信息随同步请求刷新（触发时刻按最近一次同步的时区换算，§6⑥；
-        # 客户端该字段必填，非默认值，可以直接覆盖）
-        meta_changed = False
-        if profile is not None:
-          meta_changed = self.user_serv._note_request_meta(profile, d.timezone, d.language, fill_only=False)
-        if result.changed or meta_changed:
-          if profile is None:
-            profile = UserProfile()
-            self.user_serv._note_request_meta(profile, d.timezone, d.language, fill_only=False)
-          profile.sleep_plans = result.plans
-          profile.sleep_plans_synced_at = int(time.time())
-          self.user_serv.save_profile(uid, profile)
-        return result
+        with self.user_serv.uid_lock(uid):
+          profile = self.user_serv.get_profile(uid)
+          stored = list(profile.sleep_plans) if profile else []
+          result = sleep_plan_service.sync_plans(
+            stored, incoming,
+            effective_level=effective_level,
+            tz_name=d.timezone,
+          )
+          # 环境信息随同步请求刷新（触发时刻按最近一次同步的时区换算，§6⑥；
+          # 客户端该字段必填，非默认值，可以直接覆盖）
+          meta_changed = False
+          if profile is not None:
+            meta_changed = self.user_serv._note_request_meta(profile, d.timezone, d.language, fill_only=False)
+          if result.changed or meta_changed:
+            if profile is None:
+              profile = UserProfile()
+              self.user_serv._note_request_meta(profile, d.timezone, d.language, fill_only=False)
+            profile.sleep_plans = result.plans
+            profile.sleep_plans_synced_at = int(time.time())
+            self.user_serv.save_profile(uid, profile)
+          return result
 
-      result = await asyncio.to_thread(_do_sync)
+      result = await self._run_update(_do_sync)
 
       visible = result.visible_plans
       data = {
@@ -1173,7 +1218,7 @@ class UserServer:
       if uid is None:
         return web.json_response(BaseResponse(code=403, msg="not an ops admin").model_dump(), status=403)
 
-      records = await asyncio.to_thread(self.user_serv.list_survey_records, body.get("survey_id"))
+      records = await self._run_query(self.user_serv.list_survey_records, body.get("survey_id"))
       resp = BaseResponse(code=0, msg="ok")
       return web.json_response({**resp.model_dump(), "data": {"records": records, "total": len(records)}})
     except (json.JSONDecodeError, TypeError) as e:
@@ -1192,7 +1237,7 @@ class UserServer:
         return web.json_response(BaseResponse(code=403, msg="not an ops admin").model_dump(), status=403)
 
       limit = body.get("limit") or 200
-      records = await asyncio.to_thread(self.user_serv.list_publish_records, limit)
+      records = await self._run_query(self.user_serv.list_publish_records, limit)
       resp = BaseResponse(code=0, msg="ok")
       return web.json_response({**resp.model_dump(), "data": {"records": records, "total": len(records)}})
     except (json.JSONDecodeError, TypeError) as e:
@@ -1211,7 +1256,7 @@ class UserServer:
         return web.json_response(BaseResponse(code=403, msg="not an ops admin").model_dump(), status=403)
 
       from ops_config import _load_ops_config
-      popups, surveys, _nqa = await asyncio.to_thread(_load_ops_config)
+      popups, surveys, _nqa = await self._run_query(_load_ops_config)
       data = {
         "survey_ids": sorted(surveys.keys()),
         "popup_ids": sorted(p.get("popup_id") for p in popups if p.get("popup_id")),
@@ -1236,7 +1281,7 @@ class UserServer:
         return web.json_response(BaseResponse(code=403, msg="not an ops admin").model_dump(), status=403)
 
       from ops_config import _load_ops_config
-      _popups, surveys, _nqa = await asyncio.to_thread(_load_ops_config)
+      _popups, surveys, _nqa = await self._run_query(_load_ops_config)
       items = [
         {"survey_id": sid, "created_at": (s or {}).get("created_at"), "i18n": (s or {}).get("i18n") or {}}
         for sid, s in surveys.items()
@@ -1267,7 +1312,7 @@ class UserServer:
       survey = body.get("survey")
       if not isinstance(survey, dict):
         return web.json_response(BaseResponse(code=400, msg="survey 必须是 JSON object").model_dump(), status=400)
-      ok, msg = await asyncio.to_thread(save_survey, survey)
+      ok, msg = await self._run_update(save_survey, survey)
       if not ok:
         return web.json_response(BaseResponse(code=400, msg=msg).model_dump(), status=400)
       resp = BaseResponse(code=0, msg=msg)
@@ -1294,7 +1339,7 @@ class UserServer:
       rules = body.get("rules")
       if not isinstance(rules, dict):
         return web.json_response(BaseResponse(code=400, msg="rules 必须是 JSON object").model_dump(), status=400)
-      ok, msg = await asyncio.to_thread(save_insight_rules, rules)
+      ok, msg = await self._run_update(save_insight_rules, rules)
       if not ok:
         return web.json_response(BaseResponse(code=400, msg=msg).model_dump(), status=400)
       logging.info("ops insight rules saved by uid=%s keys=%s", uid, sorted(rules.keys()))
@@ -1314,8 +1359,9 @@ class UserServer:
       uid = await self._check_ops_admin(body.get("jwt_token") or "")
       if uid is None:
         return web.json_response(BaseResponse(code=403, msg="not an ops admin").model_dump(), status=403)
+      status_data = await self._run_query(insight_rules_status)
       resp = BaseResponse(code=0, msg="succ")
-      return web.json_response({**resp.model_dump(), "data": insight_rules_status()})
+      return web.json_response({**resp.model_dump(), "data": status_data})
     except (json.JSONDecodeError, TypeError) as e:
       logging.error(f"ops insight_rules format error: {e}")
       return web.json_response(InvalidReqFormatResp().model_dump(), status=400)
@@ -1337,7 +1383,7 @@ class UserServer:
       if field is None or not getattr(field, "filename", None):
         return web.json_response(BaseResponse(code=400, msg="缺少图片文件（字段 image）").model_dump(), status=400)
       data = field.file.read()
-      url, err = await asyncio.to_thread(save_popup_image, data)
+      url, err = await self._run_update(save_popup_image, data)
       if err:
         return web.json_response(BaseResponse(code=400, msg=err).model_dump(), status=400)
       resp = BaseResponse(code=0, msg="ok")
@@ -1356,7 +1402,7 @@ class UserServer:
       return web.Response(status=404, text="not found")
     mime = {"png": "image/png", "jpg": "image/jpeg", "webp": "image/webp"}[name.rsplit(".", 1)[1]]
     return web.Response(
-      body=await asyncio.to_thread(lambda: open(path, "rb").read()),
+      body=await self._run_query(lambda: open(path, "rb").read()),
       content_type=mime,
       headers={"Cache-Control": "public, max-age=31536000, immutable"},
     )
@@ -1400,25 +1446,35 @@ class UserServer:
       logging.warning("[self-check] LLM disabled (ARK_API_KEY / KIMI_API_KEY 均未配置) — 分析/洞察文案使用默认模板")
 
   async def _analysis_sweeper(self):
-    """每小时兜底扫描：给"有未分析新夜晚但没跑成"的 uid 补触发。
-
-    覆盖的漏网场景：服务器重启丢了内存中的防抖任务、后台 LLM 临时失败、
-    更新请求后一直没有新请求进来（自动触发只在 update 路径上做判定）。
-    LLM 未启用时直接空转（calc_* 会秒回，扫了也没意义）。
-    """
+    """Consume persisted pending jobs; never scan every user profile."""
     while True:
-      await asyncio.sleep(Config.LLM_ANALYSIS_SWEEP_SECONDS)
+      await asyncio.sleep(Config.LLM_ANALYSIS_QUEUE_POLL_SECONDS)
       try:
         if not Config.LLM_ANALYSIS_AUTO_TRIGGER or not self.llm or not self.llm.enabled:
           continue
-        uids = await asyncio.to_thread(self.user_serv.list_uids)
-        for uid in uids:
-          profile = await asyncio.to_thread(self.user_serv.get_profile, uid)
-          needed, _ = self._analysis_needed(profile)
-          # 活跃门：app 不活跃（窗口内无 /analysis、无 plays）的用户不补烧 LLM
-          if needed and self._is_active(uid, profile):
-            logging.info("analysis sweeper: catch up uid=%s", uid)
-            await self._maybe_schedule_llm_update(uid, profile, None, None)
+        jobs = await self._run_query(
+          self.user_serv.list_due_analysis_pending,
+          int(time.time()), Config.LLM_ANALYSIS_PENDING_BATCH,
+        )
+        for job in jobs:
+          uid = job.get("uid")
+          job_ts = int(job.get("sleep_timestamp") or 0)
+          if not uid:
+            continue
+          profile = await self._run_query(self.user_serv.get_profile, uid)
+          needed, newest_ts = self._analysis_needed(profile)
+          if not needed:
+            await self._run_update(self.user_serv.clear_analysis_pending, uid, job_ts)
+            continue
+          if newest_ts != job_ts:
+            await self._run_update(
+              self.user_serv.mark_analysis_pending, uid, newest_ts, int(time.time()),
+            )
+            continue
+          if self._is_active(uid, profile):
+            logging.info("analysis pending queue: catch up uid=%s", uid)
+            self._llm_last_attempt[uid] = newest_ts
+            await self._schedule_llm_update_if_needed(uid, False, False, delay=0)
       except asyncio.CancelledError:
         raise
       except Exception as e:

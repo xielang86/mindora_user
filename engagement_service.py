@@ -97,8 +97,7 @@ class EngagementService:
     delivered_at = 该 uid 首次落地时间（inbox_messages.created_at），无记录退回目录 first_seen_at。
     """
     now = int(time.time())
-    with self._ps.lock:
-      profile = self._ps.get_profile(uid)
+    profile = self._ps.get_profile(uid)
     landed = {m.popup_id: m.created_at for m in (profile.inbox_messages if profile else [])}
 
     records: list[dict] = []
@@ -160,7 +159,7 @@ class EngagementService:
     """
     now = int(time.time())
     popups_catalog, _, next_query_after = _load_ops_config()
-    with self._ps.lock:
+    with self._ps.uid_lock(uid):
       profile = self._ps._get_or_create_profile_unlocked(uid)
       inbox_changed = False
       result: list[dict] = []
@@ -244,7 +243,7 @@ class EngagementService:
     if not any(p["popup_id"] == popup_id for p in popups_catalog):
       logging.warning("report_popup for unknown popup_id=%s uid=%s", popup_id, uid)
       return False
-    with self._ps.lock:
+    with self._ps.uid_lock(uid):
       profile = self._ps._get_or_create_profile_unlocked(uid)
       state = profile.popup_states.get(popup_id) or PopupState()
       if event == "impression":
@@ -301,7 +300,7 @@ class EngagementService:
     if gift_type in ("physical", "virtual") and data.gift_delivery is None:
       return None, 400
 
-    with self._ps.lock:
+    with self._ps.uid_lock(uid):
       profile = self._ps._get_or_create_profile_unlocked(uid)
       existing = profile.survey_submissions.get(data.survey_id)
       if existing is not None:
@@ -385,7 +384,7 @@ class EngagementService:
 
   def merge_footprint_days(self, uid: str, days: List[FootprintDay]) -> int:
     """上传陪伴足迹：按 uid+date 幂等合并（布尔取 OR、计数取大、首活跃取小）。返回接受的天数。"""
-    with self._ps.lock:
+    with self._ps.uid_lock(uid):
       profile = self._ps._get_or_create_profile_unlocked(uid)
       for day in days:
         existing = profile.footprint_days.get(day.date)
@@ -464,9 +463,8 @@ class EngagementService:
       tz = ZoneInfo("UTC")
     today = datetime.datetime.now(tz).date()
 
-    with self._ps.lock:
-      profile = self._ps.get_profile(uid)
-      days_map = dict(profile.footprint_days) if profile else {}
+    profile = self._ps.get_profile(uid)
+    days_map = dict(profile.footprint_days) if profile else {}
 
     # 锚定日期：最近一条有数据（≤今天）的日期
     marked = sorted(

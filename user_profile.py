@@ -748,7 +748,7 @@ class UserProfile(BaseModel):
 
   # 画像变更版本号：服务端维护、单调递增，每次 save_profile 落盘前 +1（谁改的都会
   # 触发：App update、设备 update、后台 LLM 写回、读路径补缺）。设备端用
-  # query_revision 做 3s 轻量探测，变了才全量 query_profile；自己推云成功后记下响应
+  # query_revision 做 60s 轻量探测，变了才全量 query_profile；自己推云成功后记下响应
   # 里的新 revision 做回显过滤。客户端只读——update 时客户端携带的值被忽略
   # （合并分支不拷贝此字段，新建分支重置为 0，见 _apply_basic_update）。
   revision: int = Field(0, description="画像版本号（服务端维护，单调递增；query_revision 探测用）")

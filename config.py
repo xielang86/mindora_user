@@ -26,6 +26,9 @@ class Config:
   # 可用 POPUP_SURVEY_CONFIG_PATH 环境变量覆盖为绝对路径）
   POPUP_SURVEY_CONFIG_PATH = "data/popup_survey_config.json"
   MaxServerConcurrent = 32
+  QUERY_EXECUTOR_WORKERS = int(os.getenv("QUERY_EXECUTOR_WORKERS", "32"))
+  UPDATE_EXECUTOR_WORKERS = int(os.getenv("UPDATE_EXECUTOR_WORKERS", "8"))
+  PROFILE_UID_LOCK_STRIPES = int(os.getenv("PROFILE_UID_LOCK_STRIPES", "1024"))
   Mode = 0
   ALGORITHM="RS256"
   # 验签兼容：旧的 HS256 token（JWT_SECRET_KEY 环境变量）在过期前仍可验
@@ -101,8 +104,12 @@ class Config:
   LLM_ANALYSIS_AUTO_TRIGGER = os.getenv("LLM_ANALYSIS_AUTO_TRIGGER", "true").lower() == "true"
   # 防抖：检测到新夜晚后延迟这么久再跑，等醒后的零散健康数据/修正包落地
   LLM_ANALYSIS_DEBOUNCE_SECONDS = int(os.getenv("LLM_ANALYSIS_DEBOUNCE_SECONDS", "600"))
-  # 兜底扫描间隔：补触发"重启丢了防抖任务 / LLM 临时失败"漏掉的 uid
+  # Legacy full-scan interval (kept for deployment compatibility; the server
+  # now consumes a persisted pending-job prefix instead of scanning all UIDs).
   LLM_ANALYSIS_SWEEP_SECONDS = int(os.getenv("LLM_ANALYSIS_SWEEP_SECONDS", "3600"))
+  # Persisted pending-analysis queue polling interval and maximum due jobs per poll.
+  LLM_ANALYSIS_QUEUE_POLL_SECONDS = int(os.getenv("LLM_ANALYSIS_QUEUE_POLL_SECONDS", "30"))
+  LLM_ANALYSIS_PENDING_BATCH = int(os.getenv("LLM_ANALYSIS_PENDING_BATCH", "1000"))
   # 活跃门窗口：只有窗口内有活跃信号（/analysis 请求 或 plays 事件）的用户
   # 才做醒后预生成——纯设备后台同步、app 不活跃的用户不烧 LLM
   LLM_ANALYSIS_ACTIVITY_WINDOW_SECONDS = int(os.getenv("LLM_ANALYSIS_ACTIVITY_WINDOW_SECONDS", "86400"))

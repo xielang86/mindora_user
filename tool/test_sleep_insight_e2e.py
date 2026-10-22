@@ -151,6 +151,8 @@ def run_client():
     update_dt = time.time() - t0
     body = resp.json()
     assert body.get("code") == 0, f"更新失败: {body}"
+    ack = body.get("data") or {}
+    assert ack.get("accepted") is True and isinstance(ack.get("revision"), int), body
     print(f"[client] update_profile 返回 code=0，耗时 {update_dt:.2f}s")
     assert update_dt < 5, f"更新请求耗时 {update_dt:.1f}s，不是异步返回！"
     print("[ok] 更新请求立即返回（LLM 在后台执行）")

@@ -14,6 +14,7 @@ import logging
 import os
 import threading
 import time
+import zlib
 from pathlib import Path
 from typing import Any, Optional, List
 from zoneinfo import ZoneInfo
@@ -44,6 +45,8 @@ run_dir = os.getenv("RUN_DIR") or os.path.dirname(os.path.abspath(__file__))
 
 # all bloking sync api
 class UserProfileServ:
+  REVISION_KEY_PREFIX = "_meta:revision:"
+  ANALYSIS_PENDING_KEY_PREFIX = "_meta:analysis_pending:"
   MAX_BEHAVIOR_LEN = 100
   # sleep_data 保留条数：与分析报告日级保留一致（日级 30）
   MAX_SLEEP_DATA_LEN = 30
@@ -164,7 +167,11 @@ class UserProfileServ:
 
   # -------------------- 存储与初始化 --------------------
   def __init__(self, llm: Optional[SleepAnalysisLLM] = None):
+    # self.lock only protects global KV / txt-json storage. Per-user mutations
+    # use bounded striped locks so unrelated users do not serialize.
     self.lock = threading.RLock()
+    stripes = max(16, Config.PROFILE_UID_LOCK_STRIPES)
+    self._uid_locks = [threading.RLock() for _ in range(stripes)]
     self.storage_mode = (Config.USER_PROFILE_STORAGE_MODE or "leveldb").strip().lower()
     self.db = None
     self.json_path = Path(run_dir) / Config.USER_PROFILE_JSON_PATH
@@ -218,20 +225,32 @@ class UserProfileServ:
       logging.error(f"erro uid : {uid}")
       return None
 
-    with self.lock:
-      if self.storage_mode == "leveldb":
-        data = self.db.get(uid.encode('utf-8'))  # LevelDB键值为bytes类型
-        if data:
-          logging.info("get from leveldb uid=%s size=%d bytes", uid, len(data))
-          return UserProfile.model_validate(json.loads(data.decode('utf-8')))
-        logging.info("get from leveldb uid=%s not found", uid)
-        return None
+    if self.storage_mode == "leveldb":
+      # LevelDB supports concurrent point reads. Do not serialize all users on
+      # the global Python lock; a get observes either the old or new full value.
+      data = self.db.get(uid.encode('utf-8'))
+      if data:
+        logging.debug("get from leveldb uid=%s size=%d bytes", uid, len(data))
+        return UserProfile.model_validate(json.loads(data.decode('utf-8')))
+      logging.debug("get from leveldb uid=%s not found", uid)
+      return None
 
+    with self.lock:
       data = self.text_profiles.get(uid)
-      logging.info("get from json txt uid=%s found=%s size=%d", uid, data is not None, len(json.dumps(data)) if data else 0)
+      logging.debug("get from json txt uid=%s found=%s", uid, data is not None)
       if data is not None:
         return UserProfile.model_validate(data)
       return None
+
+  def uid_lock(self, uid: str):
+    """Return the stable striped lock used for one user's mutations."""
+    locks = getattr(self, "_uid_locks", None)
+    if not locks:  # compatibility with lightweight __new__ test doubles
+      stripes = max(16, Config.PROFILE_UID_LOCK_STRIPES)
+      locks = [threading.RLock() for _ in range(stripes)]
+      self._uid_locks = locks
+    index = zlib.crc32(uid.encode("utf-8")) % len(locks)
+    return locks[index]
 
   @staticmethod
   def _accept_uid_emb(candidate) -> bool:
@@ -280,7 +299,7 @@ class UserProfileServ:
 
   def save_profile(self, uid: str, profile: UserProfile):
     """将单个用户的画像写入持久化存储；落盘前 revision +1（query_revision 变更探测版本号）。"""
-    with self.lock:
+    with self.uid_lock(uid):
       # sleep_data 落盘不变式：按 timestamp 升序，[-1] 恒为最新一晚。
       # 读路径（query_profile 的 [-N:]）、_night_window、compute_recent_sleep_stats
       # 的 [-days:] 全都依赖这条，这里是所有写入路径的唯一收口，兜住工具脚本等旁路。
@@ -291,11 +310,43 @@ class UserProfileServ:
       profile.revision = (profile.revision or 0) + 1
       if self.storage_mode == "leveldb":
         data = json.dumps(self._profile_to_json_data(profile)).encode('utf-8')
-        self.db.put(uid.encode('utf-8'), data)
+        with self.db.write_batch(transaction=True) as batch:
+          batch.put(uid.encode('utf-8'), data)
+          batch.put(
+            (self.REVISION_KEY_PREFIX + uid).encode("utf-8"),
+            str(profile.revision).encode("ascii"),
+          )
         return
 
-      self.text_profiles[uid] = self._profile_to_json_data(profile)
-      self._flush_text_profiles_unlocked()
+      with self.lock:
+        self.text_profiles[uid] = self._profile_to_json_data(profile)
+        self.text_profiles[self.REVISION_KEY_PREFIX + uid] = profile.revision
+        self._flush_text_profiles_unlocked()
+
+  def get_revision(self, uid: str) -> int:
+    """Read the compact revision key without constructing a UserProfile."""
+    key = self.REVISION_KEY_PREFIX + uid
+    if self.storage_mode == "leveldb":
+      raw = self.db.get(key.encode("utf-8"))
+      if raw is not None:
+        try:
+          return int(raw)
+        except ValueError:
+          logging.warning("invalid revision key uid=%s value=%r", uid, raw)
+      # Compatibility for profiles written before compact revision keys.
+      raw_profile = self.db.get(uid.encode("utf-8"))
+      if raw_profile is None:
+        return 0
+      try:
+        return int(json.loads(raw_profile.decode("utf-8")).get("revision") or 0)
+      except (ValueError, TypeError, json.JSONDecodeError):
+        return 0
+    with self.lock:
+      value = self.text_profiles.get(key)
+      if value is not None:
+        return int(value)
+      profile = self.text_profiles.get(uid) or {}
+      return int(profile.get("revision") or 0)
 
   # -------------------- 全局 KV（非 per-user 数据） --------------------
   # 用途：消息目录 _meta:msg:<popup_id>（popup_survey.md 2.1 历史消息恢复）等。
@@ -327,6 +378,45 @@ class UserProfileServ:
           out.append((k.decode("utf-8"), json.loads(v.decode("utf-8"))))
         return out
       return [(k, v) for k, v in self.text_profiles.items() if k.startswith(prefix)]
+
+  def mark_analysis_pending(self, uid: str, sleep_timestamp: int, due_at: int) -> None:
+    """Persist one deduplicated analysis job per UID."""
+    self.put_global(self.ANALYSIS_PENDING_KEY_PREFIX + uid, {
+      "uid": uid,
+      "sleep_timestamp": int(sleep_timestamp),
+      "due_at": int(due_at),
+      "attempt": 0,
+    })
+
+  def list_due_analysis_pending(self, now: int, limit: int = 1000) -> list[dict]:
+    """Return due jobs only; scans the pending prefix, never all user profiles."""
+    due = [
+      value for _key, value in self.iter_global_prefix(self.ANALYSIS_PENDING_KEY_PREFIX)
+      if isinstance(value, dict) and int(value.get("due_at") or 0) <= now
+    ]
+    due.sort(key=lambda item: int(item.get("due_at") or 0))
+    return due[:max(1, limit)]
+
+  def clear_analysis_pending(self, uid: str, sleep_timestamp: Optional[int] = None) -> None:
+    """Clear a job unless it has already been replaced by a newer night."""
+    key = self.ANALYSIS_PENDING_KEY_PREFIX + uid
+    with self.lock:
+      if self.storage_mode == "leveldb":
+        raw = self.db.get(key.encode("utf-8"))
+        if raw is None:
+          return
+        current = json.loads(raw.decode("utf-8"))
+        if sleep_timestamp is not None and int(current.get("sleep_timestamp") or 0) != int(sleep_timestamp):
+          return
+        self.db.delete(key.encode("utf-8"))
+        return
+      current = self.text_profiles.get(key)
+      if current is None:
+        return
+      if sleep_timestamp is not None and int(current.get("sleep_timestamp") or 0) != int(sleep_timestamp):
+        return
+      self.text_profiles.pop(key, None)
+      self._flush_text_profiles_unlocked()
 
   def _get_or_create_profile_unlocked(self, uid: str) -> UserProfile:
     """读取画像，不存在则返回一个新画像对象（调用方负责 save_profile）。"""
@@ -397,12 +487,47 @@ class UserProfileServ:
   def note_request_meta(self, uid: str, timezone: Optional[str], language: Optional[str],
                         fill_only: bool = True) -> None:
     """读路径（/analysis）登记请求环境：只在画像缺省时补缺，有变化才落盘。"""
-    with self.lock:
+    with self.uid_lock(uid):
       profile = self.get_profile(uid)
       if profile is None:
         return
       if self._note_request_meta(profile, timezone, language, fill_only=fill_only):
         self.save_profile(uid, profile)
+
+  def get_profile_and_note_request_meta(
+    self,
+    uid: str,
+    timezone: Optional[str],
+    language: Optional[str],
+    fill_only: bool = True,
+  ) -> Optional[UserProfile]:
+    """Load once for /analysis and persist request metadata only if missing.
+
+    The whole read-modify-write is protected by the UID stripe, so a first-time
+    metadata fill cannot overwrite a concurrent update for the same user.
+    """
+    with self.uid_lock(uid):
+      profile = self.get_profile(uid)
+      if profile is None:
+        return None
+      if self._note_request_meta(profile, timezone, language, fill_only=fill_only):
+        self.save_profile(uid, profile)
+      return profile
+
+  def ensure_fallback_content_for_uid(self, uid: str) -> Optional[UserProfile]:
+    """Atomically add zero-data fallback content and return the current profile.
+
+    This is an exceptional /analysis write path. Re-reading while holding the
+    UID lock prevents an older profile snapshot from overwriting a concurrent
+    update that arrived after the request's initial read.
+    """
+    with self.uid_lock(uid):
+      profile = self.get_profile(uid)
+      if profile is None or profile.sleep_data:
+        return profile
+      if self.content.ensure_fallback_content(uid, profile):
+        self.save_profile(uid, profile)
+      return profile
 
   def list_uids(self) -> list:
     """全部用户 uid（兜底扫描用）；排除 "_meta:" 前缀的全局 KV。"""
@@ -1121,7 +1246,7 @@ class UserProfileServ:
     timezone: Optional[str] = None,
     language: Optional[str] = None,
   ) -> UserProfile:
-    """Apply non-LLM profile updates. Must be called while holding self.lock.
+    """Apply non-LLM profile updates. Must be called while holding the UID stripe.
 
     Returns the profile object that should be saved.
     """
@@ -1191,7 +1316,7 @@ class UserProfileServ:
     skip_sleep_scenarios_reco_update: bool = False,
     skip_sleep_analysis_update: bool = False,
   ) -> None:
-    """Apply LLM-generated fields to profile in place. Must be called while holding self.lock.
+    """Apply LLM-generated fields to profile in place. Must be called while holding the UID stripe.
 
     推荐（sleep_reco）与睡眠分析（insight/analysis cache）是两条独立逻辑，
     由各自的 skip 开关单独控制，互不影响。
@@ -1228,14 +1353,14 @@ class UserProfileServ:
     """写入用户行为（仅更新单个用户数据）.
 
     Synchronous full-update path (basic + LLM in one call, LLM runs while
-    holding the lock). 生产路径请用 update_profile_basic + update_profile_llm
+    holding the UID stripe). 生产路径请用 update_profile_basic + update_profile_llm
     两段式（LLM 不持锁）；本路径保留给直接调用方和测试。
     """
     if new_profile is None or uid is None or not isinstance(uid, str):
       logging.error(f"invalid new profile {new_profile} or uid {uid}")
       return False
 
-    with self.lock:
+    with self.uid_lock(uid):
       # 读取或创建用户画像（仅操作单个用户，避免全量加载）
       profile = self.get_profile(uid)
       old_profile = profile
@@ -1269,18 +1394,18 @@ class UserProfileServ:
     health_schema_version: Optional[int] = None,
     timezone: Optional[str] = None,
     language: Optional[str] = None,
-  ) -> bool:
-    """Persist basic profile changes without LLM work. Fast path for HTTP update_profile."""
+  ) -> Optional[UserProfile]:
+    """Persist basic changes and return the saved profile for scheduling/response."""
     if new_profile is None or uid is None or not isinstance(uid, str):
       logging.error(f"invalid new profile {new_profile} or uid {uid}")
-      return False
+      return None
 
-    with self.lock:
+    with self.uid_lock(uid):
       profile = self.get_profile(uid)
       profile = self._apply_basic_update(uid, new_profile, profile, health_schema_version, timezone, language)
       self.save_profile(uid, profile)
       logging.info("Profile basic updated uid=%s", uid)
-      return True
+      return profile
 
   def update_profile_llm(
     self,
@@ -1290,7 +1415,7 @@ class UserProfileServ:
   ) -> bool:
     """Run LLM work for an existing profile and persist results.
 
-    Does not hold self.lock during LLM calls so concurrent basic updates are
+    Does not hold the UID stripe during LLM calls so concurrent basic updates are
     not blocked. Reloads the profile before saving to avoid overwriting
     concurrent writes.  推荐与睡眠分析由各自的 skip 开关独立控制。
     """
@@ -1298,7 +1423,7 @@ class UserProfileServ:
       logging.error(f"invalid uid {uid}")
       return False
 
-    with self.lock:
+    with self.uid_lock(uid):
       profile = self.get_profile(uid)
       if profile is None:
         logging.warning(f"skip llm update: profile not found for uid={uid}")
@@ -1321,7 +1446,7 @@ class UserProfileServ:
       analysis_reports = self.calc_analysis_reports(uid, llm_profile)
     bedtime_advice = self.content.calc_bedtime_advice(uid, llm_profile)
 
-    with self.lock:
+    with self.uid_lock(uid):
       profile = self.get_profile(uid)
       if profile is None:
         logging.warning(f"skip llm update: profile disappeared for uid={uid}")
