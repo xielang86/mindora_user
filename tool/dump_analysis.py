@@ -311,13 +311,41 @@ def deployment_diagnostic(responses: dict[str, dict]) -> str | None:
           "请核对请求地址、部署文件和服务进程，并在加载新版代码后重跑对账。")
 
 
+def source_data_diagnostic(profile: dict, responses: dict[str, dict], previous_revision: int | None = None) -> str | None:
+  """Explain a missing Weekly Best when the queried profile has lost its inputs."""
+  overview = (responses.get("analysis_overview") or {}).get("data") or {}
+  if overview.get("weekly_best"):
+    return None
+  plays = sum(len(entries) for entries in (profile.get("mindora_record") or {}).values()
+              if isinstance(entries, list))
+  if plays:
+    return None
+  revision = profile.get("revision")
+  nights = profile.get("sleep_data") or []
+  latest = max((row.get("timestamp", 0) for row in nights if isinstance(row, dict)), default=0)
+  message = (f"weekly_best 缺失：本次 query_profile 的 mindora_record 有 0 条播放，"
+             f"revision={revision}、sleep_data={len(nights)} 晚、最新睡眠时间戳={latest}。"
+             "当前响应无法从这些数据计算场景名称、使用次数或分数。")
+  if isinstance(revision, int) and previous_revision is not None and revision < previous_revision:
+    message += (f"同 UID 的旧导出曾有更高 revision={previous_revision}；"
+                "请核对服务地址、RUN_DIR/数据库目录，或排查画像回退。")
+  return message
+
+
 def render_report(checker: Checker, uid: str, date: str, out_files: dict[str, str],
-                  diagnostic: str | None = None) -> str:
+                  diagnostic: str | None = None, source: str | None = None,
+                  source_url: str | None = None) -> str:
   lines = [
     f"# /analysis 字段对照表 — uid={uid} date={date}",
     "",
     "app 逐屏核对时按本表路径取值；✅=已与源数据自动对账，📝=文案需人工核对，➖=缺省（app 应显示 --/空态），❌=不一致（bug）。",
     "",
+  ]
+  if source_url:
+    lines += [f"数据源：`{source_url}`", ""]
+  if source:
+    lines += [f"数据源诊断：{source}", ""]
+  lines += [
     "| 界面 | JSON 路径 | 值 | 核对 |",
     "|---|---|---|---|",
   ]
@@ -411,8 +439,21 @@ def main():
   checker = run_checks(profile, responses, args.date, has_sleep_source=args.sleep_data_count > 0,
                        timezone=args.timezone, language=args.language)
   diagnostic = deployment_diagnostic(responses)
+  previous_revision = None
+  for old_path in out_dir.parent.glob(f"{uid}_*/query_profile.json"):
+    if old_path.parent == out_dir:
+      continue
+    try:
+      old_profile = ((json.loads(old_path.read_text()).get("data") or {}).get("user_profile") or {})
+      old_revision = old_profile.get("revision")
+      if isinstance(old_revision, int):
+        previous_revision = max(previous_revision or 0, old_revision)
+    except (OSError, ValueError):
+      continue
+  source = source_data_diagnostic(profile, responses, previous_revision)
   report = render_report(checker, uid, args.date,
-                         {p.name: str(p) for p in sorted(out_dir.glob('*.json'))}, diagnostic)
+                         {p.name: str(p) for p in sorted(out_dir.glob('*.json'))},
+                         diagnostic, source, base_url)
   (out_dir / "CHECK_REPORT.md").write_text(report)
 
   fails = [r for r in checker.rows if r[3].startswith("❌")]
@@ -422,6 +463,8 @@ def main():
     print(f"  ❌ [{screen}] {path}: {value} — {verdict}")
   if diagnostic:
     print(f"\n版本诊断：{diagnostic}")
+  if source:
+    print(f"\n数据源诊断：{source}")
   print(f"\n对照表: {out_dir / 'CHECK_REPORT.md'}")
   sys.exit(1 if fails else 0)
 
