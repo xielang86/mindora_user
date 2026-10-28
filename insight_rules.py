@@ -993,6 +993,19 @@ def build_sleep_day_modules(profile: UserProfile, base: Baseline, lang: str) -> 
     else:
         scene_description = _t("day_scene_none", lang)
 
+    if not latest.sleep_status:
+        unavailable = {
+            "zh-Hans": "这晚没有睡眠分期数据，暂无法解读该阶段。",
+            "zh-Hant": "這晚沒有睡眠分期資料，暫無法解讀該階段。",
+            "en": "No sleep-stage data was recorded for this night, so this stage cannot be interpreted.",
+        }.get(_canonical_lang(lang), "No sleep-stage data was recorded for this night.")
+        return {
+            "sleep_scenarios": {"title": scene_display_name(scene_id) if scene_id else "",
+                                "description": scene_description},
+            "stage_insights": {stage: {"description": unavailable}
+                               for stage in ("awake", "rem", "core", "deep")},
+        }
+
     awake_count = int(round(summ.get("night_awake_count") or 0))
     awake_min = int(round(summ.get("night_awake_duration") or 0))
     stage_descriptions = {

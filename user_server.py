@@ -821,6 +821,14 @@ class UserServer:
           updates = {k: v for k, v in updates.items() if k in req.data.modules}
         deep_merge(response_data, updates)
 
+      # Stored prose can still say "昨晚" after an old night is selected.
+      # Apply the same date wording after report merge as on the builder path.
+      if req.request_type in {"analysis_overview", "analysis_sleep_day", "analysis_explore"}:
+        analysis_builders.qualify_day_level_text(
+          response_data, req.request_type, profile,
+          analysis_builders._req_tzinfo(req.data, profile), req.data.language,
+        )
+
       resp = AnalysisResponse(code=0, msg="success", request_type=req.request_type, data=response_data)
       return _respond(resp)
 

@@ -8,6 +8,7 @@
     其他视图的库存文案由 handle_analysis_http 合并。
 """
 import datetime
+import re
 import time
 from typing import Optional
 
@@ -16,7 +17,7 @@ from sleep_session_builder import mean_sleep_duration
 from sleep_metrics import MAX_PLAY_TO_SLEEP, build_sleep_metrics, estimate_sleep_window, has_unspecified_stage
 from analysis_score import SCORE_VERSION, INDEX_VERSION, daily_score, period_score
 from analysis_content import AnalysisContentService
-from user_profile import UserProfile, compute_recent_sleep_stats, short_scene_id
+from user_profile import UserProfile, short_scene_id
 
 
 # ── 数据锚定（有效时间口径）：洞察与分析锚定最近一条有效夜晚的日期 ──────────
@@ -60,6 +61,59 @@ def _req_tzinfo(d, profile: Optional[UserProfile]) -> datetime.tzinfo:
     except Exception:
       pass
   return datetime.timezone.utc
+
+
+def qualify_day_level_text(result: dict, request_type: str, profile: Optional[UserProfile],
+                           tz: datetime.tzinfo, language: str, now_ts: Optional[int] = None) -> dict:
+  """Date old-night prose after all rule and stored-report text has been merged."""
+  latest = _fresh_latest(profile, tz)
+  if latest is None:
+    return result
+  age = (int(time.time()) if now_ts is None else now_ts) - latest.timestamp
+  if 0 <= age < 86400:
+    return result
+  date = datetime.datetime.fromtimestamp(latest.timestamp, tz).date().isoformat()
+  canonical = language if language in {"zh-Hans", "zh-Hant"} else "en"
+  prefix = (f"最近一次睡眠记录（{date}）：" if canonical == "zh-Hans" else
+            f"最近一次睡眠記錄（{date}）：" if canonical == "zh-Hant" else
+            f"Latest recorded sleep ({date}): ")
+  fields = {
+    "analysis_overview": {"sleep_insight": ("description",)},
+    "analysis_sleep_day": {"sleep_scenarios": ("description",),
+                           "stage_insights": ("awake", "rem", "core", "deep")},
+    "analysis_explore": {"header_summary": ("intro_text",),
+                          "onset_efficiency": ("description",),
+                          "sleep_structure": ("description",),
+                          "night_fluctuation": ("description",),
+                          "scene_preference": ("description",),
+                          "sleep_advice": ("description",)},
+  }.get(request_type, {})
+
+  def dated(value):
+    if not isinstance(value, str) or not value.strip() or value.startswith(prefix):
+      return value
+    if canonical.startswith("zh"):
+      value = value.replace("昨晚", "该夜" if canonical == "zh-Hans" else "該夜")
+      value = value.replace("昨夜", "该夜" if canonical == "zh-Hans" else "該夜")
+    else:
+      value = re.sub(r"\blast night's\b", "that night's", value, flags=re.IGNORECASE)
+      value = re.sub(r"\blast night\b", "that night", value, flags=re.IGNORECASE)
+    return prefix + value
+
+  for module, names in fields.items():
+    card = result.get(module)
+    if not isinstance(card, dict):
+      continue
+    if module == "stage_insights":
+      for stage in names:
+        item = card.get(stage)
+        if isinstance(item, dict) and "description" in item:
+          item["description"] = dated(item["description"])
+    else:
+      for name in names:
+        if name in card:
+          card[name] = dated(card[name])
+  return result
 
 
 def _clamp_window(start: str, end: str, today: datetime.date,
@@ -347,11 +401,21 @@ def build_overview(d, profile: Optional[UserProfile]) -> dict:
     weekly_best.update(_week_scene_score(profile, scene))
     result["weekly_best"] = weekly_best
 
-  # sleep_insight：纯文案模块，默认值空串（LLM 报告覆盖；md 降级约定显示空字符串）
+  # 规则文案在读路径即可生成；同语言库存报告可在接口层覆盖。
+  # 停戴用户请求日期晚于最后一夜时，不能因日报告未命中而把整卡留空。
   result["sleep_insight"] = {"title": "", "description": "", "date": date}
+  if latest and profile:
+    import insight_rules as ir
+    text_profile = profile.model_copy(update={
+      "last_request_timezone": str(tz), "last_request_language": d.language,
+    })
+    _, _, conclusions = ir.build_night_conclusions(text_profile, d.language)
+    memory = (text_profile.sleep_analysis or {}).get("insight_memory") or {}
+    home = ir.rule_home_summary(conclusions, memory, d.language, anchor)
+    result["sleep_insight"].update(title=home.title, description=home.text)
   if metrics is not None:
     result["sleep_metrics"] = metrics
-  return filter_modules(result, d.modules)
+  return qualify_day_level_text(filter_modules(result, d.modules), "analysis_overview", profile, tz, d.language)
 
 
 def build_sleep_day(d, profile: Optional[UserProfile]) -> dict:
@@ -372,10 +436,9 @@ def build_sleep_day(d, profile: Optional[UserProfile]) -> dict:
   if onset_index is not None:
     result["score_summary"] = {"score": onset_index, "score_version": INDEX_VERSION, "date": date}
 
-  # sleep_scenarios：标题取当天最近使用场景（无则空串），描述文案 LLM 报告覆盖
-  stats = compute_recent_sleep_stats(profile, days=1) if (profile and latest) else {}
+  # 场景与分期说明在读路径使用确定性规则；库存报告仅覆盖非空文案。
   result["sleep_scenarios"] = {
-    "title": stats.get("recent_scene_title") or "",
+    "title": "",
     "description": "",
     "date": date,
   }
@@ -386,9 +449,21 @@ def build_sleep_day(d, profile: Optional[UserProfile]) -> dict:
   }
   if latest and has_unspecified_stage(latest, profile):
     result["stage_insights"]["core"]["stage_classification"] = "contains_unspecified"
+  if latest and profile:
+    import insight_rules as ir
+    text_profile = profile.model_copy(update={
+      "last_request_timezone": str(tz), "last_request_language": d.language,
+    })
+    rules = ir.build_sleep_day_modules(text_profile, ir.compute_baselines(text_profile, tz), d.language)
+    scene_text = rules.get("sleep_scenarios") or {}
+    result["sleep_scenarios"]["title"] = scene_text.get("title") or ""
+    result["sleep_scenarios"]["description"] = scene_text.get("description") or ""
+    for stage, fields in (rules.get("stage_insights") or {}).items():
+      if stage in result["stage_insights"]:
+        result["stage_insights"][stage].update(fields)
   if metrics is not None:
     result["sleep_metrics"] = metrics
-  return filter_modules(result, d.modules)
+  return qualify_day_level_text(filter_modules(result, d.modules), "analysis_sleep_day", profile, tz, d.language)
 
 
 def _fill_period_text(result: dict, d, profile: Optional[UserProfile], start, end, tz, days: int) -> None:
@@ -648,4 +723,4 @@ def build_explore(d, profile: Optional[UserProfile]) -> dict:
   for module, fields in AnalysisContentService.explore_text_modules(text_profile, d.language).items():
     if module in result:
       result[module].update(fields)
-  return filter_modules(result, d.modules)
+  return qualify_day_level_text(filter_modules(result, d.modules), "analysis_explore", profile, tz, d.language)
