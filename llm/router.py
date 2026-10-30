@@ -6,6 +6,8 @@ api_base / model 放 config.py，api_key 一律从环境变量读取（不落地
   - volc_ark  火山方舟：key=ARK_API_KEY，endpoint=ARK_ENDPOINT_ID
   - kimi      Kimi 编程订阅（Anthropic Messages 协议）：key=KIMI_API_KEY，
               base/model 可用 KIMI_API_BASE / KIMI_MODEL 覆盖
+  - openrouter OpenRouter（OpenAI Chat Completions 协议）：key=OPENROUTER_API_KEY，
+               model=OPENROUTER_MODEL，默认路由用 LLM_DEFAULT_ROUTE=openrouter
 
 路由规则来自 Config.LLM_ROUTING：request_type → 方向名，"default" 兜底。
 两级兜底：
@@ -18,7 +20,7 @@ api_base / model 放 config.py，api_key 一律从环境变量读取（不落地
 
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field as dataclass_field
 from typing import Any, List, Optional
 
 import requests
@@ -40,6 +42,7 @@ class OpenAICompatibleChat(BaseChatModel):
     model: str = Field(..., description="模型名")
     temperature: float = Field(0.7, description="采样温度")
     max_tokens: Optional[int] = Field(None, description="最大生成 token 数")
+    extra_headers: dict[str, str] = Field(default_factory=dict, description="供应商附加请求头")
 
     def _generate(
         self,
@@ -72,6 +75,7 @@ class OpenAICompatibleChat(BaseChatModel):
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.api_key}",
         }
+        headers.update(self.extra_headers)
         timeout_seconds = int(os.getenv("LLM_TIMEOUT", "120"))
         try:
             response = requests.post(
@@ -181,10 +185,11 @@ class LLMRoute:
     model: str                                  # 来自 config.py（可被环境变量覆盖）
     endpoint_id: Optional[str] = None           # 仅 volc_ark 用
     temperature: float = 0.5
+    extra_headers: dict[str, str] = dataclass_field(default_factory=dict)
 
     @property
     def available(self) -> bool:
-        return bool(self.api_key)
+        return bool(self.api_key and self.api_base and self.model)
 
 
 class ModelRouter:
@@ -213,6 +218,19 @@ class ModelRouter:
                 api_key=os.getenv("KIMI_API_KEY"),
                 api_base=os.getenv("KIMI_API_BASE") or Config.KIMI_API_BASE,
                 model=os.getenv("KIMI_MODEL") or Config.KIMI_MODEL,
+            ),
+            "openrouter": LLMRoute(
+                name="openrouter",
+                kind="openai",
+                api_key=os.getenv("OPENROUTER_API_KEY"),
+                api_base=Config.OPENROUTER_API_BASE,
+                model=os.getenv("OPENROUTER_MODEL") or Config.OPENROUTER_MODEL,
+                extra_headers={
+                    key: value for key, value in {
+                        "HTTP-Referer": Config.OPENROUTER_APP_URL,
+                        "X-Title": Config.OPENROUTER_APP_NAME,
+                    }.items() if value
+                },
             ),
         }
         return cls(routes, dict(Config.LLM_ROUTING))
@@ -308,4 +326,5 @@ class ModelRouter:
             api_base=route.api_base,
             model=route.model,
             temperature=temp,
+            extra_headers=route.extra_headers,
         )

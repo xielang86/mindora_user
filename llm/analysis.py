@@ -552,7 +552,8 @@ class SleepAnalysisLLM:
         self._last_good: dict[str, str] = {}
         if self._model is None:
             logging.warning(
-                "no available LLM route (set ARK_API_KEY or KIMI_API_KEY) — LLM analysis disabled, using default text"
+                "no available LLM route (set ARK_API_KEY, KIMI_API_KEY, or "
+                "OPENROUTER_API_KEY + OPENROUTER_MODEL) — LLM analysis disabled, using default text"
             )
 
     def _model_for(self, request_type: str) -> Optional[VolcEngineArkChat]:

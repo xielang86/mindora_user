@@ -94,9 +94,23 @@ class Config:
   # base/model 可用 KIMI_API_BASE / KIMI_MODEL（env）覆盖；base 不含 /v1/messages（SDK 自动拼）
   KIMI_API_BASE = "https://api.kimi.com/coding"
   KIMI_MODEL = "kimi-k3"
+  # OpenRouter（OpenAI Chat Completions 兼容协议）。key/model 均由环境变量提供；
+  # model 不设默认值，避免供应商模型上下线后静默切换到非预期模型。
+  OPENROUTER_API_BASE = os.getenv(
+    "OPENROUTER_API_BASE", "https://openrouter.ai/api/v1/chat/completions",
+  )
+  OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "").strip()
+  OPENROUTER_APP_URL = os.getenv("OPENROUTER_APP_URL", "").strip()
+  OPENROUTER_APP_NAME = os.getenv("OPENROUTER_APP_NAME", "Mindora").strip()
   # 模型路由：request_type → 方向名，"default" 兜底；
   # 所选方向不可用（缺 key）时自动降级到第一个可用方向（见 llm/router.py）
-  LLM_ROUTING = {"default": "kimi"}
+  # LLM_DEFAULT_ROUTE=openrouter 即可把默认分析与推荐切到 OpenRouter；
+  # LLM_SLEEP_RECO_ROUTE 可单独覆盖推荐方向。
+  LLM_ROUTING = {
+    "default": os.getenv("LLM_DEFAULT_ROUTE", "kimi").strip(),
+    "sleep_reco": os.getenv("LLM_SLEEP_RECO_ROUTE", "").strip()
+      or os.getenv("LLM_DEFAULT_ROUTE", "kimi").strip(),
+  }
 
   # 同一用户两次 LLM 后台更新之间的最小间隔（秒）
   LLM_UPDATE_COOLDOWN_SECONDS = 300
