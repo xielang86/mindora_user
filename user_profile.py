@@ -17,13 +17,35 @@ class BaseResponse(BaseModel):
   msg: str = ""
 
 # -------------------------- 子模型定义（对应data下一级字段的嵌套结构） --------------------------
+# 播放统计（behaviors.plays → mindora_record）支持的内容 cmd 前缀：
+# 引导式场景 SOP（sleep.scene.）+ 纯音乐（sleep.pure_music.；裸 pure_music. 兼容端上早期上报）。
+# 推荐侧（llm/reco.py）仍只推引导式场景，不受此影响。
+SCENE_CMD_PREFIXES = ("sleep.scene.", "sleep.pure_music.", "pure_music.")
+
+def short_scene_id(scene_id: str) -> str:
+  """播放 cmd（可带 SCENE_CMD_PREFIXES 前缀）→ 短 id，用于展示名与统计键归一。"""
+  for prefix in SCENE_CMD_PREFIXES:
+    if scene_id.startswith(prefix):
+      return scene_id[len(prefix):]
+  return scene_id
+
+
 class Address(BaseModel):
   id: str = Field(..., description="地址唯一 ID")
   is_default: bool = Field(..., description="是否默认地址")
-  region: str = Field(..., description="省市区或区域信息")
-  detail: str = Field(..., description="详细地址")
+  region: str = Field(..., description="兼容字段：国家名+state+city+district 拼出的展示串，勿用于发货、勿解析")
+  detail: str = Field(..., description="兼容字段：street1+street2+zip 拼出的展示串，勿用于发货")
   name: str = Field(..., description="收件人姓名")
-  phone: str = Field(..., description="收件人电话")
+  phone: str = Field(..., description="收件人电话，E.164 格式（带 + 与国际区号）")
+  # 结构化字段（同步商城发货用；存量地址/老客户端可能缺失，全部选填）
+  country_code: Optional[str] = Field(None, description="国家/地区，ISO 3166-1 alpha-2（US/CN/GB）")
+  state_code: Optional[str] = Field(None, description="州/省代码：美/加两位字母码（CA），中国民政部数字省级码（33）")
+  state: Optional[str] = Field(None, description="州/省显示名（面单打印值）")
+  city: Optional[str] = Field(None, description="城市")
+  district: Optional[str] = Field(None, description="区/县（仅中国等三级行政区划国家填）")
+  street1: Optional[str] = Field(None, description="街道地址（门牌号 + 街道名）")
+  street2: Optional[str] = Field(None, description="门牌/套间/单元，选填")
+  zip: Optional[str] = Field(None, description="邮编（美国必填 \\d{5} 或 \\d{5}-\\d{4}；无邮编国家为空）")
 
 class Profile(BaseModel):
   nickname: Optional[str] = Field("", description="昵称")
@@ -38,7 +60,41 @@ class Profile(BaseModel):
   weight: Optional[float] = Field(None, description="体重，单位 kg")
   height: Optional[float] = Field(None, description="身高，单位 cm")
   language: str = Field("zh-CN", description="语言")
-  wechat: Optional[str] = Field(None, description="微信号")
+  religion: Optional[str] = Field("", description="宗教信仰")
+  coacher: Optional[str] = Field("", description="导师/风格偏好")
+
+
+# 睡眠健康问卷（onboarding/设置页收集的睡眠相关字段）
+class SleepHealthProfile(BaseModel):
+  sleep_quality: Optional[str] = Field(None, description="自评睡眠质量")
+  health_problems: Optional[str] = Field(None, description="健康问题")
+  weekly_sleep_duration: Optional[str] = Field(None, description="周睡眠时长")
+  weekly_sleep_status: Optional[str] = Field(None, description="周睡眠状态")
+  weekly_exercise_volume: Optional[str] = Field(None, description="周运动量")
+  improvement_goal: Optional[str] = Field(None, description="睡眠改善目标")
+  meditation_experience: Optional[str] = Field(None, description="冥想经验")
+  stress_type: Optional[str] = Field(None, description="压力类型")
+  medication_status: Optional[str] = Field(None, description="用药情况")
+
+
+# 睡眠模式设置（对应 GUI/data/config 中的 profile.sleepMode）
+class SleepModeProfile(BaseModel):
+  is_smart: Optional[bool] = Field(None, description="是否开启智能睡眠模式")
+  start_time: Optional[str] = Field(None, description="睡眠模式开始时间，如 22:00")
+  end_time: Optional[str] = Field(None, description="睡眠模式结束时间，如 08:00")
+  sleep_light: Optional[str] = Field(None, description="助眠灯光等级")
+  screen_display: Optional[str] = Field(None, description="屏幕显示设置")
+  essential_oil: Optional[str] = Field(None, description="精油/香氛设置")
+  voice_guidance: Optional[str] = Field(None, description="语音引导设置")
+  wake_light: Optional[str] = Field(None, description="唤醒灯光等级")
+
+  @field_validator("sleep_light", "screen_display", "essential_oil", "voice_guidance", "wake_light", mode="before")
+  @classmethod
+  def coerce_level_to_str(cls, value):
+    # 历史数据/部分客户端仍按 int 上报等级值，pydantic v2 不再自动 int→str，这里统一归一
+    if value is not None and not isinstance(value, str):
+      return str(value)
+    return value
 
 
 # 建议新增：环境与敏感度
@@ -80,6 +136,23 @@ class SleepElement(BaseModel):
   vitals: Optional[StageVitals] = Field(None, description="该阶段内的平均体征（心率/呼吸/体温）")
   events: List[NightEvent] = Field(default_factory=list, description="该阶段内发生的环境/设备事件（噪音、屏幕、语音、干预等）")
 
+def _classify_awake_type(awake_count: int, awake_minutes: float) -> Optional[str]:
+  """夜间觉醒类型（统计派生标签）。
+
+  上游（HealthKit sleep_stage_awake / 设备上报）只有 awake 段+时长，没有子类型，
+  因此按当夜觉醒次数与总时长分级；多语言由 explore 的 LLM 报告本地化覆盖。
+  """
+  if awake_count <= 0:
+    return None
+  if awake_count <= 2 and awake_minutes <= 10:
+    return "Brief awakening"        # 偶发短暂觉醒
+  if awake_count >= 5:
+    return "Frequent awakenings"    # 频繁觉醒
+  if awake_minutes >= 30:
+    return "Prolonged awakening"    # 长时间觉醒
+  return "Moderate awakening"       # 中等
+
+
 class SleepResult(BaseModel):
   timestamp: int = Field(..., description="数据 update 时间戳（秒级）")
   sleep_quality: Optional[float] = Field(None, description="睡眠得分，范围0-100") 
@@ -96,7 +169,6 @@ class SleepResult(BaseModel):
 
   hrv: Optional[float] = Field(None, description="心率波动，单位bpm")
   respiratory_var: Optional[float] = Field(None, description="呼吸频率波动，单位次/分钟")
-
   # 当夜心率范围（update_profile 时从 behaviors.heart_rate 按睡眠窗口算出并持久化；
   # behaviors 序列有 MAX_BEHAVIOR_LEN 截断，请求时再算会丢历史窗口数据）
   hr_min: Optional[float] = Field(None, description="当夜睡眠窗口内心率最小值，单位bpm")
@@ -125,23 +197,51 @@ class SleepResult(BaseModel):
   # 无法归属到具体阶段的整晚事件（如卧床前的环境光、夜间离床等）
   night_events: List[NightEvent] = Field(default_factory=list, description="整晚环境/设备事件（噪音、对话、屏幕、光感、干预、离床等）")
 
+  # 来源标记：None=客户端（Mindora 设备/App）直接上报；"healthkit"=服务端从健康
+  # behaviors 序列合成（sleep_session_builder）。合成行在同晚修正值到达时被重算覆盖，
+  # 且与同晚设备上报行共存时让位（设备数据更准）
+  source: Optional[str] = Field(None, description="记录来源：None=客户端上报；healthkit=服务端合成")
+  in_bed_intervals: List[Tuple[int, int]] = Field(default_factory=list, description="真实卧床样本的起止 Unix 秒；保留来源，禁止写入估算区间")
+
   @property
   def sequence_summaries(self):
-    awake_types = {}
-    for seq in self.sleep_status:
-      if seq.sleep_type == "awake":
-        awake_types[seq.sleep_type] = awake_types.get(seq.sleep_type, 0) + 1
+    """阶段汇总（分钟）。property 不进 model_dump，响应由 user_server 手动注入。
 
-    max_awake_type = max(awake_types, key=awake_types.get) if awake_types else None
+    三个时长口径不要混用：
+      - ``total_sleep_duration``：总睡眠 TST = 非 awake 段之和。要 TST 一律读这个，
+        别再用 ``time_in_bed - night_awake_duration`` 减出来——time_in_bed 现在可能是
+        真实卧床，减法会把睡前清醒时间算进睡眠里。
+      - ``sleep_span``：阶段序列覆盖的跨度（含觉醒段），阶段占比的分母。
+      - ``time_in_bed``：卧床时长，按健康数据同步接口_0814.md §10「Time In Bed =
+        sleep_in_bed 求和」优先取真实 inBed 样本（``in_bed_intervals``）；
+        没有 inBed 的用户（Apple Watch 不写 inBed，见 §5）退回 sleep_span，
+        由 ``time_in_bed_source`` 标明来源。
+    """
+    # 觉醒类型由次数+总时长统计派生（原实现按 sleep_type 取众数，key 恒为 "awake"，恒返回 "awake"）
+    awake_count = sum(1 for seq in self.sleep_status if seq.sleep_type == "awake")
+    awake_duration = sum(seq.duration for seq in self.sleep_status if seq.sleep_type == "awake")
+    sleep_span = sum(seq.duration for seq in self.sleep_status)
+    total_sleep = sleep_span - awake_duration
+
+    bed_minutes = None
+    if self.in_bed_intervals:
+      bed_minutes = round(
+        sum(max(0, int(end) - int(start)) for start, end in self.in_bed_intervals) / 60.0, 2)
+      # 卧床短于实测睡眠 = 数据自相矛盾（inBed 半截值/时间戳错位），退回阶段跨度
+      if bed_minutes < total_sleep:
+        bed_minutes = None
 
     return {
       "rem_sleep_duration": sum(seq.duration for seq in self.sleep_status if seq.sleep_type == "rem"),
       "core_sleep_duration": sum(seq.duration for seq in self.sleep_status if seq.sleep_type == "core"),
       "deep_sleep_duration": sum(seq.duration for seq in self.sleep_status if seq.sleep_type == "deep"),
-      "night_awake_duration": sum(seq.duration for seq in self.sleep_status if seq.sleep_type == "awake"),
-      "night_awake_count": sum(1 for seq in self.sleep_status if seq.sleep_type == "awake"),
-      "night_awake_type": max_awake_type,
-      "time_in_bed": sum(seq.duration for seq in self.sleep_status)
+      "night_awake_duration": awake_duration,
+      "night_awake_count": awake_count,
+      "night_awake_type": _classify_awake_type(awake_count, awake_duration),
+      "total_sleep_duration": total_sleep,
+      "sleep_span": sleep_span,
+      "time_in_bed": bed_minutes if bed_minutes is not None else sleep_span,
+      "time_in_bed_source": "in_bed" if bed_minutes is not None else "stage_span",
     }
 
 # -------------------------- 睡眠统计辅助 --------------------------
@@ -174,11 +274,12 @@ def compute_recent_sleep_stats(profile: "UserProfile", days: int = 7) -> Dict[st
     nums = [v for v in values if v is not None]
     return round(sum(nums) / len(nums), 1) if nums else None
 
+  from sleep_session_builder import resolve_sleep_onset, resolve_sleep_onset_efficiency
   stats: Dict[str, Any] = {
     "record_count": len(recent),
     "avg_sleep_quality": _avg([r.sleep_quality for r in recent]),
-    "avg_soe": _avg([r.soe for r in recent]),
-    "avg_onset_min": _avg([r.onset for r in recent]),
+    "avg_soe": _avg([resolve_sleep_onset_efficiency(r) for r in recent]),
+    "avg_onset_min": _avg([resolve_sleep_onset(r) for r in recent]),
     "avg_hr_before_sleep": _avg([r.hr_before_sleep for r in recent]),
     "avg_rr_before_sleep": _avg([r.rr_before_sleep for r in recent]),
     "avg_heart_rate": _avg([r.avg_heart_rate for r in recent]),
@@ -194,6 +295,8 @@ def compute_recent_sleep_stats(profile: "UserProfile", days: int = 7) -> Dict[st
 
   # Aggregate stage stats across the week.
   total_time_in_bed = 0.0
+  total_sleep_span = 0.0
+  total_sleep = 0.0
   total_deep = 0.0
   total_core = 0.0
   total_rem = 0.0
@@ -203,6 +306,8 @@ def compute_recent_sleep_stats(profile: "UserProfile", days: int = 7) -> Dict[st
   for record in recent:
     summ = record.sequence_summaries if record.sleep_status else {}
     total_time_in_bed += summ.get("time_in_bed", 0)
+    total_sleep_span += summ.get("sleep_span", 0)
+    total_sleep += summ.get("total_sleep_duration", 0)
     total_deep += summ.get("deep_sleep_duration", 0)
     total_core += summ.get("core_sleep_duration", 0)
     total_rem += summ.get("rem_sleep_duration", 0)
@@ -210,13 +315,16 @@ def compute_recent_sleep_stats(profile: "UserProfile", days: int = 7) -> Dict[st
     total_awake_count += summ.get("night_awake_count", 0)
 
   stats["avg_time_in_bed_min"] = round(total_time_in_bed / len(recent), 1) if recent else 0
+  stats["avg_total_sleep_min"] = round(total_sleep / len(recent), 1) if recent else 0
   stats["avg_deep_min"] = round(total_deep / len(recent), 1) if recent else 0
   stats["avg_core_min"] = round(total_core / len(recent), 1) if recent else 0
   stats["avg_rem_min"] = round(total_rem / len(recent), 1) if recent else 0
   stats["avg_awake_min"] = round(total_awake / len(recent), 1) if recent else 0
   stats["avg_awake_count"] = round(total_awake_count / len(recent), 1) if recent else 0
 
-  denom = total_time_in_bed or 1
+  # 阶段占比的分母是阶段跨度，不是卧床时长——卧床含睡前清醒，拿它做分母会让
+  # 各阶段占比凭空缩水（且有无 inBed 数据的用户口径不一致）
+  denom = total_sleep_span or 1
   stats["avg_deep_pct"] = round(total_deep / denom * 100, 1)
   stats["avg_rem_pct"] = round(total_rem / denom * 100, 1)
   stats["avg_core_pct"] = round(total_core / denom * 100, 1)
@@ -231,7 +339,7 @@ def compute_recent_sleep_stats(profile: "UserProfile", days: int = 7) -> Dict[st
   for scene_key, records in (profile.mindora_record or {}).items():
     if not isinstance(records, list) or not records:
       continue
-    title = scene_key.replace("sleep.scene.", "").replace("_", " ").title()
+    title = short_scene_id(scene_key).replace("_", " ").title()
     for entry in records:
       if isinstance(entry, (list, tuple)) and len(entry) >= 1:
         try:
@@ -284,6 +392,7 @@ class SleepInsightReport(BaseModel):
   language: str = Field("en", description="文案语言代码")
   generated_at: Optional[int] = Field(None, description="生成时间戳（秒级）")
   llm_used: bool = Field(True, description="False 代表 LLM 未参与/生成失败")
+  input_fingerprint: Optional[str] = Field(None, description="生成文案时的输入数据与规则版本指纹；旧报告缺省为空")
   greeting: InsightModule = Field(
     default_factory=lambda: InsightModule(module_id=0),
     description="模块0｜顶部问候与洞察引导（Context & Trust）",
@@ -309,6 +418,23 @@ class SleepInsightReport(BaseModel):
     description="模块5｜轻量睡眠知识提示（Micro Education，可选）",
   )
 
+
+class BedtimeAdvice(BaseModel):
+  """画像中的睡前建议；生成时间用于七天更新间隔。"""
+  content: str = Field(..., description="睡前可执行建议")
+  language: str = Field("en", description="建议语言代码")
+  generated_at: int = Field(..., description="生成时间戳（秒级）")
+
+
+BEDTIME_ADVICE_INTERVAL_SECONDS = 7 * 86400
+
+
+def bedtime_advice_due(profile: "UserProfile", now: Optional[int] = None) -> bool:
+  advice = getattr(profile, "bedtime_advice", None) if profile else None
+  if advice is None or not advice.content.strip() or not advice.generated_at:
+    return True
+  return (int(time.time()) if now is None else now) - advice.generated_at >= BEDTIME_ADVICE_INTERVAL_SECONDS
+
 # -------------------------- /analysis 文案报告（LLM 异步生成，按周期序列存储） --------------------------
 class AnalysisTextReport(BaseModel):
   """单个周期（日/周/月）的 /analysis 文案报告。
@@ -323,6 +449,7 @@ class AnalysisTextReport(BaseModel):
   language: str = Field("en", description="文案语言代码")
   generated_at: int = Field(..., description="生成时间戳（秒级）")
   llm_used: bool = Field(True, description="False 代表 LLM 未参与/生成失败")
+  input_fingerprint: Optional[str] = Field(None, description="生成文案时的输入数据与规则版本指纹；旧报告缺省为空")
   modules: Dict[str, Any] = Field(default_factory=dict, description="接口文档响应结构的模块字典")
 
 # 各类报告的保留条数：日级 30（与 sleep_data 同序列长度）、周 10、月 12
@@ -330,6 +457,61 @@ ANALYSIS_REPORT_KEYS = (
   "analysis_overview", "analysis_sleep_day", "analysis_explore",
   "analysis_sleep_week", "analysis_sleep_month",
 )
+# 运营/陪伴四件套：画像里只是副本，完整数据各有专用端点（/footprint、/popup、/survey）。
+# 存储上限（MAX_ENGAGEMENT_LEN）与 query_profile 响应截尾（engagement_count）共用
+# 同一套「最新优先」排序键，避免两边口径打架。
+def active_sleep_plan(profile) -> Optional["SyncedSleepPlan"]:
+  """当前生效的账号级睡眠计划（sleep_plans 里 status=active 的那条，至多 1 条）。
+
+  睡眠计划同步接口.md §6③ 保证同一 uid 至多 1 条 active，且 status != active 时
+  activated_at 必为 null。注意与 UserProfile.sleep_plan（设备端老字段，全仓无写入方）
+  不是一回事——分析链路要读计划，一律走这个函数。
+  """
+  for plan in (getattr(profile, "sleep_plans", None) or []):
+    if not plan.deleted and plan.status == "active" and plan.target_minutes:
+      return plan
+  return None
+
+
+ENGAGEMENT_RESPONSE_KEYS = (
+  "footprint_days", "inbox_messages", "popup_states", "survey_submissions",
+)
+
+
+def engagement_sort_value(key: str, item_key: Any, item: Any):
+  """四件套的新旧判定值；item 可以是 pydantic 模型，也可以是 model_dump 后的 dict。"""
+  def _get(name):
+    return item.get(name) if isinstance(item, dict) else getattr(item, name, None)
+
+  if key == "footprint_days":
+    return item_key or ""          # 键就是 yyyy-MM-dd，字典序即时间序
+  if key == "inbox_messages":
+    return _get("created_at") or 0
+  if key == "survey_submissions":
+    return _get("submitted_at") or 0
+  return _get("last_impression_at") or 0   # popup_states：没曝光过的最先被挤掉
+
+
+def keep_latest_engagement(key: str, container: Any, limit: int):
+  """按 key 的时间戳截尾保留最新 limit 条；limit<=0 返回 None（调用方据此整体丢弃）。
+
+  dict（footprint_days / survey_submissions / popup_states）与 list（inbox_messages）
+  两种形态都支持，返回同形态。
+  """
+  if limit <= 0:
+    return None
+  if isinstance(container, dict):
+    if len(container) <= limit:
+      return container
+    keep = sorted(container, key=lambda k: engagement_sort_value(key, k, container[k]))[-limit:]
+    return {k: container[k] for k in keep}
+  if isinstance(container, list):
+    if len(container) <= limit:
+      return container
+    return sorted(container, key=lambda it: engagement_sort_value(key, None, it))[-limit:]
+  return container
+
+
 ANALYSIS_REPORT_RETENTION = {
   "analysis_overview": 30,
   "analysis_sleep_day": 30,
@@ -377,10 +559,19 @@ class GiftDelivery(BaseModel):
   type: str = Field(..., description="physical（实体寄地址）/ virtual（发邮箱）")
   address_id: Optional[str] = Field(None, description="客户端本地地址簿 ID，服务端不认识，仅作日志参考")
   name: Optional[str] = Field(None, description="收件人姓名（physical）")
-  phone: Optional[str] = Field(None, description="收件人电话（physical）")
-  region: Optional[str] = Field(None, description="省市区，可能为空串（physical）")
-  detail: Optional[str] = Field(None, description="详细地址（physical）")
+  phone: Optional[str] = Field(None, description="收件人电话，E.164 格式（physical）")
+  region: Optional[str] = Field(None, description="兼容展示串：国家名+state+city+district，勿用于发货（physical）")
+  detail: Optional[str] = Field(None, description="兼容展示串：street1+street2+zip，勿用于发货（physical）")
   email: Optional[str] = Field(None, description="接收邮箱（virtual）")
+  # 结构化字段（physical，与 address_list 元素一致；发货以这些为准，老客户端快照可能缺失）
+  country_code: Optional[str] = Field(None, description="国家/地区，ISO 3166-1 alpha-2（physical）")
+  state_code: Optional[str] = Field(None, description="州/省代码：美/加字母码，中国数字省级码（physical）")
+  state: Optional[str] = Field(None, description="州/省显示名（physical）")
+  city: Optional[str] = Field(None, description="城市（physical）")
+  district: Optional[str] = Field(None, description="区/县，仅中国填（physical）")
+  street1: Optional[str] = Field(None, description="街道地址（physical）")
+  street2: Optional[str] = Field(None, description="门牌/套间，选填（physical）")
+  zip: Optional[str] = Field(None, description="邮编（physical）")
 
 class SurveySubmission(BaseModel):
   """一次问卷提交记录；同一 uid+survey_id 幂等，存于 UserProfile.survey_submissions"""
@@ -403,23 +594,99 @@ class FootprintDay(BaseModel):
   companion_minutes: int = Field(0, description="当天助眠陪伴分钟数（累计值，合并取大）")
   first_active_at: Optional[int] = Field(None, description="当天首次活跃秒级时间戳（合并取小）")
 
+# -------------------------- 睡眠计划同步（睡眠计划同步接口.md） --------------------------
+# 注意与上方设备端 SleepPlan（target_bed_time 等，供 goal_achieved 用）不是一回事：
+# 这里是 App 端账号级计划，服务端是唯一事实源，含墓碑（deleted=true）记录。
+class SleepPlanCycle(BaseModel):
+  """计划周期；fixed_daily=官方预设每天执行，weekdays=自定义按周几"""
+  type: Optional[str] = Field(None, description="fixed_daily | weekdays")
+  days_count: Optional[int] = Field(None, description="fixed_daily 必填：官方预设总天数（习惯养成21/时差修正7/焦虑修复14）")
+  weekdays: List[int] = Field(default_factory=list, description="weekdays 必填：1=周一…7=周日，须至少3天连续")
+  repeats_weekly: Optional[bool] = Field(None, description="weekdays 必填；false 时仅执行一轮")
+
+
+class SyncedSleepPlan(BaseModel):
+  """睡眠计划同步对象（上报与下发同构）。
+
+  除 plan_id/updated_at 外全部可选：墓碑只需 plan_id/deleted/deleted_at/updated_at 四个字段；
+  完整计划的字段校验在服务端合并层（sleep_plan_service）做，不在模型层卡死。
+  """
+  plan_id: str = Field(..., description="客户端生成的标准大写 UUID，全局主键（uid+plan_id upsert）")
+  kind: Optional[str] = Field(None, description="custom | habit_formation | jet_lag | anxiety_relief")
+  custom_name: str = Field("", description="仅 kind=custom 有效，≤10 字符")
+  target_minutes: Optional[int] = Field(None, description="目标睡眠时长（分钟），≥60")
+  sleep_time: Optional[int] = Field(None, description="入睡时刻，0-1439（当天分钟数，设备当前时区本地时间）")
+  wake_time: Optional[int] = Field(None, description="起床时刻，0-1439；≤sleep_time 表示次日")
+  cycle: Optional[SleepPlanCycle] = None
+  reminder_enabled: Optional[bool] = None
+  reminder_minutes_before: Optional[int] = Field(None, description="提前分钟数：15/30/60/90")
+  alarm_sound_id: Optional[str] = Field(None, description="temple_bell | sunlit_coast | rainforest_mist")
+  sleep_aid_category: Optional[str] = Field(None, description="推荐策略：smart | preference | trending")
+  status: Optional[str] = Field(None, description="not_enabled | active | completed | stopped（stopped 仅兼容历史）")
+  timezone: Optional[str] = Field(None, description="仅审计：该计划最后保存时的时区，不参与触发时刻计算")
+  created_at: Optional[int] = Field(None, description="创建时刻秒级时间戳")
+  updated_at: int = Field(..., description="最近更新秒级时间戳，冲突解决依据（后写胜出）")
+  activated_at: Optional[int] = Field(None, description="本轮开启起算时刻；status != active 时必须为 null")
+  deleted: bool = Field(False, description="墓碑标记")
+  deleted_at: Optional[int] = Field(None, description="删除时刻，deleted=true 时必填")
+
+
+class SleepPlanSyncData(BaseModel):
+  uid: Optional[str] = Field(None, description="debug 用；正式请求以 jwt_token 为准")
+  jwt_token: Optional[str] = None
+  language: Optional[str] = Field(None, description="界面语言，如 zh-Hans / en")
+  timezone: Optional[str] = Field(None, description="设备当前时区（IANA），触发时刻换算与日历日完成判定都靠它")
+  device_id: Optional[str] = Field(None, description="设备唯一标识，多端冲突排查/审计用")
+  last_sync_at: Optional[int] = Field(None, description="上次同步成功时服务端返回的 server_time；首次不传")
+  plans: List[SyncedSleepPlan] = Field(default_factory=list, description="sync_plans：自 last_sync_at 以来有变更的计划（含墓碑）")
+
+
+class SleepPlanSyncRequest(BaseModel):
+  request_type: str = Field(..., description="sync_plans | query_plans")
+  timestamp: int = Field(..., description="请求发送时间戳（秒级）")
+  version: str = Field("1.0")
+  data: SleepPlanSyncData
+
+  @model_validator(mode='after')
+  def validate_data_by_request_type(self):
+    if self.data.jwt_token is None and self.data.uid is None:
+      raise ValueError("uid or jwt_token must be provided")
+    if self.request_type == "sync_plans":
+      pass  # plans 可为空数组（无变更时仅拉取）
+    elif self.request_type != "query_plans":
+      raise ValueError(f"unknown request_type: {self.request_type}")
+    return self
+
+
 class UserProfile(BaseModel):
   """用户画像信息"""
   uid_emb: List[float] = Field(default_factory=list)
   basic_info: Optional[Dict[str, str]] = Field(default_factory=dict)
   long_term_profile: List[Tuple[str, float]] = Field(default_factory=list)
+  sop_tag_profile: Dict[str, Any] = Field(default_factory=dict, description="服务端从保留的 Mindora 使用历史重算：标签接触、偏好证据、睡眠结果关联分开存储")
+  sop_recommendation_details: Dict[str, Any] = Field(default_factory=dict, description="SOP规则评分、命中标签、历史与当前排序、实际LLM来源")
 
   # 睡眠计划（设备端制定的睡眠目标，配合 SleepResult.goal_achieved 计算达成率）
   sleep_plan: Optional[SleepPlan] = Field(None, description="用户的睡眠目标计划")
+  # App 端账号级睡眠计划（睡眠计划同步接口.md；服务端为唯一事实源，含墓碑记录）
+  sleep_plans: List[SyncedSleepPlan] = Field(default_factory=list, description="账号级睡眠计划全量（含 deleted 墓碑）")
+  sleep_plans_synced_at: Optional[int] = Field(None, description="最近一次计划同步的 server_time（秒）")
 
   # 洞察页 6 模块 LLM 分析结果（mindora_advice.md 模块0-5）
   sleep_insight: Optional[SleepInsightReport] = Field(None, description="洞察页6模块睡眠分析结果")
+  bedtime_advice: Optional[BedtimeAdvice] = Field(None, description="LLM 生成的睡前建议；缺失或生成满七天后更新")
 
   # /analysis 文案报告序列（LLM 异步生成；日级保留30、周10、月12，见 ANALYSIS_REPORT_RETENTION）
   analysis_reports: Dict[str, List[AnalysisTextReport]] = Field(
     default_factory=lambda: {key: [] for key in ANALYSIS_REPORT_KEYS},
     description="按 request_type 分组的分析文案报告序列",
   )
+
+  # 睡眠健康问卷（onboarding/设置页收集的睡眠相关字段）
+  sleep_health: Optional[SleepHealthProfile] = Field(None, description="睡眠健康问卷")
+
+  # 睡眠模式设置（对应 GUI/data/config 中的 profile.sleepMode）
+  sleep_mode: Optional[SleepModeProfile] = Field(None, description="睡眠模式设置")
 
   # 新增：存储推荐的助眠候选方案
   sleep_scenarios_reco: Optional[List[SleepScenario]] = Field(default_factory=list, description="推荐的候选助眠流程列表")
@@ -452,29 +719,56 @@ class UserProfile(BaseModel):
 
   behaviors: Dict[str, List[Tuple[int, Any]]] = Field(
     default_factory=lambda: {
-      # 生命体征
+      # 生命体征（v1 口径，健康数据同步接口.md；v2 客户端不再写 heart_rate）
       "heart_rate": [], "blood_oxygen": [], "resting_heart_rate": [],
       "heart_rate_variability_sdnn": [], "respiratory_rate": [],
       "sleeping_wrist_temperature": [], "body_temperature": [],
+      # 生命体征（v2 口径，健康数据同步接口_0814.md：全部裁剪到睡眠跨度）
+      "sleep_heart_rate_min": [], "sleep_heart_rate_max": [],
+      "sleep_heart_rate_variability_sdnn": [], "sleep_respiratory_rate": [],
+      "sleep_body_temperature": [],
       # 睡眠状态
       "sleep_status": [],
       "sleep_stage_deep": [], "sleep_stage_rem": [], "sleep_stage_light": [],
+      # 睡眠阶段（v2 新增轨）
+      "sleep_stage_unspecified": [], "sleep_stage_awake": [], "sleep_in_bed": [],
       # 交互行为
       "clicks": [], "plays": [],
     }
   )
+
+  # 健康数据按自然日的口径版本登记（yyyy-MM-dd → health_schema_version）。
+  # update_profile 时按请求 timezone 把 behaviors 时间戳归日写入；缺省/老数据按 1 处理。
+  # 对账接口 query_health_sync_state 据此回答版本，"有哪些天"则按 behaviors 实际数据现算。
+  health_sync_days: Dict[str, int] = Field(default_factory=dict)
+  # 服务端内部迁移进度：自然日 → 字段 → 口径版本。日级版本不足以区分分批迁移。
+  # 不接收客户端覆盖，不在 query/update_profile 响应中返回。
+  health_sync_field_versions: Dict[str, Dict[str, int]] = Field(default_factory=dict)
+  health_sync_timezone: Optional[str] = Field(None, description="内部版本登记使用的时区")
+
+  # 画像变更版本号：服务端维护、单调递增，每次 save_profile 落盘前 +1（谁改的都会
+  # 触发：App update、设备 update、后台 LLM 写回、读路径补缺）。设备端用
+  # query_revision 做 60s 轻量探测，变了才全量 query_profile；自己推云成功后记下响应
+  # 里的新 revision 做回显过滤。客户端只读——update 时客户端携带的值被忽略
+  # （合并分支不拷贝此字段，新建分支重置为 0，见 _apply_basic_update）。
+  revision: int = Field(0, description="画像版本号（服务端维护，单调递增；query_revision 探测用）")
 
   # only the recent 7 days sleep data will be returned to app, and used for sleep analysis and advice generation, such as the data of yestoday night
   sleep_data:  List[SleepResult] = Field(default_factory=list)
 
   sleep_analysis: Dict[str, Any] = Field(
     default_factory=lambda: {
-      "sleep_trend_week": "",
-      "sleep_trend_month": "",
-      "scene": {"title":"", "music":"", "text":"", "image_url": ""},
+      # 数值快照（每次 update_profile 重算，7 天窗口语义天然滚动，仅存当前一份）：
+      # most_used_scene(_7d) 与 best_sleep_quality_scene_7d 是 /analysis 骨架
+      # （weekly_best / onset_efficiency / scene_preference）的直接数据源；
+      # recent_scene 是最近一次使用场景（设备端轮询 query_profile 展示用）；
+      # insight_memory 是洞察长期记忆（建议历史/昨日首页主题，见 insight_rules）。
+      # 历史上的 sleep_trend_week/month 与 scene{title,music,text,image_url}
+      # 为死字段（从未有写入方，趋势已由 rule_trend 现算），已移除。
       "most_used_scene": None,
       "most_used_scene_7d": None,
       "best_sleep_quality_scene_7d": None,
+      "recent_scene": None,
     }
   )
 
@@ -492,6 +786,13 @@ class UserProfile(BaseModel):
   )
 
   profile: Optional[Profile] = None
+
+  # 最近一次请求的客户端环境（每次 update_profile 显式携带时刷新）：
+  # 每日 LLM 分析触发门的自然日口径用 last_request_timezone（缺省 UTC），
+  # sleep_insight/analysis_reports 文案语言用 last_request_language（缺省 en）
+  last_request_timezone: Optional[str] = Field(None, description="最近一次请求的客户端时区 ID，如 Asia/Shanghai")
+  last_request_language: Optional[str] = Field(None, description="最近一次请求的界面语言，如 zh-Hans / en")
+  last_request_at: Optional[int] = Field(None, description="最近一次带环境信息的请求时间戳（秒）")
 
   # 首页弹窗 / 站内消息 / 调查问卷 / 陪伴足迹（tanchuang_suvey.md, peibanzuji.md）
   popup_states: Dict[str, PopupState] = Field(
@@ -515,16 +816,64 @@ class UserProfile(BaseModel):
 class ProfileData(BaseModel):
   uid: Optional[str] = Field(None, description="uid, just for debug")
   jwt_token: str | None = Field(None, description="JWT token，in wan should be fixed")
+  device_id: Optional[str] = Field(
+    None,
+    description="设备唯一标识；设备端请求必填，云端按 uid↔device_id 绑定校验/多端区分",
+  )
+  device_type: Optional[str] = Field(
+    None,
+    description="请求来源类型：设备端固定 mindora（common/device_id.DEVICE_TYPE）；App 复用本结构时填 ios/android 等",
+  )
   user_profile: Optional[UserProfile] = Field(None, description="user profile")
-  skip_sleep_scenarios_reco_update: bool = Field(
-    True,
-    description="只跳过助眠场景推荐(sleep_scenarios_reco)的重算，不影响睡眠分析(insight/analysis cache)",
+  language: Optional[str] = Field(None, description="界面语言，如 en、zh-Hans（健康同步 v2 必填）")
+  timezone: Optional[str] = Field(None, description="客户端时区，如 Asia/Shanghai；健康数据按自然日归类的日界依据")
+  health_schema_version: Optional[int] = Field(
+    None,
+    description="健康数据口径版本（健康数据同步接口_0814.md §8.3）；缺省按 1 处理",
   )
-  skip_sleep_analysis_update: bool = Field(
-    True,
-    description="只跳过睡眠分析(sleep_insight + analysis cache)的生成，不影响场景推荐",
+  # query_health_sync_state 对账窗口（§8.4）
+  start_date: Optional[str] = Field(None, description="对账起始自然日 yyyy-MM-dd")
+  end_date: Optional[str] = Field(None, description="对账结束自然日 yyyy-MM-dd")
+  # 三态开关：None=由服务端按数据自动决策（有未分析的新夜晚则每天生成一次）；
+  # 显式 True=客户端要求跳过；显式 False=客户端要求立即强制生成
+  skip_sleep_scenarios_reco_update: Optional[bool] = Field(
+    None,
+    description="助眠场景推荐(sleep_scenarios_reco)开关：None=自动 / True=跳过 / False=强制，不影响睡眠分析",
   )
+  skip_sleep_analysis_update: Optional[bool] = Field(
+    None,
+    description="睡眠分析(sleep_insight + analysis cache)开关：None=自动 / True=跳过 / False=强制，不影响场景推荐",
+  )
+  # query_profile 响应裁剪开关：sleep_data 和 behaviors 是画像的体积大头。
+  # sleep_data_count：0=不携带 sleep_data；缺省 1=只回最近一晚；N=最近 N 晚。
+  # 返回的每条 sleep_data 附计算属性 sequence_summaries（各阶段时长/觉醒统计）。
+  # 旧布尔字段 include_sleep_data 由 before-validator 映射（false→0 / true→全部 30 晚）
+  sleep_data_count: int = Field(1, ge=0, description="query_profile 响应携带最近 N 晚 sleep_data（附 sequence_summaries）；0=不携带，缺省 1")
+  include_behaviors: bool = Field(True, description="query_profile 响应是否携带 behaviors，默认 True；为 False 时同时剔除 health_sync_days")
+  include_sop_tag_profile: bool = Field(False, description="query_profile 响应是否携带 sop_tag_profile，默认 False")
+  include_sop_recommendation_details: bool = Field(False, description="query_profile 响应是否携带 sop_recommendation_details，默认 False")
+  # mindora_record（场景/纯音乐播放历史，每个 cmd 最多 MAX_BEHAVIOR_LEN 条）是纯服务端
+  # 派生字段（由 behaviors.plays 的 sop_start 聚合而来，合并路径从不采信客户端回传值），
+  # 设备端只展示 sleep_analysis.recent_scene/most_used_scene，不需要原始历史。
+  include_mindora_record: bool = Field(True, description="query_profile 响应是否携带 mindora_record，默认 True；设备端可传 False 省流量")
+  # analysis_reports（LLM 生成的日/周/月/总览文案报告）同式限量：各序列升序、最新在尾，
+  # 截尾保留最新 N 份；缺省 1=每类只回最新一份；0=不携带 analysis_reports
+  analysis_report_count: int = Field(1, ge=0, description="query_profile 响应中 analysis_reports 每类(day/week/month/overview/explore)携带最近 N 份报告，缺省 1；0=不携带")
+  # 运营/陪伴四件套（弹窗状态、站内消息、问卷提交、陪伴足迹）同式限量，各自独立按
+  # 自己的时间戳截尾保留最新 N 条：footprint_days 按日期键、inbox_messages 按 created_at、
+  # survey_submissions 按 submitted_at、popup_states 按 last_impression_at。
+  # 这四个在画像里只是副本，完整数据各有专用端点（/footprint、/popup、/survey），
+  # 所以缺省只回 1 条；0=四者均不携带。
+  engagement_count: int = Field(1, ge=0, description="query_profile 响应中 footprint_days/inbox_messages/popup_states/survey_submissions 各携带最近 N 条，缺省 1；0=均不携带")
 
+  @model_validator(mode="before")
+  @classmethod
+  def _legacy_include_sleep_data(cls, values):
+    """兼容旧布尔开关 include_sleep_data：false→0，true→全部（30，与存量上限一致）。"""
+    if isinstance(values, dict) and "include_sleep_data" in values and "sleep_data_count" not in values:
+      legacy = values.pop("include_sleep_data")
+      values["sleep_data_count"] = 30 if legacy else 0
+    return values
 
 class ProfileRequest(BaseModel):
   request_type: str = Field("query_profile", description="query_profile | update_profile（client_request.md 契约）")

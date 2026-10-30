@@ -9,6 +9,8 @@ CREATE TABLE `user_auth` (
   `status` TINYINT(1) NOT NULL DEFAULT 1 COMMENT '用户状态：1-正常，0-禁用',
   `user_level` VARCHAR(32) NOT NULL DEFAULT 'free' COMMENT '用户等级：free/pro/premium',
   `level_end_at` DATETIME NULL DEFAULT NULL COMMENT '会员等级截止时间',
+  `signup_trial_end_at` DATETIME NULL DEFAULT NULL COMMENT '注册赠送的 Premium 体验期结束时刻',
+  `basic_purchase_trial_end_at` DATETIME NULL DEFAULT NULL COMMENT '首次购买 Basic 赠送的 Premium 体验期结束时刻',
   `device_list` VARCHAR(256) NOT NULL,
   `register_time` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '注册时间（自动填充当前时间）',
   `update_time` DATETIME NULL DEFAULT NULL ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间（自动更新）',
@@ -43,4 +45,6 @@ CREATE TABLE `redemption_codes` (
 -- If user_auth already exists in production, run this migration instead:
 -- ALTER TABLE `user_auth`
 --   ADD COLUMN `user_level` VARCHAR(32) NOT NULL DEFAULT 'free' COMMENT '用户等级：free/pro/premium',
---   ADD COLUMN `level_end_at` DATETIME NULL DEFAULT NULL COMMENT '会员等级截止时间';
+--   ADD COLUMN `level_end_at` DATETIME NULL DEFAULT NULL COMMENT '会员等级截止时间',
+--   ADD COLUMN `signup_trial_end_at` DATETIME NULL DEFAULT NULL COMMENT '注册赠送的 Premium 体验期结束时刻',
+--   ADD COLUMN `basic_purchase_trial_end_at` DATETIME NULL DEFAULT NULL COMMENT '首次购买 Basic 赠送的 Premium 体验期结束时刻';

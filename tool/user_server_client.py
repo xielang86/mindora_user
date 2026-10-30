@@ -75,19 +75,85 @@ class UserServerClient:
     }
     return self._post("/login", payload)
 
-  def query_profile(self) -> dict[str, Any]:
+  def query_profile(
+    self,
+    sleep_data_count: int = 1,
+    include_behaviors: bool = True,
+    analysis_report_count: int = 1,
+    include_mindora_record: bool = True,
+    engagement_count: int = 1,
+    include_sop_tag_profile: bool = False,
+    include_sop_recommendation_details: bool = False,
+  ) -> dict[str, Any]:
+    # sleep_data / behaviors / analysis_reports 是画像体积大头；count=0 不携带，N=最近 N 条/份；
+    # 不携带 behaviors 时服务端会同时去掉 health_sync_days；
+    # include_mindora_record=False 额外去掉播放历史（设备端不展示）
     payload = {
       "request_type": "query_profile",
       "timestamp": int(time.time()),
       "version": "1.0",
-      "data": self._auth_data(),
+      "data": {
+        **self._auth_data(),
+        "sleep_data_count": sleep_data_count,
+        "include_behaviors": include_behaviors,
+        "analysis_report_count": analysis_report_count,
+        "include_mindora_record": include_mindora_record,
+        "engagement_count": engagement_count,
+        "include_sop_tag_profile": include_sop_tag_profile,
+        "include_sop_recommendation_details": include_sop_recommendation_details,
+      },
+    }
+    return self._post("/user_profile", payload)
+
+  def query_user_rights(self) -> dict[str, Any]:
+    """直查 auth_server 权益；base_url 应指向认证服务，必须提供 JWT。"""
+    if not self.jwt_token:
+      raise ValueError("query_user_rights requires --jwt-token or JWT_TOKEN")
+    return self._post("/auth", {
+      "request_type": "query_user_rights",
+      "timestamp": int(time.time()),
+      "version": "1.0",
+      "data": {"jwt_token": self.jwt_token},
+    })
+
+  def query_plans(self, device_id: str = "cli-plan-query", last_sync_at: int | None = None) -> dict[str, Any]:
+    """单独查询账号睡眠计划，不上传计划变更。"""
+    data = {
+      **self._auth_data(),
+      "language": self.language,
+      "timezone": self.timezone,
+      "device_id": device_id,
+    }
+    if last_sync_at is not None:
+      data["last_sync_at"] = last_sync_at
+    return self._post("/sleep_plan", {
+      "request_type": "query_plans",
+      "timestamp": int(time.time()),
+      "version": "1.0",
+      "data": data,
+    })
+
+  def query_health_sync_state(self, start_date: str, end_date: str) -> dict[str, Any]:
+    """健康数据对账（健康数据同步接口_0814.md §8.4）：窗口内已有数据的天+口径版本。"""
+    payload = {
+      "request_type": "query_health_sync_state",
+      "timestamp": int(time.time()),
+      "version": "1.0",
+      "data": {
+        **self._auth_data(),
+        "timezone": self.timezone,
+        "start_date": start_date,
+        "end_date": end_date,
+      },
     }
     return self._post("/user_profile", payload)
 
   def update_profile(
     self,
     user_profile: dict[str, Any] | None = None,
-    skip_sleep_scenarios_reco_update: bool = False,
+    skip_sleep_scenarios_reco_update: bool | None = None,
+    skip_sleep_analysis_update: bool | None = None,
+    health_schema_version: int | None = None,
   ) -> dict[str, Any]:
     payload = {
       "request_type": "update_profile",
@@ -96,9 +162,17 @@ class UserServerClient:
       "data": {
         **self._auth_data(),
         "user_profile": user_profile or self.default_user_profile(),
-        "skip_sleep_scenarios_reco_update": skip_sleep_scenarios_reco_update,
+        "language": self.language,
+        "timezone": self.timezone,
       },
     }
+    # 三态开关：None=不带该字段（服务端自动决策）；True=跳过；False=强制
+    if skip_sleep_scenarios_reco_update is not None:
+      payload["data"]["skip_sleep_scenarios_reco_update"] = skip_sleep_scenarios_reco_update
+    if skip_sleep_analysis_update is not None:
+      payload["data"]["skip_sleep_analysis_update"] = skip_sleep_analysis_update
+    if health_schema_version is not None:
+      payload["data"]["health_schema_version"] = health_schema_version
     return self._post("/user_profile", payload)
 
   def analysis_overview(self, date: str | None = None, modules: list[str] | None = None) -> dict[str, Any]:
@@ -268,7 +342,15 @@ class UserServerClient:
 
 def print_result(title: str, result: Any):
   print(f"\n{'=' * 20} {title} {'=' * 20}")
-  print(json.dumps(result, ensure_ascii=False, indent=2))
+  # 调试输出保留请求结构，但不打印认证令牌。
+  def redact(value):
+    if isinstance(value, dict):
+      return {key: "***" if key == "jwt_token" else redact(item) for key, item in value.items()}
+    if isinstance(value, list):
+      return [redact(item) for item in value]
+    return value
+
+  print(json.dumps(redact(result), ensure_ascii=False, indent=2))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -281,6 +363,8 @@ def build_parser() -> argparse.ArgumentParser:
       "run_all",
       "login",
       "query_profile",
+      "query_plans",
+      "query_user_rights",
       "update_profile",
       "analysis_overview",
       "analysis_sleep_day",
@@ -305,14 +389,22 @@ def build_parser() -> argparse.ArgumentParser:
   parser.add_argument("--end-date", default=None)
   parser.add_argument("--language", default=DEFAULT_LANGUAGE)
   parser.add_argument("--timezone", default=DEFAULT_TIMEZONE)
+  parser.add_argument("--device-id", default="cli-plan-query", help="睡眠计划查询的设备标识")
+  parser.add_argument("--last-sync-at", type=int, default=None, help="睡眠计划上次同步的 Unix 秒时间戳（可选）")
+  parser.add_argument("--include-sop-tag-profile", action="store_true", help="query_profile 返回 SOP 标签画像")
+  parser.add_argument("--include-sop-recommendation-details", action="store_true", help="query_profile 返回 SOP 推荐详情")
   parser.add_argument("--focus", nargs="*", default=None)
   parser.add_argument("--modules", nargs="*", default=None)
-  parser.add_argument("--skip-sleep-scenarios-reco-update", action="store_true")
+  parser.add_argument("--skip-sleep-scenarios-reco-update", action="store_const", const=True, default=None,
+                      help="显式要求跳过场景推荐重算；不带则交给服务端自动决策")
   return parser
 
 
 def main():
-  args = build_parser().parse_args()
+  parser = build_parser()
+  args = parser.parse_args()
+  if args.action == "query_user_rights" and not args.jwt_token:
+    parser.error("query_user_rights requires --jwt-token or JWT_TOKEN")
   base_url = f"http://{args.host}:{args.port or DEFAULT_PORT}" if args.host else args.base_url
   client = UserServerClient(
     base_url=base_url,
@@ -328,7 +420,14 @@ def main():
   elif args.action == "login":
     result = client.login_with_jwt()
   elif args.action == "query_profile":
-    result = client.query_profile()
+    result = client.query_profile(
+      include_sop_tag_profile=args.include_sop_tag_profile,
+      include_sop_recommendation_details=args.include_sop_recommendation_details,
+    )
+  elif args.action == "query_user_rights":
+    result = client.query_user_rights()
+  elif args.action == "query_plans":
+    result = client.query_plans(device_id=args.device_id, last_sync_at=args.last_sync_at)
   elif args.action == "update_profile":
     result = client.update_profile(skip_sleep_scenarios_reco_update=args.skip_sleep_scenarios_reco_update)
   elif args.action == "analysis_overview":

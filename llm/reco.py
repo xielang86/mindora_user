@@ -1,9 +1,9 @@
 import json
 import logging
 import os
-import random
 import re
 import time
+import threading
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, List, Optional
@@ -13,7 +13,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from llm.ark_chat import VolcEngineArkChat
 from llm.router import ModelRouter
-from user_profile import UserProfile, SleepScenario
+from user_profile import UserProfile, SleepScenario, short_scene_id
 
 
 # 仓库根目录（本文件在 llm/ 包内，db/ 和 data/ 在仓库根）
@@ -162,6 +162,9 @@ def _summarize_profile_for_prompt(profile: UserProfile) -> str:
         data["basic_info"] = profile.basic_info
     if profile.long_term_profile:
         data["long_term_profile"] = profile.long_term_profile
+    if profile.sop_tag_profile:
+        data["sop_tag_profile"] = {k: v for k, v in profile.sop_tag_profile.items()
+                                   if k != "sleep_usage_links"}
     if profile.profile:
         prof = profile.profile.model_dump(mode="json", exclude_none=True)
         prof.pop("avatar_base64", None)
@@ -169,9 +172,11 @@ def _summarize_profile_for_prompt(profile: UserProfile) -> str:
 
     sleep_analysis = profile.sleep_analysis or {}
     data["sleep_analysis"] = {
-        "sleep_trend_week": sleep_analysis.get("sleep_trend_week", ""),
-        "sleep_trend_month": sleep_analysis.get("sleep_trend_month", ""),
-        "scene": sleep_analysis.get("scene", {}),
+        # 只保留仍有写入方的数值快照（场景统计由 update_profile 每次重算）；
+        # 旧 sleep_trend_week/month（死字段，从未写入）不再传入，
+        # 当前睡眠分析由 _sleep_analysis_summary 基于原始数据现算。
+        "most_used_scene_7d": sleep_analysis.get("most_used_scene_7d"),
+        "best_sleep_quality_scene_7d": sleep_analysis.get("best_sleep_quality_scene_7d"),
     }
 
     return json.dumps(data, ensure_ascii=False, indent=2)
@@ -194,6 +199,9 @@ def _build_prompt(profile: UserProfile) -> str:
 User profile JSON:
 {_summarize_profile_for_prompt(profile)}
 
+Current sleep analysis and advice (rule-computed from the user's own data; last night vs their 7-day baseline):
+{_sleep_analysis_summary(profile, getattr(profile, "last_request_language", None) or "en")}
+
 Sleep intervention knowledge base:
 {knowledge}
 
@@ -204,8 +212,8 @@ Scenario candidates:
 {json.dumps(_SCENARIO_CANDIDATES, ensure_ascii=False, indent=2)}
 
 Task:
-1. Read the user profile and infer the most likely sleep issue pattern, preferences, and suitable intervention style.
-2. Select the best 2 scenario candidates from the provided candidate list.
+1. Read the user's CURRENT sleep analysis and advice above (onset / structure / night fluctuations / scene association). Pick scenarios that best match their current sleep pattern and the advice already given.
+2. Select the best 2 scenario candidates from the provided candidate list, ordered by fit (first = best).
 3. You may reorder candidates, but every returned scenario and every stage field value must come from the candidate list.
 4. Keep the output schema exactly compatible with this Python model:
 {{
@@ -226,16 +234,86 @@ Task:
     }}
   ]
 }}
-5. Return exactly 2 scenarios.
+5. Return exactly 2 scenarios in ranked order.
 """
 
 
+def _sleep_analysis_summary(profile: UserProfile, lang: str) -> str:
+    """把当前睡眠分析与建议汇总成 prompt 段落（规则结论 + 7d/当夜聚合 + 场景使用 +
+    已存洞察报告），让推荐随睡眠状态变化。
+
+    之前推荐恒定的根因：prompt 里的 sleep_analysis 只有永远为空的
+    sleep_trend_week/month（死字段），LLM 看不到任何真实睡眠数据。
+    """
+    try:
+        import insight_rules as ir
+    except Exception as e:
+        logging.warning("insight_rules unavailable for reco prompt: %s", e)
+        return ""
+    lines: list[str] = []
+    try:
+        tz = ir.resolve_tz(getattr(profile, "last_request_timezone", None))
+        state = ir.compute_data_state(profile, tz)
+        base = ir.compute_baselines(profile, tz)
+        lines.append(
+            f"data_state={state}; valid nights: 7d={len(base.nights_7d)}, 30d={len(base.nights_30d)}"
+        )
+        if base.latest is not None:
+            parts = []
+            from analysis_score import daily_score
+            scored = daily_score(base.latest, profile)
+            if scored is not None:
+                parts.append(f"score={scored['score']}/100 ({scored['score_version']})")
+            if base.latest.onset is not None:
+                parts.append(f"onset={base.latest.onset:.0f}min")
+            summ = base.latest.sequence_summaries if base.latest.sleep_status else {}
+            if summ:
+                tst = summ.get("total_sleep_duration") or 0
+                parts.append(f"TST={tst:.0f}min")
+                parts.append(f"WASO={summ.get('night_awake_duration', 0):.0f}min")
+                parts.append(f"awakenings={summ.get('night_awake_count', 0)}")
+            lines.append("last night: " + ", ".join(parts))
+        # 规则结论（入睡/结构/波动/场景 + 建议），含与近7日个人基线的比较
+        _, _, conclusions = ir.build_night_conclusions(profile, lang)
+        for c in conclusions:
+            if c.text:
+                lines.append(f"insight[{c.key}|{c.state}] {c.title}: {c.text}")
+        # 场景使用与关联表现
+        top = ir.top_scenes_in_window(profile.mindora_record, end_ts=int(time.time()), days=7, limit=3)
+        if top:
+            lines.append("scene usage last 7d: " + ", ".join(f"{s}×{n}" for s, n in top))
+        sa = profile.sleep_analysis or {}
+        best = sa.get("best_sleep_quality_scene_7d")
+        if best and best.get("score_version"):
+            lines.append(
+                f"best associated scene 7d: {best.get('scene_name')} "
+                f"(avg score {best.get('avg_sleep_quality')}, {best.get('nights')} nights)"
+            )
+        # 已存洞察报告（LLM 润色版，若已有）与建议动作
+        si = getattr(profile, "sleep_insight", None)
+        if si is not None:
+            for key in ("onset", "architecture", "intervention", "scene_preference"):
+                m = getattr(si, key, None)
+                if m is not None and getattr(m, "content", ""):
+                    lines.append(f"stored insight[{key}]: {m.content}")
+            onset_m = getattr(si, "onset", None)
+            if onset_m is not None and getattr(onset_m, "action", ""):
+                lines.append(f"current advice action: {onset_m.action}")
+    except Exception as e:
+        logging.warning("sleep analysis summary build failed: %s", e)
+    return "\n".join(lines)
+
+
 def _build_sop_reco_prompt(profile: UserProfile, candidates: List[str]) -> str:
+    from content_tags import candidate_metadata
     knowledge = _load_text(_KNOWLEDGE_BASE_PATH)
     topology = _load_text(_TOPOLOGY_PATH)
     return f"""
 User profile JSON:
 {_summarize_profile_for_prompt(profile)}
+
+Current sleep analysis and advice (rule-computed from the user's own data; last night vs their 7-day baseline):
+{_sleep_analysis_summary(profile, getattr(profile, "last_request_language", None) or "en")}
 
 Sleep intervention knowledge base:
 {knowledge}
@@ -246,9 +324,15 @@ Sleep strategy topology:
 Standard SOP process candidates:
 {json.dumps(candidates, ensure_ascii=False, indent=2)}
 
+Workbook content metadata (null means unannotated; do not guess missing tags):
+{json.dumps(candidate_metadata(candidates), ensure_ascii=False, indent=2)}
+Exposure means content was used, not liked or fully heard. Outcome associations are
+observations, not causal improvements. Workbook goals/health clues are unvalidated
+annotations, not user outcomes. Guide variants are not confirmed played.
+
 Task:
-1. Read the user profile and infer the most likely sleep issue pattern, preferences, and suitable intervention style.
-2. Select the best 3 SOP process candidates from the provided candidate list.
+1. Read the user's CURRENT sleep analysis and advice above (onset / structure / night fluctuations / scene association). Pick SOP processes that best match their current sleep pattern and the advice already given — e.g. slow onset → stronger relaxation/induction; frequent awakenings → steadier deep-stage sound; a well-associated scene → keep its acoustic style.
+2. Select the best 3 SOP process candidates from the provided candidate list, ordered by fit (first = best).
 3. You may reorder candidates, but every returned value must come from the candidate list.
 4. Do not return any `sleep.pure_music.*` candidate. Restrict the result to guided `sleep.scene.*` candidates only.
 5. Keep the output schema exactly compatible with this JSON structure:
@@ -271,17 +355,64 @@ Task:
   ]
 }}
 6. Only set `cmd_name`; all other fields should be null.
-7. Return exactly 3 SOP process ids.
+7. Return up to 3 SOP process ids in ranked order, or all candidates if fewer than 3 are available.
 """
 
 
-def _get_model() -> Optional[BaseChatModel]:
-    """睡眠推荐的 LLM 请求方向由 ModelRouter 决定（request_type="sleep_reco"，缺省走 default 方向）。"""
+_ROUTE_FAILURE_UNTIL = {}
+_ROUTE_FAILURE_LOCK = threading.Lock()
+
+
+def _route_key(route):
+    return (route.name, route.api_base, route.model)
+
+
+def _recommendation_models():
+    """Lazy initialization lets one broken provider fall through to the next."""
     try:
-        return ModelRouter.from_env().chat_model_for("sleep_reco", temperature=0.3)
+        router = ModelRouter.from_env()
     except Exception as e:
         logging.error("sleep recommendation llm init failed: %s", e)
-        return None
+        return
+    for route in router.available_routes("sleep_reco"):
+        with _ROUTE_FAILURE_LOCK:
+            cooling_down = _ROUTE_FAILURE_UNTIL.get(_route_key(route), 0) > time.monotonic()
+        if cooling_down:
+            continue
+        try:
+            model = router.chat_model_for_route(route, temperature=0.3)
+            if model is not None:
+                yield route, model
+        except Exception:
+            _mark_route_failed(route)
+            logging.exception("recommendation model initialization failed: route=%s", route.name)
+
+
+def _mark_route_failed(route):
+    with _ROUTE_FAILURE_LOCK:
+        _ROUTE_FAILURE_UNTIL[_route_key(route)] = time.monotonic() + 300
+
+
+def _invoke_recommendation(prompt, system_prompt, flow, validate, expected):
+    for route, model in _recommendation_models():
+        route_flow = f"{flow}:{route.name}"
+        _append_llm_trace("request", route_flow, prompt)
+        try:
+            response = model.invoke([SystemMessage(content=system_prompt), HumanMessage(content=prompt)])
+            raw = response.content
+            _append_llm_trace("response", route_flow, prompt, response_text=str(raw))
+            result = validate(_extract_json(raw))
+            if len(result) != expected:
+                raise ValueError(f"Expected {expected} valid candidates, received {len(result)}")
+            with _ROUTE_FAILURE_LOCK:
+                _ROUTE_FAILURE_UNTIL.pop(_route_key(route), None)
+            logging.info("recommendation LLM succeeded: flow=%s route=%s", flow, route.name)
+            return result, route.name
+        except Exception as e:
+            _mark_route_failed(route)
+            _append_llm_trace("error", route_flow, prompt, error_text=str(e))
+            logging.warning("recommendation LLM failed: flow=%s route=%s; trying next provider (%s)", flow, route.name, type(e).__name__)
+    return None, None
 
 
 def _extract_json(text: str) -> Optional[dict[str, Any]]:
@@ -325,7 +456,7 @@ def _fallback_scenarios() -> List[SleepScenario]:
 
 def _default_sop_candidates() -> List[str]:
     profile_candidates = [
-        key.replace("sleep.scene.", "")
+        short_scene_id(key)
         for key in UserProfile().mindora_record.keys()
     ]
     return list(dict.fromkeys(profile_candidates))
@@ -436,12 +567,6 @@ def _fallback_sop_reco(candidates: List[SleepScenario]) -> List[SleepScenario]:
     return [_build_sop_reco_scenario(item) for item in _default_sop_candidates()[:3]]
 
 
-def _pick_random_sop_reco(scenarios: List[SleepScenario]) -> List[SleepScenario]:
-    if not scenarios:
-        return []
-    return [random.choice(scenarios)]
-
-
 class RecommendationEngine:
     """根据用户画像生成 Sleep Scenarios 的引擎"""
 
@@ -467,30 +592,9 @@ class RecommendationEngine:
 
     @staticmethod
     def generate(profile: UserProfile) -> List[SleepScenario]:
-        model = _get_model()
-        if model is None:
-            logging.warning("no available LLM route (ARK_API_KEY/KIMI_API_KEY unset), using fallback sleep scenario candidates")
-            return _fallback_scenarios()
-
         prompt = _build_prompt(profile)
-        _append_llm_trace("request", "sleep_scenario_reco", prompt)
-        try:
-            response = model.invoke([
-                SystemMessage(content=_SYSTEM_PROMPT),
-                HumanMessage(content=prompt),
-            ])
-            response_text = response.content if isinstance(response.content, str) else json.dumps(response.content, ensure_ascii=False)
-            _append_llm_trace("response", "sleep_scenario_reco", prompt, response_text=response_text)
-            parsed = _extract_json(response.content)
-            scenarios = _validate_scenarios(parsed)
-            if len(scenarios) == 2:
-                return scenarios
-            logging.warning("sleep recommendation llm returned %s valid scenarios, using fallback", len(scenarios))
-        except Exception as e:
-            _append_llm_trace("error", "sleep_scenario_reco", prompt, error_text=str(e))
-            logging.error("sleep recommendation llm call failed: %s", e)
-
-        return _fallback_scenarios()
+        scenarios, _route = _invoke_recommendation(prompt, _SYSTEM_PROMPT, "sleep_scenario_reco", _validate_scenarios, 2)
+        return scenarios if scenarios is not None else _fallback_scenarios()
 
     @staticmethod
     def generate_sop_reco(profile: UserProfile, candidates: Optional[List[str]] = None) -> List[SleepScenario]:
@@ -502,37 +606,40 @@ class RecommendationEngine:
         if not candidate_scenarios:
             candidate_scenarios = [_build_sop_reco_scenario(item) for item in _default_sop_candidates()]
 
-        normalized_candidates = [
-            cmd_name
-            for scenario in candidate_scenarios
-            if (cmd_name := _extract_sop_cmd_name(scenario)) is not None
-        ]
+        from content_tags import canonical_cmd
+        from sop_ranking import rank_sops, rules
 
-        fallback = _fallback_sop_reco(candidate_scenarios)
-        if not fallback:
+        # Normalize and deduplicate at the execution seam, including fallback inputs.
+        unique = {}
+        for scenario in candidate_scenarios:
+            cmd = _extract_sop_cmd_name(scenario)
+            if cmd and not _is_pure_music_cmd(cmd) and canonical_cmd(cmd).startswith("sleep.scene."):
+                unique.setdefault(canonical_cmd(cmd), scenario)
+        candidate_scenarios = list(unique.values())
+        commands = [_extract_sop_cmd_name(s) for s in candidate_scenarios]
+        ranking = rank_sops(profile, commands)
+        candidate_map = {_extract_sop_cmd_name(s): s for s in candidate_scenarios}
+        ranked_candidates = [candidate_map[row["cmd_name"]] for row in ranking]
+        details = {
+            "rules_version": rules()["version"], "generated_at": int(time.time()),
+            "basis": "current_profile_snapshot", "ranking": ranking,
+            "historical": sorted([r for r in ranking if any(e["type"] in ("explicit_preference", "outcome_association")
+                for e in r["evidence"])], key=lambda r: -r["historical_score"])[:3],
+            "current": ranking[:3], "llm_route": None, "selection_method": "rules",
+            "limitations": ["Outcome scores describe associations, not causal improvement.",
+                            "Exposure is not preference; unavailable feedback contributes zero.",
+                            "Profile goals are not a separately collected daily state."]}
+        profile.sop_recommendation_details = details
+        details["historical_status"] = "available" if details["historical"] else "insufficient_evidence"
+        if not ranked_candidates:
             return []
-
-        model = _get_model()
-        if model is None:
-            logging.warning("no available LLM route (ARK_API_KEY/KIMI_API_KEY unset), using fallback SOP candidates")
-            return _pick_random_sop_reco(fallback)
-
-        prompt = _build_sop_reco_prompt(profile, normalized_candidates)
-        _append_llm_trace("request", "sleep_sop_reco", prompt)
-        try:
-            response = model.invoke([
-                SystemMessage(content=_SOP_SYSTEM_PROMPT),
-                HumanMessage(content=prompt),
-            ])
-            response_text = response.content if isinstance(response.content, str) else json.dumps(response.content, ensure_ascii=False)
-            _append_llm_trace("response", "sleep_sop_reco", prompt, response_text=response_text)
-            parsed = _extract_json(response.content)
-            reco = _validate_sop_reco(parsed, candidate_scenarios)
-            if len(reco) == min(3, len(normalized_candidates)):
-                return _pick_random_sop_reco(reco)
-            logging.warning("sleep sop recommendation llm returned %s valid candidates, using fallback", len(reco))
-        except Exception as e:
-            _append_llm_trace("error", "sleep_sop_reco", prompt, error_text=str(e))
-            logging.error("sleep sop recommendation llm call failed: %s", e)
-
-        return _pick_random_sop_reco(fallback)
+        prompt = _build_sop_reco_prompt(profile, [row["cmd_name"] for row in ranking])
+        prompt += "\nRule ranking evidence (higher scores take priority):\n" + json.dumps(ranking, ensure_ascii=False)
+        prompt += f"\nReturn exactly {min(3, len(ranking))} distinct candidates. Use content fit to resolve equal rule scores."
+        proposed, route = _invoke_recommendation(prompt, _SOP_SYSTEM_PROMPT, "sleep_sop_reco",
+            lambda payload: _validate_sop_reco(payload, ranked_candidates), min(3, len(ranking)))
+        if proposed is not None:
+            llm_order = {_extract_sop_cmd_name(s): i for i, s in enumerate(proposed)}
+            ranking = sorted(ranking, key=lambda r: (-r["score"], llm_order.get(r["cmd_name"], len(ranking))))
+            details.update(llm_route=route, selection_method="rules_with_llm_tiebreak", ranking=ranking, current=ranking[:3])
+        return [_clone_sleep_scenario(candidate_map[row["cmd_name"]]) for row in ranking[:3]]

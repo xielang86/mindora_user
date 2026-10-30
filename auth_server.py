@@ -2,7 +2,9 @@ import datetime
 import hashlib
 import secrets
 import jwt
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from auth import AuthRequest, AuthResponse, AuthRequestType, JWTTokenData, AuthData
@@ -23,7 +25,9 @@ from db.mysql_db import (
   init_web_columns, register_user_with_password, get_user_password_hash,
   get_user_by_phone, register_phone_user, get_or_create_wechat_user,
   init_membership_schema, get_user_rights_info, redeem_redemption_code,
+  get_user_membership_info,
   create_redemption_codes, get_ops_role, set_ops_role,
+  report_subscription,
 )
 from db.redis_db import get_verify_code, set_verify_code, delete_verify_code
 from common.util import normalize_email
@@ -63,9 +67,36 @@ mock_db = {
 
 # 加载配置（JWT 签名密钥改为 RS256 私钥文件，见 common/jwt_keys.py；
 # JWT_SECRET_KEY 仅作为旧 HS256 token 的验签回退，不再用于签发）
-JWT_EXPIRE_SECONDS = int(os.getenv("JWT_EXPIRE_SECONDS"))
-VERIFY_CODE_EXPIRE_SECONDS = int(os.getenv("VERIFY_CODE_EXPIRE_SECONDS"))
+# 加载配置（JWT 签名密钥改为 RS256 私钥文件，见 common/jwt_keys.py；
+# JWT_SECRET_KEY 仅作为旧 HS256 token 的验签回退，不再用于签发）
+JWT_EXPIRE_SECONDS = int(os.getenv("JWT_EXPIRE_SECONDS", "2592000"))  # token 有效期，默认 30 天
+VERIFY_CODE_EXPIRE_SECONDS = int(os.getenv("VERIFY_CODE_EXPIRE_SECONDS", "300"))  # 验证码有效期，默认 5 分钟
 REDEMPTION_ADMIN_SECRET = os.getenv("REDEMPTION_ADMIN_SECRET", "")
+
+# Apple 审核专用账号：env AUTH_REVIEW_CODES="email:code,email2:code2"
+# 命中后：发码接口直接返回成功（不发邮件，邮箱可能不存在）；登录/注销验码接受
+# 固定码且不消费，审核员 logout 后可用同一码反复登录。生产模式同样生效。
+AUTH_REVIEW_CODES: dict[str, str] = {}
+
+def _load_review_codes() -> None:
+  raw = os.getenv("AUTH_REVIEW_CODES", "")
+  for item in raw.split(","):
+    item = item.strip()
+    if not item or ":" not in item:
+      continue
+    email, code = item.split(":", 1)
+    email, code = email.strip(), code.strip()
+    if not email or not code:
+      continue
+    AUTH_REVIEW_CODES[normalize_email(email)] = code
+
+_load_review_codes()
+
+def _review_fixed_code(email: str | None) -> str | None:
+  """命中审核账号则返回其固定验证码，否则返回 None。"""
+  if not email:
+    return None
+  return AUTH_REVIEW_CODES.get(normalize_email(email))
 
 # 邮件发件人配置
 MY_163_EMAIL = "mindora2026@163.com"
@@ -160,15 +191,20 @@ def _safe_email(email: str | None, uid: str) -> str:
   return f"{uid[:12]}@mindora.local"
 
 
+def _parse_iso_dt(value, uid: str, field: str):
+  """rights payload 里的 ISO 时间字段转 datetime；非法值降级为 None。"""
+  if isinstance(value, datetime):
+    return value
+  if isinstance(value, str):
+    try:
+      return datetime.fromisoformat(value)
+    except ValueError:
+      logging.warning("invalid %s format for uid=%s: %s", field, uid, value)
+  return None
+
+
 def _build_token_data(uid: str, email: str | None, token: str, expire_days: int) -> JWTTokenData:
   rights_info = get_user_rights_info(uid)
-  level_end_at = rights_info.get("level_end_at")
-  if isinstance(level_end_at, str):
-    try:
-      level_end_at = datetime.fromisoformat(level_end_at)
-    except ValueError:
-      logging.warning("invalid level_end_at format for uid=%s: %s", uid, level_end_at)
-      level_end_at = None
   return JWTTokenData(
     uid=uid,
     email=_safe_email(email, uid),
@@ -176,7 +212,8 @@ def _build_token_data(uid: str, email: str | None, token: str, expire_days: int)
     expire_days=expire_days,
     user_level=rights_info.get("stored_user_level", "free"),
     effective_user_level=rights_info.get("effective_user_level", "free"),
-    level_end_at=level_end_at,
+    level_end_at=_parse_iso_dt(rights_info.get("level_end_at"), uid, "level_end_at"),
+    premium_trial_end_at=_parse_iso_dt(rights_info.get("premium_trial_end_at"), uid, "premium_trial_end_at"),
     rights=rights_info.get("rights"),
   )
 
@@ -200,6 +237,12 @@ def send_verify_code_handler(data: AuthData):
     msg=f"Verify code sent successfully (Mock: {verify_code})",
     data=None
   )
+
+  # 审核账号：不发邮件直接成功（邮箱可能不存在，发信失败会卡住审核流程）
+  if _review_fixed_code(data.email) is not None:
+    resp.msg = "Verify code sent successfully"
+    logging.info(f">>> [REVIEW ACCOUNT] skip email send to {normalize_email(data.email)}")
+    return resp
 
   if Config.Mode == 1:
     mock_db["verify_codes"][data.email] = verify_code
@@ -235,25 +278,34 @@ def auth_by_verify_code(data: AuthData) -> AuthResponse:
   try:
     normalized_email = normalize_email(data.email)
     device_id = str(data.device_id)
-    verify_code = "1234"
-    if Config.Mode != 1:
-      verify_code = get_verify_code(normalized_email, device_id)
+    fixed_code = _review_fixed_code(normalized_email)
+    if fixed_code is not None:
+      # 审核账号固定码：不消费，logout 后可用同一码反复登录
+      if data.verify_code != fixed_code:
+        resp.code = 401
+        resp.msg = "验证码错误"
+        logging.info(f"review account verify failed: {normalized_email}")
+        raise HTTPException(status_code=401, detail="verify code error")
+    else:
+      verify_code = "1234"
+      if Config.Mode != 1:
+        verify_code = get_verify_code(normalized_email, device_id)
 
-    if not verify_code:
-      resp.code = 401
-      resp.msg = "验证码已过期或不存在"
-      logging.info(f"verify: {verify_code} vs {data.verify_code}")
-      raise HTTPException(status_code=401, detail="验证码已过期或不存在")
+      if not verify_code:
+        resp.code = 401
+        resp.msg = "验证码已过期或不存在"
+        logging.info(f"verify: {verify_code} vs {data.verify_code}")
+        raise HTTPException(status_code=401, detail="验证码已过期或不存在")
 
-    if verify_code != data.verify_code:
-      resp.code = 401
-      resp.msg = "验证码错误"
-      logging.info(f"verify: {verify_code} vs {data.verify_code}")
-      raise HTTPException(status_code=401, detail="verify code error")
+      if verify_code != data.verify_code:
+        resp.code = 401
+        resp.msg = "验证码错误"
+        logging.info(f"verify: {verify_code} vs {data.verify_code}")
+        raise HTTPException(status_code=401, detail="verify code error")
 
-    # 验证成功即消费验证码，防止 TTL 内重放
-    if Config.Mode != 1:
-      delete_verify_code(normalized_email, device_id)
+      # 验证成功即消费验证码，防止 TTL 内重放
+      if Config.Mode != 1:
+        delete_verify_code(normalized_email, device_id)
     
     user = get_user_by_email_or_uid(email=normalized_email)
     uid = None
@@ -423,6 +475,11 @@ def send_delete_verify_code_handler(data: AuthData) -> AuthResponse:
     resp.msg = "验证码已发送 (Mock: 1234)"
     return resp
 
+  # 审核账号：不发邮件直接成功，注销验证码即登录固定码
+  if _review_fixed_code(jwt_email) is not None:
+    logging.info(">>> [REVIEW ACCOUNT] skip delete-verify email send for uid=%s", uid)
+    return resp
+
   user = get_active_user_by_email_or_uid(email=None, uid=uid)
   if user is None:
     raise HTTPException(status_code=401, detail="用户不存在或已被注销")
@@ -486,20 +543,26 @@ def delete_user_with_code_handler(data: AuthData) -> AuthResponse:
     mock_db["verify_codes"].pop(f"{uid}@{DELETE_VERIFY_CODE_DEVICE_ID}", None)
     return resp
 
-  user = get_active_user_by_email_or_uid(email=None, uid=uid)
-  if user is None:
-    raise HTTPException(status_code=401, detail="用户不存在或已被注销")
+  # 审核账号：注销验证码即登录固定码，不消费（注销后下次登录会自动恢复账号）
+  fixed_code = _review_fixed_code(jwt_email)
+  if fixed_code is not None:
+    if data.verify_code != fixed_code:
+      raise HTTPException(status_code=401, detail="验证码错误或已过期")
+  else:
+    user = get_active_user_by_email_or_uid(email=None, uid=uid)
+    if user is None:
+      raise HTTPException(status_code=401, detail="用户不存在或已被注销")
 
-  contact, _ = _resolve_delete_verify_contact(uid, jwt_email)
-  if not contact:
-    raise HTTPException(status_code=400, detail="用户未绑定有效的邮箱或手机号")
+    contact, _ = _resolve_delete_verify_contact(uid, jwt_email)
+    if not contact:
+      raise HTTPException(status_code=400, detail="用户未绑定有效的邮箱或手机号")
 
-  stored_code = get_verify_code(contact, DELETE_VERIFY_CODE_DEVICE_ID)
-  if not stored_code or stored_code != data.verify_code:
-    raise HTTPException(status_code=401, detail="验证码错误或已过期")
+    stored_code = get_verify_code(contact, DELETE_VERIFY_CODE_DEVICE_ID)
+    if not stored_code or stored_code != data.verify_code:
+      raise HTTPException(status_code=401, detail="验证码错误或已过期")
 
-  # 消费验证码，防止重放
-  delete_verify_code(contact, DELETE_VERIFY_CODE_DEVICE_ID)
+    # 消费验证码，防止重放
+    delete_verify_code(contact, DELETE_VERIFY_CODE_DEVICE_ID)
 
   result = soft_delete_user(uid=uid)
   code = result.get("code")
@@ -714,6 +777,24 @@ def query_user_rights_handler(data: AuthData) -> AuthResponse:
   )
 
 
+def query_membership_info_handler(data: AuthData) -> AuthResponse:
+  """Return the authenticated user's persisted and effective membership fields."""
+  payload = decode_access_token(data.jwt_token)
+  uid = payload.get("uid")
+  membership_info = get_user_membership_info(uid)
+  if membership_info is None:
+    raise HTTPException(status_code=404, detail="user not found")
+  if membership_info["status"] != 1:
+    raise HTTPException(status_code=403, detail="user is inactive")
+  membership_info.pop("status", None)
+  return AuthResponse(
+    request_type=AuthRequestType.QUERY_MEMBERSHIP_INFO,
+    code=0,
+    msg="success",
+    data=membership_info,
+  )
+
+
 def query_ops_role_handler(data: AuthData) -> AuthResponse:
   """查询本人运营角色（user_server / 运营后台据此判断 push 权限）。"""
   payload = decode_access_token(data.jwt_token)
@@ -758,6 +839,55 @@ def redeem_redemption_code_handler(data: AuthData) -> AuthResponse:
     raise HTTPException(status_code=result["code"], detail=result["msg"])
   return AuthResponse(
     request_type=AuthRequestType.REDEEM_REDEMPTION_CODE,
+    code=0,
+    msg=result["msg"],
+    data=result["data"],
+  )
+
+
+def report_subscription_handler(data: AuthData) -> AuthResponse:
+  """report_subscription（高级会员体验期接口.md §4 方案A + §5.1）：
+
+  - 客户端不过滤档位，Premium/未知 product_id 同样上报（§5.1③）：一律归档
+    subscription_reports 供 Apple 对账，仅 Basic 档触发第②段体验期盖章；
+  - ⚠️ 客户端对 4xx / 业务码非 0 的处理是「出队不再重试」（§5.1②）：参数/业务错误
+    必须返回 HTTP 200 + code != 0，绝不能回 4xx（这笔上报会永久丢失）；db 内部错误
+    （5xx）仍回 HTTP 500——客户端会保留队列重试，不该丢。
+  """
+  payload = decode_access_token(data.jwt_token)
+  uid = payload.get("uid")
+  product_id = (data.product_id or "").strip()
+  grant_trial = product_id in Config.BASIC_SUBSCRIPTION_PRODUCT_IDS
+  if not grant_trial:
+    logging.info("report_subscription: product_id=%s not eligible for trial, uid=%s", product_id, uid)
+
+  purchased_at = datetime.fromtimestamp(data.purchased_at) if data.purchased_at else None
+  result = report_subscription(
+    uid=uid,
+    platform=data.platform or "",
+    product_id=product_id,
+    original_transaction_id=data.original_transaction_id,
+    purchased_at=purchased_at,
+    grant_trial=grant_trial,
+  )
+  if result["code"] != 0:
+    if result["code"] >= 500:
+      # 服务端内部错误：回 5xx 让客户端保留队列、下次登录/回前台重试
+      raise HTTPException(status_code=result["code"], detail=result["msg"])
+    # 参数/业务错误（400/403/404）：HTTP 200 + code != 0——重试无意义，但绝不回 4xx
+    return AuthResponse(
+      request_type=AuthRequestType.REPORT_SUBSCRIPTION,
+      code=result["code"],
+      msg=result["msg"],
+      data=None,
+    )
+  logging.info(
+    "report_subscription: uid=%s product_id=%s txn=%s trial_granted=%s",
+    uid, product_id, data.original_transaction_id,
+    (result.get("data") or {}).get("trial_granted"),
+  )
+  return AuthResponse(
+    request_type=AuthRequestType.REPORT_SUBSCRIPTION,
     code=0,
     msg=result["msg"],
     data=result["data"],
@@ -871,11 +1001,17 @@ async def handle_auth(request: AuthRequest, raw_request: Request):
   elif req_type == AuthRequestType.QUERY_USER_RIGHTS:
     return query_user_rights_handler(data)
 
+  elif req_type == AuthRequestType.QUERY_MEMBERSHIP_INFO:
+    return query_membership_info_handler(data)
+
   elif req_type == AuthRequestType.QUERY_OPS_ROLE:
     return query_ops_role_handler(data)
 
   elif req_type == AuthRequestType.GRANT_OPS_ROLE:
     return grant_ops_role_handler(data)
+
+  elif req_type == AuthRequestType.REPORT_SUBSCRIPTION:
+    return report_subscription_handler(data)
 
   raise HTTPException(status_code=400, detail="Unsupported request type")
 
@@ -896,6 +1032,29 @@ async def unhandled_exception_handler(request, exc):
     content={"code": 500, "msg": "internal server error", "detail": str(exc)},
   )
 
+
+@app.exception_handler(RequestValidationError)
+async def request_validation_exception_handler(request: Request, exc: RequestValidationError):
+  """参数校验失败默认 422；report_subscription 例外（高级会员体验期接口.md §5.1②）：
+  客户端对 4xx 的处理是「出队不再重试」——422 会让这笔购买上报永久丢失、
+  该用户第②段体验期再也不会触发，统一改回 HTTP 200 + code=400。"""
+  try:
+    body = await request.json()
+  except Exception:
+    body = None
+  if isinstance(body, dict) and body.get("request_type") == AuthRequestType.REPORT_SUBSCRIPTION.value:
+    logging.warning("report_subscription param validation failed: %s", exc)
+    return JSONResponse(
+      status_code=200,
+      content=AuthResponse(
+        request_type=AuthRequestType.REPORT_SUBSCRIPTION,
+        code=400,
+        msg="invalid request params",
+        data=None,
+      ).model_dump(mode="json"),
+    )
+  return JSONResponse(status_code=422, content=jsonable_encoder({"detail": exc.errors()}))
+
 @app.get("/auth/wechat/qrcode")
 async def wechat_qrcode():
   """Return WeChat QR-code page URL for PC scan-to-login."""
@@ -908,6 +1067,26 @@ async def wechat_qrcode():
 @app.get("/health")
 async def health():
   return {"status": "ok", "service": "auth_server"}
+
+
+@app.post("/apple/assn")
+async def apple_assn(raw_request: Request):
+  """App Store Server Notifications V2 接收端点（服务端-AppStore订阅通知接入(ASSN V2).md）。
+
+  Apple 不会带任何鉴权 header，安全性靠 JWS 三层验签（§4.2）；应答语义见 §4.3：
+  成功/丢弃 → 200 空 body；RETRYABLE_VERIFICATION_FAILURE / DB 错误 → 500 让 Apple 重投。
+  处理必须快，不做外网调用。
+  """
+  from apple_assn import handle_apple_notification
+
+  try:
+    body = await raw_request.json()
+  except Exception:
+    logging.warning("apple_assn: non-JSON body dropped")
+    return Response(status_code=200)
+  signed_payload = body.get("signedPayload", "") if isinstance(body, dict) else ""
+  status = handle_apple_notification(signed_payload)
+  return Response(status_code=status)
 
 
 if __name__ == "__main__":

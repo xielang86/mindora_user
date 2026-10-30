@@ -31,6 +31,11 @@ MESSAGE_CATALOG_PREFIX = "_meta:msg:"
 # 全量问卷提交记录的 LevelDB key 前缀（一提交一 key，append-only，运营后台按前缀全量遍历）
 SURVEY_RECORD_PREFIX = "_meta:survey:"
 
+# 消息发布审计日志的 LevelDB key 前缀（一次发布一 key，append-only）：
+# 记录谁在什么时间发布了什么弹窗（完整 payload），ops 后台"发布记录"页查询；
+# 与消息目录（_meta:msg:）分工：目录服务 App 拉取（可标 offline），审计只增不改
+PUBLISH_LOG_PREFIX = "_meta:publish:"
+
 
 class EngagementService:
   def __init__(self, profile_serv):
@@ -92,8 +97,7 @@ class EngagementService:
     delivered_at = 该 uid 首次落地时间（inbox_messages.created_at），无记录退回目录 first_seen_at。
     """
     now = int(time.time())
-    with self._ps.lock:
-      profile = self._ps.get_profile(uid)
+    profile = self._ps.get_profile(uid)
     landed = {m.popup_id: m.created_at for m in (profile.inbox_messages if profile else [])}
 
     records: list[dict] = []
@@ -155,7 +159,7 @@ class EngagementService:
     """
     now = int(time.time())
     popups_catalog, _, next_query_after = _load_ops_config()
-    with self._ps.lock:
+    with self._ps.uid_lock(uid):
       profile = self._ps._get_or_create_profile_unlocked(uid)
       inbox_changed = False
       result: list[dict] = []
@@ -239,7 +243,7 @@ class EngagementService:
     if not any(p["popup_id"] == popup_id for p in popups_catalog):
       logging.warning("report_popup for unknown popup_id=%s uid=%s", popup_id, uid)
       return False
-    with self._ps.lock:
+    with self._ps.uid_lock(uid):
       profile = self._ps._get_or_create_profile_unlocked(uid)
       state = profile.popup_states.get(popup_id) or PopupState()
       if event == "impression":
@@ -296,7 +300,7 @@ class EngagementService:
     if gift_type in ("physical", "virtual") and data.gift_delivery is None:
       return None, 400
 
-    with self._ps.lock:
+    with self._ps.uid_lock(uid):
       profile = self._ps._get_or_create_profile_unlocked(uid)
       existing = profile.survey_submissions.get(data.survey_id)
       if existing is not None:
@@ -357,9 +361,30 @@ class EngagementService:
     records.sort(key=lambda r: r.get("submitted_at") or 0, reverse=True)
     return records
 
+  # -------------------- 消息发布审计日志 --------------------
+  def record_publish(self, popup: dict, operator_uid: str, operator_email: str = "") -> dict:
+    """记录一次消息发布（/ops/push 成功后调用）。append-only，返回写入的记录。"""
+    now = int(time.time())
+    record = {
+      "published_at": now,
+      "popup_id": popup.get("popup_id"),
+      "operator_uid": operator_uid,
+      "operator_email": operator_email,
+      "popup": popup,
+    }
+    # key 自带时间戳前缀（10 位 epoch 字典序即时间序），同秒多次发布靠 popup_id 区分
+    self._ps.put_global(f"{PUBLISH_LOG_PREFIX}{now}:{popup.get('popup_id')}", record)
+    return record
+
+  def list_publish_records(self, limit: int = 200) -> list[dict]:
+    """发布审计日志（运营后台用），按发布时间倒序。"""
+    records = [rec for _key, rec in self._ps.iter_global_prefix(PUBLISH_LOG_PREFIX)]
+    records.sort(key=lambda r: r.get("published_at") or 0, reverse=True)
+    return records[:limit]
+
   def merge_footprint_days(self, uid: str, days: List[FootprintDay]) -> int:
     """上传陪伴足迹：按 uid+date 幂等合并（布尔取 OR、计数取大、首活跃取小）。返回接受的天数。"""
-    with self._ps.lock:
+    with self._ps.uid_lock(uid):
       profile = self._ps._get_or_create_profile_unlocked(uid)
       for day in days:
         existing = profile.footprint_days.get(day.date)
@@ -438,9 +463,8 @@ class EngagementService:
       tz = ZoneInfo("UTC")
     today = datetime.datetime.now(tz).date()
 
-    with self._ps.lock:
-      profile = self._ps.get_profile(uid)
-      days_map = dict(profile.footprint_days) if profile else {}
+    profile = self._ps.get_profile(uid)
+    days_map = dict(profile.footprint_days) if profile else {}
 
     # 锚定日期：最近一条有数据（≤今天）的日期
     marked = sorted(

@@ -20,6 +20,7 @@ Usage (from user_server.py):
 """
 
 import asyncio
+import datetime
 import json
 import logging
 import os
@@ -31,6 +32,9 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from llm.ark_chat import VolcEngineArkChat
 from llm.router import ModelRouter
+from config import Config
+from sleep_session_builder import resolve_sleep_onset
+from insight_rules_config import get_insight_rules as _get_insight_rules
 
 
 from user_profile import compute_recent_sleep_stats
@@ -67,18 +71,36 @@ def extract_sleep_context(profile, data) -> dict:
     # Locally computed 7-day sleep statistics (no raw sequences).
     stats = compute_recent_sleep_stats(profile, days=7)
     ctx.update(stats)
+    # Raw sleep_quality is a historical heuristic. Prompts must describe the
+    # same versioned product score that /analysis can actually display.
+    from analysis_score import daily_score, period_score
+    from zoneinfo import ZoneInfo
+    try:
+        tz = ZoneInfo(getattr(data, "timezone", None) or profile.last_request_timezone or "UTC")
+    except (KeyError, ValueError):
+        tz = datetime.timezone.utc
+    scored_nights = sorted(profile.sleep_data, key=lambda r: r.timestamp)
+    anchor = scored_nights[-1].timestamp if scored_nights else None
+    if anchor is not None:
+        def _period(days):
+            nights = [r for r in scored_nights if 0 <= anchor - r.timestamp < days * 86400]
+            return period_score(nights, profile)
+        weekly = _period(7)
+        monthly = _period(30)
+        ctx["avg_sleep_quality"] = weekly["score"] if weekly else None
+        ctx["avg_sleep_score_30d"] = monthly["score"] if monthly else None
+    else:
+        ctx["avg_sleep_quality"] = None
+        ctx["avg_sleep_score_30d"] = None
 
     # 当夜明细（sleep_data 最后一条）——日视图 / 探索页的 prompt 需要夜级数据。
     latest = profile.sleep_data[-1] if profile.sleep_data else None
     if latest is not None:
         summaries = latest.sequence_summaries if latest.sleep_status else {}
-        tb = summaries.get("time_in_bed") or 0
+        tb = summaries.get("sleep_span") or 0   # 阶段占比分母，见 sequence_summaries
         ctx.update({
-            "latest_score":           latest.sleep_quality,
-            "latest_soe":             latest.soe,
-            "latest_onset_min":       latest.onset,
-            "latest_sleep_arch":      latest.sleep_arch_index,
-            "latest_night_var":       latest.night_var_index,
+            "latest_score":           (daily_score(latest, profile) or {}).get("score"),
+            "latest_onset_min":       resolve_sleep_onset(latest),
             "latest_first_sleep_time": latest.first_sleep_time,
             "latest_hr_before_sleep": latest.hr_before_sleep,
             "latest_rr_before_sleep": latest.rr_before_sleep,
@@ -91,21 +113,18 @@ def extract_sleep_context(profile, data) -> dict:
             "latest_awake_count":     summaries.get("night_awake_count"),
             "latest_awake_min":       summaries.get("night_awake_duration"),
             "latest_awake_type":      summaries.get("night_awake_type"),
+            "latest_total_sleep_min": summaries.get("total_sleep_duration"),
+            "latest_goal_achieved":   latest.goal_achieved,
             "latest_deep_pct":        round(summaries.get("deep_sleep_duration", 0) / tb * 100, 1) if tb else None,
             "latest_rem_pct":         round(summaries.get("rem_sleep_duration", 0) / tb * 100, 1) if tb else None,
             "latest_core_pct":        round(summaries.get("core_sleep_duration", 0) / tb * 100, 1) if tb else None,
         })
 
     # 场景别名：weekly_top_scene_* → prompt 里的 scene_name / used_times
+    # （旧 sleep_trend_week/month、scene.title/text 为死字段已移除——
+    #   趋势由 insight_rules.rule_trend 现算，场景由 weekly_top_scene_* 覆盖）
     ctx["scene_name"] = stats.get("weekly_top_scene_title")
     ctx["used_times"] = stats.get("weekly_top_scene_count")
-
-    # Profile sleep_analysis fields drive the prompt content.
-    sleep_analysis = profile.sleep_analysis or {}
-    ctx["sleep_trend_week"]  = sleep_analysis.get("sleep_trend_week", "")
-    ctx["sleep_trend_month"] = sleep_analysis.get("sleep_trend_month", "")
-    ctx["scene_title"]       = (sleep_analysis.get("scene") or {}).get("title", "")
-    ctx["scene_text"]        = (sleep_analysis.get("scene") or {}).get("text", "")
 
     # 去掉 None 值，让 prompt 模板里 ctx.get(key, '—') 的默认值真正生效
     # （key 存在但值为 None 时 .get 不会用默认值，会把 None 渲染进 prompt）
@@ -115,13 +134,16 @@ def extract_sleep_context(profile, data) -> dict:
 def deep_merge(base: dict, updates: dict) -> None:
     """
     Recursively merge `updates` into `base`, overwriting only non-empty string
-    values.  Numeric / boolean / list values in `base` are never overwritten.
+    values.  Numeric / boolean values in `base` are never overwritten.
+    Non-empty lists (e.g. LLM-localized scenario_list) overwrite list values.
     """
     for k, v in updates.items():
         if k not in base:
             base[k] = v
         elif isinstance(v, dict) and isinstance(base.get(k), dict):
             deep_merge(base[k], v)
+        elif isinstance(v, list) and v and isinstance(base.get(k), list):
+            base[k] = v
         elif isinstance(v, str) and v.strip():
             base[k] = v
         # skip None, empty strings, and non-string overrides of existing data
@@ -131,23 +153,51 @@ def deep_merge(base: dict, updates: dict) -> None:
 # Prompt templates  (text fields only — no numeric placeholders)
 # ──────────────────────────────────────────────────────────────
 
-_SYSTEM = (
+_SYSTEM_TEMPLATE = (
     "You are a professional sleep health analyst for the Mindora app. "
     "Analyze the provided sleep data and return ONLY a JSON object — "
     "no markdown fences, no explanation, no trailing text. "
-    "All string values must be written in the language specified. "
+    "All string values must be written in {lang}. "
+    "This overrides the language of the prompt itself. "
     "Keep every description to 1–2 sentences, warm and encouraging in tone."
 )
 
+_LANG_NAMES = {
+    "zh-Hans": "简体中文", "zh-Hant": "繁體中文",
+    "en": "English", "ja": "日本語", "ko": "한국어",
+    "de": "Deutsch", "fr": "Français", "it": "Italiano",
+    "es": "Español", "id": "Bahasa Indonesia",
+}
+
+def _lang_name(language: str) -> str:
+    return _LANG_NAMES.get(language, "English")
+
 def _lang_instruction(language: str) -> str:
-    names = {
-        "zh-Hans": "简体中文", "zh-Hant": "繁體中文",
-        "en": "English", "ja": "日本語", "ko": "한국어",
-        "de": "Deutsch", "fr": "Français", "it": "Italiano",
-        "es": "Español", "id": "Bahasa Indonesia",
-    }
-    lang_name = names.get(language, "English")
-    return f"Language for all text values: {lang_name} ({language})."
+    return f"Language for all text values: {_lang_name(language)} ({language})."
+
+def _system_prompt(language: str) -> str:
+    """system prompt 里点名具体语言（比泛泛的 'the language specified' 约束力强）。"""
+    return _SYSTEM_TEMPLATE.format(lang=f"{_lang_name(language)} ({language})")
+
+def _lang_closing(language: str) -> str:
+    """prompt 末尾重申输出语言：prompt 主体（数据/规则/schema 示例）全是英文，
+    仅靠开头一行指令模型偶尔会整篇漂成英文，利用近因效应在末尾再压一次。"""
+    return (
+        f"\n\nIMPORTANT: Write ALL text values in {_lang_name(language)} ({language}), "
+        "including titles, content and evidence."
+    )
+
+_CJK_RE = re.compile(r"[一-鿿぀-ヿ가-힯]")
+
+def _language_matches(result: dict, language: str) -> bool:
+    """输出语言校验：CJK 语言请求的结果必须含 CJK 字符。
+
+    K3 在英文主导的 prompt 下会随机整篇漂成英文（prompt 加固只能降低概率），
+    服务端校验 + 重试兜底；非 CJK 语言不校验（拉丁/英文之间漂移不判）。
+    """
+    if not language.startswith(("zh", "ja", "ko")):
+        return True
+    return bool(_CJK_RE.search(json.dumps(result, ensure_ascii=False)))
 
 
 def _prompt_overview(ctx: dict) -> str:
@@ -155,15 +205,20 @@ def _prompt_overview(ctx: dict) -> str:
 
 Sleep data summary:
 - Date: {ctx.get('date')}
-- 7-day average sleep quality: {ctx.get('avg_sleep_quality','—')} / 100
-- Last night's quality: {ctx.get('latest_score','—')} / 100
+- 7-day Mindora product score: {ctx.get('avg_sleep_quality','unavailable')}
+- Last night's Mindora product score: {ctx.get('latest_score','unavailable')}
+- If a score is unavailable, do not describe or infer its value.
 - Most-used scene (7 days): {ctx.get('scene_name','—')} × {ctx.get('used_times','—')} times
+- Weekly-best audio (raw name): {ctx.get('weekly_best_audio_name') or ctx.get('scene_name','—')}
 
 Return JSON with exactly these keys:
 {{
   "sleep_insight": {{
     "title": "<8 words or fewer>",
     "description": "<1–2 sentences>"
+  }},
+  "weekly_best": {{
+    "audio_name": "<the given weekly-best audio name, localized into the target language; keep it a short display name>"
   }}
 }}"""
 
@@ -172,7 +227,7 @@ def _prompt_sleep_day(ctx: dict) -> str:
     return f"""{_lang_instruction(ctx.get('language','en'))}
 
 Sleep data for {ctx.get('date')}:
-- Quality score: {ctx.get('latest_score','—')} / 100
+- Mindora product score: {ctx.get('latest_score','unavailable')}; if unavailable, do not infer one.
 - First sleep time: {ctx.get('latest_first_sleep_time','—')}
 - Pre-sleep HR: {ctx.get('latest_hr_before_sleep','—')} bpm  RR: {ctx.get('latest_rr_before_sleep','—')} brpm
 - Deep: {ctx.get('latest_deep_min','—')} min ({ctx.get('latest_deep_pct','—')}%)  REM: {ctx.get('latest_rem_min','—')} min ({ctx.get('latest_rem_pct','—')}%)
@@ -196,13 +251,14 @@ Return JSON with exactly these keys:
 
 def _prompt_sleep_week(ctx: dict) -> str:
     score = ctx.get('avg_sleep_quality')
-    label = "Excellent" if score and score >= 80 else "Good" if score and score >= 60 else "Fair"
-    score = score if score is not None else '—'
+    label = "Excellent" if score is not None and score >= 80 else "Good" if score is not None and score >= 60 else "Fair" if score is not None else "Unavailable"
+    score = score if score is not None else 'unavailable'
     return f"""{_lang_instruction(ctx.get('language','en'))}
 
 Weekly sleep summary ({ctx.get('start_date')} – {ctx.get('end_date')}):
-- Average quality score: {score} / 100  (baseline label: {label})
+- Average Mindora product score: {score}  (label: {label}); do not infer a missing score.
 - Most-used scene: {ctx.get('scene_name','—')} × {ctx.get('used_times','—')} times
+- Best onset-efficiency scene this week (raw name): {ctx.get('onset_scenario_name') or ctx.get('scene_name','—')}
 - Typical first-sleep time: {ctx.get('typical_first_sleep_time','—')}
 - Deep sleep proportion: {ctx.get('avg_deep_pct','—')}%  REM: {ctx.get('avg_rem_pct','—')}%
 
@@ -214,19 +270,24 @@ Return JSON with exactly these keys:
   "sleep_trends": {{
     "body":        "<headline ≤8 words>",
     "description": "<1–2 sentences summarising the week's pattern>"
+  }},
+  "onset_efficiency": {{
+    "scenario_name": "<the given best onset-efficiency scene name, localized into the target language; keep it a short display name>"
   }}
 }}"""
 
 
 def _prompt_sleep_month(ctx: dict) -> str:
-    score = ctx.get('avg_sleep_quality')
+    score = ctx.get('avg_sleep_score_30d')
     scene_name = ctx.get('scene_name') or '—'
-    score = score if score is not None else '—'
+    scene_list = ctx.get('onset_scenario_list') or '—'
+    score = score if score is not None else 'unavailable'
     return f"""{_lang_instruction(ctx.get('language','en'))}
 
 Monthly sleep summary ({ctx.get('start_date')} – {ctx.get('end_date')}):
-- Average quality score: {score} / 100
+- Average Mindora product score: {score}; do not infer a missing score.
 - Top sleep scene: {scene_name}
+- Top scenes this month (raw names, keep this order): {scene_list}
 - Average deep sleep: {ctx.get('avg_deep_pct','—')}%  REM: {ctx.get('avg_rem_pct','—')}%
 
 Return JSON with exactly these keys:
@@ -239,6 +300,7 @@ Return JSON with exactly these keys:
     "description": "<1–2 sentences about the month's sleep trend>"
   }},
   "onset_efficiency": {{
+    "scenario_list": ["<the given top scene names, each localized into the target language, same order, same count>"],
     "description": "<1 sentence about the best-performing scene(s)>"
   }}
 }}"""
@@ -270,10 +332,13 @@ def _prompt_explore(ctx: dict, modules: list) -> str:
     if "night_fluctuation" in wanted:
         schema["night_fluctuation"] = {
             "label":       "<status phrase: e.g. Normal | Moderate | High Fluctuation>",
+            "awake_type":  "<short localized label for the awakening pattern, based on the given awake count/minutes; e.g. Brief awakening | Frequent awakenings | Prolonged awakening>",
             "description": "<1 sentence about disturbances and system response>",
         }
     if "scene_preference" in wanted:
         schema["scene_preference"] = {
+            "scene_name":  "<the preferred scene display name, localized into the target language>",
+            "scene_type":  "<scene type description, e.g. Ocean / Forest / Rain / Wind, localized>",
             "description": "<1 sentence why this scene matched the sleep rhythm>",
         }
     if "sleep_advice" in wanted:
@@ -290,8 +355,8 @@ def _prompt_explore(ctx: dict, modules: list) -> str:
     return f"""{_lang_instruction(ctx.get('language','en'))}
 
 Last-night sleep analysis ({ctx.get('date')}):
-- Overall score: {ctx.get('latest_score','—')} / 100
-- Onset efficiency (SOE): {ctx.get('latest_soe','—')} / 100,  fell asleep in ~{ctx.get('latest_onset_min','?')} min at {ctx.get('latest_first_sleep_time','—')}
+- Mindora product score: {ctx.get('latest_score','unavailable')}; do not infer a missing score.
+- Reported onset duration: {ctx.get('latest_onset_min','—')} min at {ctx.get('latest_first_sleep_time','—')}; this duration may be estimated when no inBed start was recorded.
 - Pre-sleep HR: {ctx.get('latest_hr_before_sleep','—')} bpm   RR: {ctx.get('latest_rr_before_sleep','—')} brpm
 - Deep: {ctx.get('latest_deep_pct','—')}%   REM: {ctx.get('latest_rem_pct','—')}%   Core: {ctx.get('latest_core_pct','—')}%
 - Night wakings: {ctx.get('latest_awake_count','—')} × {ctx.get('latest_awake_min','—')} min   type: {ctx.get('latest_awake_type','—')}
@@ -300,6 +365,69 @@ Last-night sleep analysis ({ctx.get('date')}):
 
 Return JSON with exactly these keys:
 {json.dumps(schema, indent=2, ensure_ascii=False)}"""
+
+
+def _prompt_conclusion_polish(ctx: dict) -> str:
+    """规则结论润色 prompt（对照规范 v3 §4：LLM 仅可在既定事实上润色）。
+
+    输入是规则引擎算好的结构化结论（含事实、状态、已渲染文案），要求模型
+    只重写文本字段：不得增删数字/事实/场景/结论，不得使用禁用词，保持语言。
+    """
+    import json as _json
+    conclusions_json = _json.dumps(ctx.get("conclusions") or [], ensure_ascii=False, indent=1)
+    forbidden = "、".join(_get_insight_rules()["forbidden_terms"])
+    return f"""{_lang_instruction(ctx.get('language', 'en'))}
+
+You are polishing pre-computed sleep insight conclusions for the Mindora app.
+The conclusions below were computed by deterministic rules from the user's own data.
+Your ONLY job is to adjust terminal punctuation and surrounding spaces in the
+"title" and "text" of each conclusion. Keep all other characters unchanged.
+
+Conclusions (JSON):
+{conclusions_json}
+
+Hard constraints (violating any → output is rejected):
+- Do NOT add, remove, reorder or change any word, number, time, scene name, or factual claim.
+- Do NOT add new conclusions, diagnoses, causes, or effectiveness claims.
+- Do NOT use any of these forbidden terms: {forbidden}
+- Keep "title" ≤ 8 words and "text" ≤ 4 sentences.
+- Return ONLY a JSON object mapping each conclusion "key" to {{"title": ..., "text": ...}}.
+- Keys must be exactly the same set as the input conclusions."""
+
+
+def polish_output_ok(result: dict, conclusions: list, language: str) -> bool:
+    """LLM 润色输出校验（校验失败 → 保留规则模板文案）：
+    仅接受同键、同语言、无禁用词且事实文本相同的输出；允许末尾标点和首尾空白变化。"""
+    if not isinstance(result, dict):
+        return False
+    keys = {getattr(c, "key", None) for c in conclusions}
+    if set(result.keys()) != {k for k in keys if k}:
+        return False
+    if not _language_matches(result, language):
+        return False
+    import json as _json
+    text_all = _json.dumps(result, ensure_ascii=False).lower()
+    for term in _get_insight_rules()["forbidden_terms"]:
+        if term.lower() in text_all:
+            return False
+    # A prompt and a number whitelist cannot prove that prose preserves facts.
+    # Until an approved phrase grammar exists, permit terminal punctuation and
+    # boundary whitespace only. Internal punctuation can change numeric meaning
+    # (for example -3 vs 3 or 20-30 vs 2030), so it must remain exact.
+    def semantic_text(value: str) -> str:
+        return value.strip().rstrip("。！？!?.,;； ")
+    by_key = {c.key: c for c in conclusions}
+    for key, v in result.items():
+        if not isinstance(v, dict) or set(v) != {"title", "text"}:
+            return False
+        for field in ("title", "text"):
+            s = v.get(field)
+            original = getattr(by_key[key], field)
+            if not isinstance(s, str) or len(s) > _get_insight_rules()["polish_max_chars"] * 3:
+                return False
+            if semantic_text(s) != semantic_text(original):
+                return False
+    return True
 
 
 def _prompt_sleep_insight(ctx: dict) -> str:
@@ -324,7 +452,7 @@ You are writing the Mindora insight page. Every sentence must answer:
 
 Recent 7-day sleep statistics (aggregated locally):
 - Records used: {ctx.get('record_count', '—')}
-- Average sleep quality: {_fmt(ctx.get('avg_sleep_quality'))} / 100
+- Average Mindora product score: {_fmt(ctx.get('avg_sleep_quality'))}; do not infer a missing score.
 - Average sleep-onset latency: {_fmt(ctx.get('avg_onset_min'), ' min')}
 - Typical first sleep time: {ctx.get('typical_first_sleep_time', '—')}
 - Typical bed time: {ctx.get('typical_bed_time', '—')}   wake time: {ctx.get('typical_wake_time', '—')}
@@ -386,6 +514,23 @@ Return ONLY a JSON object (no markdown, no explanation) with exactly these six m
 }}"""
 
 
+def _prompt_bedtime_advice(ctx: dict) -> str:
+    return f"""{_lang_instruction(ctx.get('language', 'en'))}
+
+Write one practical bedtime suggestion for the coming week, based only on the available information below.
+- Nights with sleep data in the last 7 days: {ctx.get('record_count', 0)}
+- Typical bedtime: {ctx.get('typical_bed_time', 'unknown')}
+- Typical first sleep time: {ctx.get('typical_first_sleep_time', 'unknown')}
+- Average sleep onset: {ctx.get('avg_onset_min', 'unknown')} minutes
+- Average Mindora product score: {ctx.get('avg_sleep_quality', 'unavailable')}; do not infer a missing score.
+- Most used sleep scene: {ctx.get('weekly_top_scene_title', 'unknown')}
+- User's improvement goal: {ctx.get('improvement_goal', 'unknown')}
+- Preferred sleep-mode start time: {ctx.get('sleep_mode_start_time', 'unknown')}
+
+Give a specific, gentle action the user can try before bed. If data is sparse, use a general bedtime habit and do not claim a personal pattern. Do not diagnose, prescribe treatment, or promise results. Keep it to one or two short sentences.
+Return ONLY JSON: {{"content": "<bedtime suggestion>"}}"""
+
+
 # ──────────────────────────────────────────────────────────────
 # SleepAnalysisLLM
 # ──────────────────────────────────────────────────────────────
@@ -403,9 +548,12 @@ class SleepAnalysisLLM:
     def __init__(self, router: Optional["ModelRouter"] = None):
         self._router = router or ModelRouter.from_env()
         self._model = self._router.chat_model_for("default")
+        # request_type → 最近成功方向名：下次优先用它，避免每次都先撞失败方向
+        self._last_good: dict[str, str] = {}
         if self._model is None:
             logging.warning(
-                "no available LLM route (set ARK_API_KEY or KIMI_API_KEY) — LLM analysis disabled, using default text"
+                "no available LLM route (set ARK_API_KEY, KIMI_API_KEY, or "
+                "OPENROUTER_API_KEY + OPENROUTER_MODEL) — LLM analysis disabled, using default text"
             )
 
     def _model_for(self, request_type: str) -> Optional[VolcEngineArkChat]:
@@ -414,6 +562,25 @@ class SleepAnalysisLLM:
         if router is None:
             return self._model
         return router.chat_model_for(request_type) or self._model
+
+    def _candidate_models(self, request_type: str) -> list[tuple[str, "VolcEngineArkChat"]]:
+        """按优先级返回 [(方向名, model)]：最近成功方向优先，其余按路由表注册顺序。
+
+        调用级故障转移的候选序列：首选方向调用失败/超时/非 JSON 时按序切换。
+        """
+        router = getattr(self, "_router", None)
+        if router is None:
+            return [("default", self._model)] if self._model is not None else []
+        routes = router.available_routes(request_type)
+        last = getattr(self, "_last_good", {}).get(request_type)
+        if last:
+            routes = sorted(routes, key=lambda r: 0 if r.name == last else 1)
+        out = []
+        for route in routes:
+            model = router.chat_model_for_route(route)
+            if model is not None:
+                out.append((route.name, model))
+        return out
 
     @property
     def enabled(self) -> bool:
@@ -427,17 +594,14 @@ class SleepAnalysisLLM:
 
     # ── internal ──────────────────────────────────────────────
 
-    async def _call(self, user_prompt: str, request_type: str = "default") -> Optional[str]:
-        """Run a blocking LLM call in a thread pool."""
-        if not self.enabled:
-            return None
-        model = self._model_for(request_type)
-        if model is None:
+    async def _call(self, user_prompt: str, model, route_name: str, language: str = "en") -> Optional[str]:
+        """Run a blocking LLM call in a thread pool（指定方向；失败由调用方切换方向）。"""
+        if not self.enabled or model is None:
             return None
 
         def _invoke() -> str:
             resp = model.invoke([
-                SystemMessage(content=_SYSTEM),
+                SystemMessage(content=_system_prompt(language)),
                 HumanMessage(content=user_prompt),
             ])
             return resp.content
@@ -451,9 +615,9 @@ class SleepAnalysisLLM:
                 timeout=130,
             )
         except asyncio.TimeoutError:
-            logging.warning("LLM call timed out")
+            logging.warning("LLM call timed out (route=%s)", route_name)
         except Exception as e:
-            logging.error("LLM call error: %s", e)
+            logging.error("LLM call error (route=%s): %s", route_name, e)
         return None
 
     def _parse(self, text: Optional[str]) -> Optional[dict]:
@@ -491,13 +655,29 @@ class SleepAnalysisLLM:
             "analysis_sleep_month":    lambda: _prompt_sleep_month(ctx),
             "analysis_explore":        lambda: _prompt_explore(ctx, modules),
             "sleep_insight_report":    lambda: _prompt_sleep_insight(ctx),
+            "bedtime_advice":         lambda: _prompt_bedtime_advice(ctx),
+            "sleep_insight_polish":    lambda: _prompt_conclusion_polish(ctx),
+            "insight_polish":          lambda: _prompt_conclusion_polish(ctx),
         }.get(request_type)
 
         if prompt_fn is None:
             return None
 
-        raw = await self._call(prompt_fn(), request_type)
-        return self._parse(raw)
+        prompt = prompt_fn() + _lang_closing(language)
+        # 调用级故障转移：首选方向失败（异常/超时/非 JSON/语言校验不过）→ 切换下一个方向
+        for route_name, model in self._candidate_models(request_type):
+            for attempt in (1, 2):
+                raw = await self._call(prompt, model, route_name, language)
+                result = self._parse(raw)
+                if result is None:
+                    break  # 调用失败/非 JSON：换下一个方向
+                if _language_matches(result, language):
+                    self._last_good[request_type] = route_name
+                    return result
+                logging.warning("LLM output not in %s (route=%s, request_type=%s), retry %d/2", language, route_name, request_type, attempt)
+            logging.warning("llm route %s failed for request_type=%s, trying next route", route_name, request_type)
+        logging.error("all llm routes failed (request_type=%s), using fallback", request_type)
+        return None
 
     def generate_sync(
         self,
@@ -524,21 +704,34 @@ class SleepAnalysisLLM:
             "analysis_sleep_month":    lambda: _prompt_sleep_month(ctx),
             "analysis_explore":        lambda: _prompt_explore(ctx, modules),
             "sleep_insight_report":    lambda: _prompt_sleep_insight(ctx),
+            "bedtime_advice":         lambda: _prompt_bedtime_advice(ctx),
+            "sleep_insight_polish":    lambda: _prompt_conclusion_polish(ctx),
+            "insight_polish":          lambda: _prompt_conclusion_polish(ctx),
         }.get(request_type)
 
         if prompt_fn is None:
             return None
 
-        model = self._model_for(request_type)
-        if model is None:
-            return None
-
-        try:
-            resp = model.invoke([
-                SystemMessage(content=_SYSTEM),
-                HumanMessage(content=prompt_fn()),
-            ])
-            return self._parse(resp.content)
-        except Exception as e:
-            logging.error("LLM sync call error: %s", e)
-            return None
+        prompt = prompt_fn() + _lang_closing(language)
+        # 调用级故障转移：首选方向失败（异常/超时/非 JSON/语言校验不过）→ 切换下一个方向
+        for route_name, model in self._candidate_models(request_type):
+            for attempt in (1, 2):
+                try:
+                    resp = model.invoke([
+                        SystemMessage(content=_system_prompt(language)),
+                        HumanMessage(content=prompt),
+                    ])
+                    result = self._parse(resp.content)
+                except Exception as e:
+                    logging.error("LLM sync call error (route=%s): %s", route_name, e)
+                    break  # 换下一个方向
+                if result is None:
+                    logging.warning("LLM returned non-JSON (route=%s, request_type=%s)", route_name, request_type)
+                    break  # 换下一个方向
+                if _language_matches(result, language):
+                    self._last_good[request_type] = route_name
+                    return result
+                logging.warning("LLM output not in %s (route=%s, request_type=%s), retry %d/2", language, route_name, request_type, attempt)
+            logging.warning("llm route %s failed for request_type=%s, trying next route", route_name, request_type)
+        logging.error("all llm routes failed (request_type=%s), using fallback", request_type)
+        return None
