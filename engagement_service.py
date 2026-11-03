@@ -97,7 +97,7 @@ class EngagementService:
     delivered_at = 该 uid 首次落地时间（inbox_messages.created_at），无记录退回目录 first_seen_at。
     """
     now = int(time.time())
-    profile = self._ps.get_profile(uid)
+    profile = self._ps.get_profile(uid, {"engagement:popup"})
     landed = {m.popup_id: m.created_at for m in (profile.inbox_messages if profile else [])}
 
     records: list[dict] = []
@@ -160,7 +160,7 @@ class EngagementService:
     now = int(time.time())
     popups_catalog, _, next_query_after = _load_ops_config()
     with self._ps.uid_lock(uid):
-      profile = self._ps._get_or_create_profile_unlocked(uid)
+      profile = self._ps.get_or_create_parts(uid, {"engagement:popup", "engagement:survey"})
       inbox_changed = False
       result: list[dict] = []
 
@@ -244,7 +244,7 @@ class EngagementService:
       logging.warning("report_popup for unknown popup_id=%s uid=%s", popup_id, uid)
       return False
     with self._ps.uid_lock(uid):
-      profile = self._ps._get_or_create_profile_unlocked(uid)
+      profile = self._ps.get_or_create_parts(uid, {"engagement:popup"})
       state = profile.popup_states.get(popup_id) or PopupState()
       if event == "impression":
         state.show_count += 1
@@ -301,7 +301,7 @@ class EngagementService:
       return None, 400
 
     with self._ps.uid_lock(uid):
-      profile = self._ps._get_or_create_profile_unlocked(uid)
+      profile = self._ps.get_or_create_parts(uid, {"engagement:survey"})
       existing = profile.survey_submissions.get(data.survey_id)
       if existing is not None:
         logging.info(
@@ -385,7 +385,7 @@ class EngagementService:
   def merge_footprint_days(self, uid: str, days: List[FootprintDay]) -> int:
     """上传陪伴足迹：按 uid+date 幂等合并（布尔取 OR、计数取大、首活跃取小）。返回接受的天数。"""
     with self._ps.uid_lock(uid):
-      profile = self._ps._get_or_create_profile_unlocked(uid)
+      profile = self._ps.get_or_create_parts(uid, {"engagement:footprint"})
       for day in days:
         existing = profile.footprint_days.get(day.date)
         if existing is None:
@@ -463,7 +463,7 @@ class EngagementService:
       tz = ZoneInfo("UTC")
     today = datetime.datetime.now(tz).date()
 
-    profile = self._ps.get_profile(uid)
+    profile = self._ps.get_profile(uid, {"engagement:footprint"})
     days_map = dict(profile.footprint_days) if profile else {}
 
     # 锚定日期：最近一条有数据（≤今天）的日期

@@ -773,8 +773,8 @@ class UserServer:
       # 用户在看法分析页 = 活跃信号（收窄后只认 /analysis 和 plays）
       self._mark_activity(uid)
 
-      # One UID-locked read supplies both request-meta persistence and the
-      # analysis builders. The steady-state path performs exactly one DB get.
+      # One snapshot supplies the analysis inputs. Unrelated avatar, operational
+      # data and recommendation outputs are not read from split storage.
       profile = await self._run_query(
         self.user_serv.get_profile_and_note_request_meta,
         uid, req.data.timezone, req.data.language,
@@ -1076,7 +1076,7 @@ class UserServer:
 
       def _do_sync() -> sleep_plan_service.SyncResult:
         with self.user_serv.uid_lock(uid):
-          profile = self.user_serv.get_profile(uid)
+          profile = self.user_serv.get_profile(uid, {"plans:state", "request_meta"})
           stored = list(profile.sleep_plans) if profile else []
           result = sleep_plan_service.sync_plans(
             stored, incoming,
@@ -1090,7 +1090,7 @@ class UserServer:
             meta_changed = self.user_serv._note_request_meta(profile, d.timezone, d.language, fill_only=False)
           if result.changed or meta_changed:
             if profile is None:
-              profile = UserProfile()
+              profile = self.user_serv.get_or_create_parts(uid, {"plans:state", "request_meta"})
               self.user_serv._note_request_meta(profile, d.timezone, d.language, fill_only=False)
             profile.sleep_plans = result.plans
             profile.sleep_plans_synced_at = int(time.time())

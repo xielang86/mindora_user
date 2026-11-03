@@ -32,6 +32,7 @@ from analysis_score import SCORE_VERSION, daily_score
 from common import util
 from config import Config
 from engagement_service import EngagementService
+from profile_repository import ProfileRepository, PARTS, ANALYSIS_PARTS
 from llm import SleepAnalysisLLM
 from user_profile import (
   UserProfile, SleepScenario, Profile, SCENE_CMD_PREFIXES, short_scene_id,
@@ -192,7 +193,12 @@ class UserProfileServ:
     logging.info(f"user profile storage mode={self.storage_mode}")
 
   def _profile_to_json_data(self, profile: UserProfile) -> dict:
-    return profile.model_dump(mode="json")
+    data = profile.model_dump(mode="json")
+    # Preserve forward/legacy JSON fields ignored by typed DTO validation.
+    data.update(getattr(profile, "_storage_top_extra", {}))
+    if isinstance(data.get("profile"), dict):
+      data["profile"].update(getattr(profile, "_storage_profile_extra", {}))
+    return data
 
   def _load_profiles_from_text_unlocked(self) -> dict[str, Any]:
     if not self.json_path.exists():
@@ -219,28 +225,36 @@ class UserProfileServ:
   def _flush_text_profiles_unlocked(self):
     self._save_profiles_to_text_unlocked(self.text_profiles)
 
-  def get_profile(self, uid: str) -> Optional[UserProfile]:
-    """读取单个用户画像"""
+  @property
+  def repository(self):
+    if "_repository" not in self.__dict__:
+      self._repository = ProfileRepository(self)
+    return self._repository
+
+  def get_profile(self, uid: str, parts=None) -> Optional[UserProfile]:
+    """Legacy DTO assembled from a consistent set of storage parts."""
     if not uid or not isinstance(uid, str):
-      logging.error(f"erro uid : {uid}")
       return None
+    data = self.repository.read(uid, parts)
+    if data is None:
+      return None
+    profile = UserProfile.model_validate(data)
+    # Explicit capability: save_profile may only write the parts actually read.
+    object.__setattr__(profile, "_storage_parts", PARTS if parts is None else frozenset(parts))
+    object.__setattr__(profile, "_storage_top_extra", {
+      k: v for k, v in data.items() if k not in UserProfile.model_fields
+    })
+    object.__setattr__(profile, "_storage_profile_extra", {
+      k: v for k, v in (data.get("profile") or {}).items() if k not in Profile.model_fields
+    })
+    return profile
 
-    if self.storage_mode == "leveldb":
-      # LevelDB supports concurrent point reads. Do not serialize all users on
-      # the global Python lock; a get observes either the old or new full value.
-      data = self.db.get(uid.encode('utf-8'))
-      if data:
-        logging.debug("get from leveldb uid=%s size=%d bytes", uid, len(data))
-        return UserProfile.model_validate(json.loads(data.decode('utf-8')))
-      logging.debug("get from leveldb uid=%s not found", uid)
-      return None
-
-    with self.lock:
-      data = self.text_profiles.get(uid)
-      logging.debug("get from json txt uid=%s found=%s", uid, data is not None)
-      if data is not None:
-        return UserProfile.model_validate(data)
-      return None
+  def get_or_create_parts(self, uid: str, parts):
+    profile = self.get_profile(uid, parts)
+    if profile is None:
+      profile = UserProfile()
+      object.__setattr__(profile, "_storage_parts", frozenset(parts))
+    return profile
 
   def uid_lock(self, uid: str):
     """Return the stable striped lock used for one user's mutations."""
@@ -307,21 +321,9 @@ class UserProfileServ:
         profile.sleep_data.sort(key=lambda r: r.timestamp)
       self._cap_sleep_record_lists(profile)
       self._cap_engagement_containers(profile)
-      profile.revision = (profile.revision or 0) + 1
-      if self.storage_mode == "leveldb":
-        data = json.dumps(self._profile_to_json_data(profile)).encode('utf-8')
-        with self.db.write_batch(transaction=True) as batch:
-          batch.put(uid.encode('utf-8'), data)
-          batch.put(
-            (self.REVISION_KEY_PREFIX + uid).encode("utf-8"),
-            str(profile.revision).encode("ascii"),
-          )
-        return
-
-      with self.lock:
-        self.text_profiles[uid] = self._profile_to_json_data(profile)
-        self.text_profiles[self.REVISION_KEY_PREFIX + uid] = profile.revision
-        self._flush_text_profiles_unlocked()
+      profile.revision = self.repository.save(
+        uid, self._profile_to_json_data(profile), getattr(profile, "_storage_parts", None),
+      )
 
   def get_revision(self, uid: str) -> int:
     """Read the compact revision key without constructing a UserProfile."""
@@ -488,7 +490,7 @@ class UserProfileServ:
                         fill_only: bool = True) -> None:
     """读路径（/analysis）登记请求环境：只在画像缺省时补缺，有变化才落盘。"""
     with self.uid_lock(uid):
-      profile = self.get_profile(uid)
+      profile = self.get_profile(uid, {"request_meta"})
       if profile is None:
         return
       if self._note_request_meta(profile, timezone, language, fill_only=fill_only):
@@ -501,13 +503,13 @@ class UserProfileServ:
     language: Optional[str],
     fill_only: bool = True,
   ) -> Optional[UserProfile]:
-    """Load once for /analysis and persist request metadata only if missing.
+    """Load analysis inputs from one snapshot; fill request metadata if missing.
 
     The whole read-modify-write is protected by the UID stripe, so a first-time
     metadata fill cannot overwrite a concurrent update for the same user.
     """
     with self.uid_lock(uid):
-      profile = self.get_profile(uid)
+      profile = self.get_profile(uid, ANALYSIS_PARTS)
       if profile is None:
         return None
       if self._note_request_meta(profile, timezone, language, fill_only=fill_only):
@@ -522,7 +524,7 @@ class UserProfileServ:
     update that arrived after the request's initial read.
     """
     with self.uid_lock(uid):
-      profile = self.get_profile(uid)
+      profile = self.get_profile(uid, ANALYSIS_PARTS)
       if profile is None or profile.sleep_data:
         return profile
       if self.content.ensure_fallback_content(uid, profile):
@@ -530,14 +532,8 @@ class UserProfileServ:
       return profile
 
   def list_uids(self) -> list:
-    """全部用户 uid（兜底扫描用）；排除 "_meta:" 前缀的全局 KV。"""
-    with self.lock:
-      if self.storage_mode == "leveldb":
-        return [
-          k.decode("utf-8") for k, _v in self.db.iterator()
-          if not k.startswith(b"_meta:")
-        ]
-      return [k for k in self.text_profiles if not k.startswith("_meta:")]
+    """Enumerate legacy users and the explicit v2 user directory, never parts."""
+    return self.repository.list_uids()
 
   # -------------------- 健康数据口径版本（健康数据同步接口_0814.md §8）--------------------
   @staticmethod
@@ -717,7 +713,7 @@ class UserProfileServ:
     health_sync_days 也能回答（缺省版本 1），且被截断淘汰的天不会谎报。
     无画像返回 None。
     """
-    profile = self.get_profile(uid)
+    profile = self.get_profile(uid, {"internal:health", "internal:health_sync"})
     if profile is None:
       return None
     tz = self._resolve_tz(timezone)
