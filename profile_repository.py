@@ -103,16 +103,17 @@ def decompose(data):
     return parts, revision
 
 
-def assemble(parts, revision):
+def assemble(parts, revision, *, copy_values=True):
     result = {}
     for part in sorted(parts):
         for field, value in parts[part].items():
+            item = copy.deepcopy(value) if copy_values else value
             if field in {"profile", "behaviors", "sleep_analysis"} and isinstance(value, dict):
                 if result.get(field) is None:
                     result[field] = {}
-                result[field].update(copy.deepcopy(value))
+                result[field].update(item)
             else:
-                result[field] = copy.deepcopy(value)
+                result[field] = item
     result["revision"] = revision
     return result
 
@@ -199,7 +200,10 @@ class ProfileRepository:
                 if value is None:
                     raise ValueError(f"missing committed profile part: {part}")
                 loaded[part] = value
-            return assemble(loaded, meta["commit_revision"])
+            # LevelDB values were decoded into new Python objects above.  The
+            # assembled result owns them; copying every nested record again is
+            # unnecessary on this hot query path.
+            return assemble(loaded, meta["commit_revision"], copy_values=False)
 
     def migrate(self, uid, dry_run=False):
         """Caller owns the UID lock; never changes business values or revision."""
