@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Mixed read/write HTTP load test for user_server.
 
-The default mix is revision:70, device:15, app:5, analysis:5, update:5.  Remote
-targets are rejected unless --allow-remote is explicitly supplied.
+The default mix is revision:70, device:15, app:5, analysis:5, update:5.
+The app operation omits profile_view, exercising the compatibility default;
+app_only explicitly selects the two-part App projection. Remote targets are
+rejected unless --allow-remote is explicitly supplied.
 """
 from __future__ import annotations
 
@@ -22,7 +24,7 @@ import aiohttp
 import jwt
 
 
-OPS = ("revision", "device", "app", "profile", "analysis", "update")
+OPS = ("revision", "device", "app", "app_only", "profile", "analysis", "update")
 
 
 def parse_mix(value: str) -> dict[str, float]:
@@ -78,8 +80,8 @@ class LoadTest:
     base = {"timestamp": now, "version": "1.0"}
     if op == "revision":
       return "/user_profile", {**base, "request_type": "query_revision", "data": self.auth(uid)}
-    if op in {"profile", "app", "device"}:
-      view = {"profile": "all", "device": "device"}.get(op)
+    if op in {"profile", "app", "app_only", "device"}:
+      view = {"profile": "all", "app_only": "app", "device": "device"}.get(op)
       return "/user_profile", {**base, "request_type": "query_profile", "data": {
         **self.auth(uid), **({"profile_view": view} if view else {}),
       }}
@@ -114,10 +116,14 @@ class LoadTest:
         ok = response.status == 200 and isinstance(parsed, dict) and parsed.get("code") == 0
         if op == "revision":
           ok = ok and isinstance(data, dict) and isinstance(data.get("revision"), int)
-        elif op in {"profile", "app", "device"}:
+        elif op in {"profile", "app", "app_only", "device"}:
           up = data.get("user_profile") if isinstance(data, dict) else None
           ok = ok and isinstance(up, dict) and isinstance(up.get("revision"), int)
           if op == "app":
+            ok = (ok and isinstance(up.get("profile"), dict)
+                  and "avatar_base64" in up["profile"] and "address_list" in up["profile"]
+                  and "sleep_data" in up and "behaviors" not in up)
+          elif op == "app_only":
             ok = ok and isinstance(up.get("profile"), dict) and set(up) == {"revision", "profile"}
           elif op == "device":
             ok = ok and isinstance(up.get("profile"), dict) and "avatar_base64" not in up["profile"]

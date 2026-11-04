@@ -63,6 +63,7 @@ PROFILE_VIEW_PARTS = {
     "scene:summary", "analysis:reports", "analysis:advice", "recommendation:current",
   }),
 }
+PROFILE_VIEW_PARTS["compat"] = PROFILE_VIEW_PARTS["device"] | {"profile:avatar"}
 APP_PROFILE_FIELDS = frozenset({
   "nickname", "gender", "age", "birthday", "email", "phone", "weight", "height",
   "address_list", "avatar_base64", "avatar_mime_type",
@@ -439,13 +440,15 @@ class UserServer:
           "include_sop_tag_profile": False, "include_sop_recommendation_details": False,
         })
         profile_dict = self._profile_response_body(profile, options)
-        if view == "device":
+        if view in {"device", "compat"}:
           profile_dict = {field: value for field, value in profile_dict.items()
                           if field in DEVICE_TOP_FIELDS}
           if isinstance(profile_dict.get("profile"), dict):
+            profile_fields = (DEVICE_PROFILE_FIELDS if view == "device"
+                              else DEVICE_PROFILE_FIELDS | APP_PROFILE_FIELDS)
             profile_dict["profile"] = {
               field: value for field, value in profile_dict["profile"].items()
-              if field in DEVICE_PROFILE_FIELDS
+              if field in profile_fields
             }
           if isinstance(profile_dict.get("analysis_reports"), dict):
             profile_dict["analysis_reports"] = {
