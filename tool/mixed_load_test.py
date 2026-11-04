@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Mixed read/write HTTP load test for user_server.
 
-The default mix is revision:70, profile:15, analysis:10, update:5.  Remote
+The default mix is revision:70, device:15, app:5, analysis:5, update:5.  Remote
 targets are rejected unless --allow-remote is explicitly supplied.
 """
 from __future__ import annotations
@@ -22,7 +22,7 @@ import aiohttp
 import jwt
 
 
-OPS = ("revision", "profile", "analysis", "update")
+OPS = ("revision", "device", "app", "profile", "analysis", "update")
 
 
 def parse_mix(value: str) -> dict[str, float]:
@@ -35,7 +35,7 @@ def parse_mix(value: str) -> dict[str, float]:
         raise ValueError
       result[name] = weight
   except ValueError:
-    raise argparse.ArgumentTypeError("mix must look like revision=70,profile=15,analysis=10,update=5")
+    raise argparse.ArgumentTypeError("mix must look like revision=70,device=15,app=5,analysis=5,update=5")
   if not result or sum(result.values()) <= 0:
     raise argparse.ArgumentTypeError("mix must contain a positive weight")
   return result
@@ -78,10 +78,10 @@ class LoadTest:
     base = {"timestamp": now, "version": "1.0"}
     if op == "revision":
       return "/user_profile", {**base, "request_type": "query_revision", "data": self.auth(uid)}
-    if op == "profile":
+    if op in {"profile", "app", "device"}:
+      view = {"profile": "all", "device": "device"}.get(op)
       return "/user_profile", {**base, "request_type": "query_profile", "data": {
-        **self.auth(uid), "sleep_data_count": 7, "include_behaviors": True,
-        "analysis_report_count": 1, "include_mindora_record": True, "engagement_count": 0,
+        **self.auth(uid), **({"profile_view": view} if view else {}),
       }}
     if op == "analysis":
       return "/analysis", {**base, "request_type": "analysis_explore", "data": {
@@ -107,10 +107,24 @@ class LoadTest:
         body = await response.read()
         size = len(body)
         try:
-          app_code = json.loads(body).get("code")
-        except (json.JSONDecodeError, AttributeError):
-          app_code = None
-        ok = response.status == 200 and app_code == 0
+          parsed = json.loads(body)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+          parsed = None
+        data = parsed.get("data") if isinstance(parsed, dict) else None
+        ok = response.status == 200 and isinstance(parsed, dict) and parsed.get("code") == 0
+        if op == "revision":
+          ok = ok and isinstance(data, dict) and isinstance(data.get("revision"), int)
+        elif op in {"profile", "app", "device"}:
+          up = data.get("user_profile") if isinstance(data, dict) else None
+          ok = ok and isinstance(up, dict) and isinstance(up.get("revision"), int)
+          if op == "app":
+            ok = ok and isinstance(up.get("profile"), dict) and set(up) == {"revision", "profile"}
+          elif op == "device":
+            ok = ok and isinstance(up.get("profile"), dict) and "avatar_base64" not in up["profile"]
+        elif op == "analysis":
+          ok = ok and isinstance(data, dict)
+        elif op == "update":
+          ok = ok and isinstance(data, dict) and data.get("accepted") is True
     except (aiohttp.ClientError, asyncio.TimeoutError):
       ok = False
     elapsed = (time.perf_counter_ns() - started) / 1_000_000
@@ -138,7 +152,9 @@ class LoadTest:
           async with session.post(self.args.base_url + "/user_profile", json=payload) as response:
             body = await response.read()
             parsed = json.loads(body)
-            if response.status != 200 or parsed.get("code") != 0:
+            data = parsed.get("data") if isinstance(parsed, dict) else None
+            if (response.status != 200 or not isinstance(parsed, dict) or parsed.get("code") != 0
+                    or not isinstance(data, dict) or data.get("accepted") is not True):
               return uid, f"HTTP {response.status}: {body[:200]!r}"
         except Exception as exc:
           return uid, str(exc)
@@ -239,7 +255,7 @@ def main() -> None:
   parser.add_argument("--profiles", default="tool/load_profiles_100.json")
   parser.add_argument("--jwt-secret", default=os.getenv("JWT_SECRET_KEY"),
                       help="Must match server JWT_SECRET_KEY; defaults to the environment variable")
-  parser.add_argument("--mix", type=parse_mix, default=parse_mix("revision=70,profile=15,analysis=10,update=5"))
+  parser.add_argument("--mix", type=parse_mix, default=parse_mix("revision=70,device=15,app=5,analysis=5,update=5"))
   parser.add_argument("--duration", type=float, default=30)
   parser.add_argument("--qps", type=float, default=100, help="Target aggregate arrival rate; 0 runs closed-loop")
   parser.add_argument("--concurrency", type=int, default=32)

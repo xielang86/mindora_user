@@ -11,8 +11,7 @@ from urllib.parse import quote
 
 
 GROUPS = {
-    "internal:preferences": ("uid_emb", "basic_info", "long_term_profile"),
-    "settings:sleep": ("sleep_health", "sleep_mode"),
+    "internal:preferences": ("uid_emb", "long_term_profile"),
     "plans:state": ("sleep_plan", "sleep_plans", "sleep_plans_synced_at"),
     "internal:health_sync": ("health_sync_days", "health_sync_field_versions", "health_sync_timezone"),
     "sleep:records": ("sleep_data",),
@@ -37,6 +36,10 @@ ANALYSIS_PARTS = PARTS - {
     "engagement:popup", "engagement:survey", "engagement:footprint",
 }
 AVATAR_FIELDS = {"avatar_base64", "avatar_mime_type"}
+DETAIL_FIELDS = ("basic_info", "sleep_health", "sleep_mode")
+# Schema 2 stored these fields in separate parts. Schema 3 moves them into
+# profile:details and retires settings:sleep.
+V2_PARTS = PARTS | {"settings:sleep"}
 
 
 def encoded_uid(uid):
@@ -64,10 +67,10 @@ def split_profile(data):
         parts[part] = {field: data.pop(field) for field in fields if field in data}
     profile = data.pop("profile", None)
     # Preserve absent vs explicit null, and absent vs empty avatar fields.
-    parts["profile:details"] = {}
+    parts["profile:details"] = {field: data.pop(field) for field in DETAIL_FIELDS if field in data}
     parts["profile:avatar"] = {}
     if isinstance(profile, dict):
-        parts["profile:details"] = {"profile": {k: v for k, v in profile.items() if k not in AVATAR_FIELDS}}
+        parts["profile:details"]["profile"] = {k: v for k, v in profile.items() if k not in AVATAR_FIELDS}
         parts["profile:avatar"] = {"profile": {k: v for k, v in profile.items() if k in AVATAR_FIELDS}}
     elif profile is not None:
         raise ValueError("profile must be an object or null")
@@ -96,7 +99,7 @@ def decompose(data):
     for field, part in (("profile", "profile:details"), ("behaviors", "internal:health"),
                         ("sleep_analysis", "scene:summary")):
         if field in data and data[field] is None:
-            parts[part] = {field: None}
+            parts[part][field] = None
     return parts, revision
 
 
@@ -115,7 +118,7 @@ def assemble(parts, revision):
 
 
 class ProfileRepository:
-    SCHEMA = 2
+    SCHEMA = 3
     REVISION_PREFIX = b"_meta:revision:"
     USER_PREFIX = b"_meta:user:"
 
@@ -138,15 +141,19 @@ class ProfileRepository:
         raw = reader.get(k)
         return json.loads(raw) if raw is not None else None
 
-    def _batch(self, values):
+    def _batch(self, values, deletions=()):
         if self.service.storage_mode == "leveldb":
             with self.service.db.write_batch(transaction=True) as batch:
                 for k, value in values.items():
                     batch.put(k, encode(value))
+                for k in deletions:
+                    batch.delete(k)
         else:
             with self.service.lock:
                 old = self.service.text_profiles.copy()
                 self.service.text_profiles.update({k.decode(): copy.deepcopy(v) for k, v in values.items()})
+                for k in deletions:
+                    self.service.text_profiles.pop(k.decode(), None)
                 try:
                     self.service._flush_text_profiles_unlocked()
                 except Exception:
@@ -155,9 +162,19 @@ class ProfileRepository:
 
     def _meta(self, reader, uid):
         meta = self._get(reader, key(uid, "meta"))
-        if meta is not None and (meta.get("schema_version") != self.SCHEMA or not meta.get("migration_complete")):
+        if meta is not None and (meta.get("schema_version") not in {2, self.SCHEMA} or not meta.get("migration_complete")):
             raise ValueError("unsupported or incomplete profile layout")
         return meta
+
+    def _read_v2(self, reader, uid, meta):
+        loaded = {}
+        for part in V2_PARTS:
+            raw_key = f"p2:{encoded_uid(uid)}:{part}".encode()
+            value = self._get(reader, raw_key)
+            if value is None:
+                raise ValueError(f"missing committed v2 profile part: {part}")
+            loaded[part] = value
+        return assemble(loaded, meta["commit_revision"])
 
     def read(self, uid, parts=None):
         selected = PARTS if parts is None else frozenset(parts)
@@ -173,6 +190,9 @@ class ProfileRepository:
                     raise ValueError("legacy profile is not an object")
                 all_parts, revision = decompose(legacy)
                 return assemble({p: all_parts[p] for p in selected}, revision)
+            if meta["schema_version"] == 2:
+                all_parts, revision = decompose(self._read_v2(reader, uid, meta))
+                return assemble({p: all_parts[p] for p in selected}, revision)
             loaded = {}
             for part in selected:
                 value = self._get(reader, key(uid, part))
@@ -184,16 +204,17 @@ class ProfileRepository:
     def migrate(self, uid, dry_run=False):
         """Caller owns the UID lock; never changes business values or revision."""
         with self.snapshot() as reader:
-            if self._meta(reader, uid) is not None:
+            meta = self._meta(reader, uid)
+            if meta is not None and meta["schema_version"] == self.SCHEMA:
                 return "already_migrated"
-            raw = self._get(reader, uid.encode())
+            raw = self._read_v2(reader, uid, meta) if meta is not None else self._get(reader, uid.encode())
             if raw is None:
                 return "not_found"
             parts, revision = decompose(raw)
             if assemble(parts, revision) != {**raw, "revision": revision}:
                 raise ValueError("profile migration round-trip mismatch")
         if not dry_run:
-            self._write(uid, parts, revision, None)
+            self._write(uid, parts, revision, meta)
         return "migrated" if not dry_run else "would_migrate"
 
     def _write(self, uid, changes, revision, old_meta):
@@ -201,6 +222,8 @@ class ProfileRepository:
             "schema_version": self.SCHEMA, "migration_complete": True,
             "part_revisions": {},
         }
+        meta["schema_version"] = self.SCHEMA
+        meta["part_revisions"].pop("settings:sleep", None)
         for part in changes:
             meta["part_revisions"][part] = revision
         meta["commit_revision"] = revision
@@ -208,7 +231,9 @@ class ProfileRepository:
         values[key(uid, "meta")] = meta
         values[self.REVISION_PREFIX + uid.encode()] = revision
         values[self.USER_PREFIX + encoded_uid(uid).encode()] = uid
-        self._batch(values)
+        retired = ((f"p2:{encoded_uid(uid)}:settings:sleep".encode(),)
+                   if old_meta is not None and old_meta["schema_version"] == 2 else ())
+        self._batch(values, deletions=retired)
 
     def save(self, uid, data, parts=None):
         """Patch loaded parts, preserving every other part; increment old API revision."""
@@ -221,6 +246,10 @@ class ProfileRepository:
             if meta is None:
                 legacy = self._get(reader, uid.encode())
                 previous, old_revision = decompose(legacy or {})
+                previous.update({p: incoming[p] for p in selected})
+                changes = previous
+            elif meta["schema_version"] == 2:
+                previous, old_revision = decompose(self._read_v2(reader, uid, meta))
                 previous.update({p: incoming[p] for p in selected})
                 changes = previous
             else:
@@ -236,10 +265,10 @@ class ProfileRepository:
             with self.service.db.snapshot() as snapshot:
                 with snapshot.iterator() as rows:
                     keys = [k for k, _ in rows]
-                legacy = {k.decode() for k in keys if not k.startswith((b"_meta:", b"p2:"))}
+                legacy = {k.decode() for k in keys if k and not k.startswith((b"_meta:", b"p2:"))}
                 users = {self._get(snapshot, k) for k in keys if k.startswith(self.USER_PREFIX)}
         else:
             with self.service.lock:
-                legacy = {k for k in self.service.text_profiles if not k.startswith(("_meta:", "p2:"))}
+                legacy = {k for k in self.service.text_profiles if k and not k.startswith(("_meta:", "p2:"))}
                 users = {v for k, v in self.service.text_profiles.items() if k.startswith(self.USER_PREFIX.decode())}
         return sorted(legacy | users)

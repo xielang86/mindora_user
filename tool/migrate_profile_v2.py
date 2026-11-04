@@ -1,11 +1,11 @@
-"""Offline storage migration. Stop user_server and back up the DB first.
+"""Offline profile migration to the current schema (v3). Stop user_server and back up the DB first.
 
-  python tool/migrate_profile_v2.py --db /path/to/db --mode inspect
-  python tool/migrate_profile_v2.py --db /path/to/db --mode migrate
-  python tool/migrate_profile_v2.py --db /path/to/db --mode verify
+  python3 tool/migrate_profile_v2.py --db /path/to/db --mode inspect
+  python3 tool/migrate_profile_v2.py --db /path/to/db --mode migrate
+  python3 tool/migrate_profile_v2.py --db /path/to/db --mode verify
 
-Migration preserves the old blob, values and business revisions. Once v2 is
-written, v2 is authoritative; rebuild-legacy exports its latest state for a
+Migration accepts single-key legacy or split v2 profiles, preserving values and
+business revisions. Once v3 is written, v3 is authoritative; rebuild-legacy exports its latest state for a
 rollback, instead of silently reverting to the stale original blob.
 """
 import argparse
@@ -36,7 +36,7 @@ def run(repository, uid, mode):
         if {**legacy, "revision": current["revision"]} != current:
             raise ValueError("legacy/v2 mismatch at same revision")
         return "verified_equal"
-    # Legacy is deliberately not mirrored on ordinary v2 commits.
+    # Legacy is deliberately not mirrored on split-layout commits.
     return "verified_v2_legacy_stale"
 
 
@@ -61,9 +61,10 @@ def main():
         users = args.uid or repository.list_uids()
         processed = 0
         for uid in users:
-            if (args.mode == "migrate" and args.limit is not None and not args.uid
-                    and db.get(key(uid, "meta")) is not None):
-                continue
+            if args.mode == "migrate" and args.limit is not None and not args.uid:
+                raw_meta = db.get(key(uid, "meta"))
+                if raw_meta is not None and json.loads(raw_meta).get("schema_version") == repository.SCHEMA:
+                    continue
             if args.limit is not None and processed >= args.limit:
                 break
             processed += 1

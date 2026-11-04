@@ -24,6 +24,7 @@ from analysis_content import AnalysisContentService, explore_input_fingerprint
 from config import Config
 from common.jwt_keys import verify_token
 from profile_service import UserProfileServ
+from profile_repository import PARTS
 from user_profile import (
   UserProfile, ProfileRequest, ProfileResponse, ProfileData,
   ENGAGEMENT_RESPONSE_KEYS, keep_latest_engagement,
@@ -53,6 +54,29 @@ def get_http_status(resp: BaseResponse):
   if resp.code != 0:
     status = resp.code
   return status
+
+
+PROFILE_VIEW_PARTS = {
+  "app": frozenset({"profile:details", "profile:avatar"}),
+  "device": frozenset({
+    "profile:details", "internal:preferences", "plans:state", "sleep:records",
+    "scene:summary", "analysis:reports", "analysis:advice", "recommendation:current",
+  }),
+}
+APP_PROFILE_FIELDS = frozenset({
+  "nickname", "gender", "age", "birthday", "email", "phone", "weight", "height",
+  "address_list", "avatar_base64", "avatar_mime_type",
+})
+DEVICE_PROFILE_FIELDS = frozenset({
+  "nickname", "gender", "age", "birthday", "email", "weight", "height",
+  "religion", "coacher",
+})
+DEVICE_TOP_FIELDS = frozenset({
+  "revision", "profile", "basic_info", "uid_emb", "long_term_profile",
+  "sleep_plan", "sleep_data", "sleep_analysis", "analysis_reports", "bedtime_advice",
+  "sleep_scenarios_reco", "standard_sop_reco", "sleep_health", "sleep_mode",
+})
+assert all(parts <= PARTS for parts in PROFILE_VIEW_PARTS.values())
 
 
 # -------------------- 弹窗主图上传（ops 后台） --------------------
@@ -301,7 +325,7 @@ class UserServer:
   def _profile_response_body(profile, data: ProfileData, apply_defaults: bool = True) -> dict:
     """画像 → 响应 dict：注入 sequence_summaries 并按请求开关裁剪体积大头。
 
-    裁剪口径（query_profile 缺省生效）：
+    裁剪口径（仅 query_profile 的 all 视图生效）：
       - sleep_data 限量（0=不携带，缺省 1=只回最近一晚）；顺序与存库/快照一致
         （timestamp 升序，[-1] 是最新一晚），截尾保留最新 N 条
       - engagement_count 限量 footprint_days / inbox_messages / popup_states /
@@ -314,7 +338,7 @@ class UserServer:
     sequence_summaries（各阶段时长/觉醒统计）是 SleepResult 的计算属性，property 不进
     model_dump，必须手动注入——两个端点都注入，否则客户端拿不到 time_in_bed。
 
-    apply_defaults=False（update_profile 用）：只认客户端显式携带的开关，其余字段
+    apply_defaults=False（旧 update_profile 兼容逻辑）：只认客户端显式携带的开关，其余字段
     全量返回。update_profile 的响应是客户端的本地快照基准（个人资料同步约定 §2/§3），
     默认裁剪会让老客户端把没回来的 sleep_data / behaviors 当成「服务端没有」而抹掉本地历史。
     """
@@ -389,8 +413,8 @@ class UserServer:
     if uid is None:
       return InvalidOrExpiredTokenResp()
 
-    # uid 时段黑名单（profile_query_gate）：名单内的 uid 只在允许时段可拉全量画像，
-    # 时段外直接 403；update_profile / query_revision 不受影响
+    # uid 时段黑名单（profile_query_gate）：所有画像查询视图共用原查询门禁；
+    # 时段外直接 403；update_profile / query_revision 不受影响。
     if not profile_query_gate.is_query_allowed(uid):
       logging.warning("query_profile denied by time gate uid=%s", uid)
       return ProfileResponse(
@@ -398,10 +422,35 @@ class UserServer:
         request_type=request.request_type, data=None,
       )
 
-    profile = self.user_serv.get_profile(uid)
+    view = request.data.profile_view
+    profile = self.user_serv.get_profile(uid, PROFILE_VIEW_PARTS[view]) if view != "all" else self.user_serv.get_profile(uid)
     if profile:
       logging.debug("profile found uid=%s", uid)
-      profile_dict = self._profile_response_body(profile, request.data)
+      if view == "app":
+        details = profile.profile.model_dump() if profile.profile is not None else None
+        profile_dict = {"revision": profile.revision, "profile": (
+          {field: value for field, value in details.items() if field in APP_PROFILE_FIELDS}
+          if details is not None else None
+        )}
+      else:
+        options = request.data if view == "all" else request.data.model_copy(update={
+          "sleep_data_count": 1, "analysis_report_count": 1, "engagement_count": 0,
+          "include_behaviors": False, "include_mindora_record": False,
+          "include_sop_tag_profile": False, "include_sop_recommendation_details": False,
+        })
+        profile_dict = self._profile_response_body(profile, options)
+        if view == "device":
+          profile_dict = {field: value for field, value in profile_dict.items()
+                          if field in DEVICE_TOP_FIELDS}
+          if isinstance(profile_dict.get("profile"), dict):
+            profile_dict["profile"] = {
+              field: value for field, value in profile_dict["profile"].items()
+              if field in DEVICE_PROFILE_FIELDS
+            }
+          if isinstance(profile_dict.get("analysis_reports"), dict):
+            profile_dict["analysis_reports"] = {
+              "analysis_sleep_day": profile_dict["analysis_reports"].get("analysis_sleep_day", [])
+            }
       return ProfileResponse(code=0, msg="succ", request_type=request.request_type, data={"user_profile": profile_dict})
     else:
       logging.warning("uid=%s query not found request=%s", uid, self._request_for_log(request))

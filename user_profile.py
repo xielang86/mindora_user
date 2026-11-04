@@ -1,4 +1,4 @@
-from typing import Dict, List, Tuple, Any, Optional
+from typing import Dict, List, Tuple, Any, Optional, Literal
 import time
 
 from pydantic import (
@@ -830,6 +830,9 @@ class ProfileData(BaseModel):
   health_schema_version: Optional[int] = Field(
     None,
     description="健康数据口径版本（健康数据同步接口_0814.md §8.3）；缺省按 1 处理",
+  )
+  profile_view: Literal["app", "device", "all"] = Field(
+    "app", description="query_profile 固定响应视图；缺省 app，all 用于完整调试查询",
   )
   # query_health_sync_state 对账窗口（§8.4）
   start_date: Optional[str] = Field(None, description="对账起始自然日 yyyy-MM-dd")

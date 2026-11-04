@@ -306,7 +306,7 @@ HTML_TEMPLATE = """
         }
 
         async function fetchScenarios() {
-            const payload = { request_type: 'query_profile', data: { uid: TEST_UID }, timestamp:  Math.floor(Date.now() / 1000) };
+            const payload = { request_type: 'query_profile', data: { uid: TEST_UID, profile_view: 'all' }, timestamp:  Math.floor(Date.now() / 1000) };
             try {
                 const resp = await fetch('/api/proxy', {
                     method: 'POST',

@@ -84,6 +84,7 @@ class UserServerClient:
     engagement_count: int = 1,
     include_sop_tag_profile: bool = False,
     include_sop_recommendation_details: bool = False,
+    profile_view: str = "all",
   ) -> dict[str, Any]:
     # sleep_data / behaviors / analysis_reports 是画像体积大头；count=0 不携带，N=最近 N 条/份；
     # 不携带 behaviors 时服务端会同时去掉 health_sync_days；
@@ -94,6 +95,7 @@ class UserServerClient:
       "version": "1.0",
       "data": {
         **self._auth_data(),
+        "profile_view": profile_view,
         "sleep_data_count": sleep_data_count,
         "include_behaviors": include_behaviors,
         "analysis_report_count": analysis_report_count,
@@ -392,6 +394,8 @@ def build_parser() -> argparse.ArgumentParser:
   parser.add_argument("--device-id", default="cli-plan-query", help="睡眠计划查询的设备标识")
   parser.add_argument("--last-sync-at", type=int, default=None, help="睡眠计划上次同步的 Unix 秒时间戳（可选）")
   parser.add_argument("--include-sop-tag-profile", action="store_true", help="query_profile 返回 SOP 标签画像")
+  parser.add_argument("--profile-view", choices=("app", "device", "all"), default="all",
+                      help="query_profile 视图；调试工具默认 all，应用请求缺省 app")
   parser.add_argument("--include-sop-recommendation-details", action="store_true", help="query_profile 返回 SOP 推荐详情")
   parser.add_argument("--focus", nargs="*", default=None)
   parser.add_argument("--modules", nargs="*", default=None)
@@ -421,6 +425,7 @@ def main():
     result = client.login_with_jwt()
   elif args.action == "query_profile":
     result = client.query_profile(
+      profile_view=args.profile_view,
       include_sop_tag_profile=args.include_sop_tag_profile,
       include_sop_recommendation_details=args.include_sop_recommendation_details,
     )
