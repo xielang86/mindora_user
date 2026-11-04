@@ -29,7 +29,7 @@ REMINDER_MINUTES_CHOICES = (15, 30, 60, 90)
 ALARM_SOUND_IDS = ("temple_bell", "sunlit_coast", "rainforest_mist")
 SLEEP_AID_CATEGORIES = ("smart", "preference", "trending")
 MIN_TARGET_MINUTES = 60
-MAX_CUSTOM_NAME_LEN = 10
+MAX_CUSTOM_NAME_LEN = 24
 
 # 额度表（§6②）：键为服务端等级（common/user_rights.py 的 free/pro/premium），
 # 文档里的 "basic（普通会员）" 对应服务端 pro。
@@ -113,6 +113,8 @@ def has_3_consecutive_weekdays(weekdays) -> bool:
   s = set(weekdays)
   return any({d, d % 7 + 1, (d + 1) % 7 + 1} <= s for d in range(1, 8))
 
+def name_width(name: str) -> int:
+  return sum(2 if ord(c) >= 0x2E80 else 1 for c in name)
 
 def validate_full_plan(plan: SyncedSleepPlan) -> Optional[str]:
   """校验一条完整上报（非墓碑），返回 rejected reason 或 None。"""
@@ -140,7 +142,7 @@ def validate_full_plan(plan: SyncedSleepPlan) -> Optional[str]:
     return "invalid_cycle"
 
   if plan.kind == "custom":
-    if len(plan.custom_name or "") > MAX_CUSTOM_NAME_LEN:
+    if name_width(plan.custom_name or "") > MAX_CUSTOM_NAME_LEN:
       return "invalid_name"  # 服务端拒绝，不要静默截断（否则两端名称不一致）
     if plan.cycle.type != "weekdays":
       return "invalid_cycle"
