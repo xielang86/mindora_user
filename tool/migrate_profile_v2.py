@@ -1,11 +1,11 @@
-"""Offline profile migration to the current schema (v3). Stop user_server and back up the DB first.
+"""Offline profile migration to the current schema (v4). Stop user_server and back up the DB first.
 
   python3 tool/migrate_profile_v2.py --db /path/to/db --mode inspect
   python3 tool/migrate_profile_v2.py --db /path/to/db --mode migrate
   python3 tool/migrate_profile_v2.py --db /path/to/db --mode verify
 
-Migration accepts single-key legacy or split v2 profiles, preserving values and
-business revisions. Once v3 is written, v3 is authoritative; rebuild-legacy exports its latest state for a
+Migration accepts single-key legacy or split v2/v3 profiles, preserving values and
+business revisions. Once v4 is written, v4 is authoritative; rebuild-legacy exports its latest state for a
 rollback, instead of silently reverting to the stale original blob.
 """
 import argparse
@@ -15,7 +15,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from profile_repository import ProfileRepository, key  # noqa: E402
+from profile_repository import ProfileRepository, assemble, decompose, encoded_uid, key  # noqa: E402
 
 
 def run(repository, uid, mode):
@@ -32,12 +32,23 @@ def run(repository, uid, mode):
     if mode == "rebuild-legacy":
         repository._batch({uid.encode(): current})
         return "legacy_rebuilt"
+    if meta["schema_version"] == repository.SCHEMA:
+        parts, revision = decompose(current)
+        if assemble(parts, revision) != current:
+            raise ValueError("v4 profile round-trip mismatch")
+        with repository.snapshot() as reader:
+            if repository._get(reader, key(uid, "analysis:content")) is None:
+                raise ValueError("missing v4 analysis content")
+            for old_part in ("analysis:advice", "analysis:reports"):
+                old_key = f"p2:{encoded_uid(uid)}:{old_part}".encode()
+                if repository._get(reader, old_key) is not None:
+                    raise ValueError(f"stale v3 profile part: {old_part}")
     if legacy is not None and int(legacy.get("revision") or 0) == current["revision"]:
         if {**legacy, "revision": current["revision"]} != current:
             raise ValueError("legacy/v2 mismatch at same revision")
         return "verified_equal"
     # Legacy is deliberately not mirrored on split-layout commits.
-    return "verified_v2_legacy_stale"
+    return "verified_v4_legacy_stale" if meta["schema_version"] == repository.SCHEMA else "verified_v2_legacy_stale"
 
 
 def main():

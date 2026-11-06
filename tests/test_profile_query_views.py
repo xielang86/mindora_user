@@ -106,7 +106,7 @@ def test_omitted_view_keeps_app_and_device_fields(server):
                                           sleep_data_count=30, include_behaviors=True))
     body = srv.handle_query_profile(req).data["user_profile"]
     assert reads == [PROFILE_VIEW_PARTS["compat"]]
-    assert len(reads[0]) == 9
+    assert len(reads[0]) == 8
     assert set(body) <= DEVICE_TOP_FIELDS
     assert set(body["profile"]) == APP_PROFILE_FIELDS | DEVICE_PROFILE_FIELDS
     assert body["profile"]["phone"] == "123"

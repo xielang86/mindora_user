@@ -60,7 +60,7 @@ PROFILE_VIEW_PARTS = {
   "app": frozenset({"profile:details", "profile:avatar"}),
   "device": frozenset({
     "profile:details", "internal:preferences", "plans:state", "sleep:records",
-    "scene:summary", "analysis:reports", "analysis:advice", "recommendation:current",
+    "scene:summary", "analysis:content", "recommendation:current",
   }),
 }
 PROFILE_VIEW_PARTS["compat"] = PROFILE_VIEW_PARTS["device"] | {"profile:avatar"}

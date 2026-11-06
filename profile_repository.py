@@ -20,8 +20,7 @@ GROUPS = {
     "internal:reco_details": ("sop_recommendation_details",),
     "recommendation:current": ("sleep_scenarios_reco", "standard_sop_reco"),
     "analysis:insight": ("sleep_insight",),
-    "analysis:advice": ("bedtime_advice",),
-    "analysis:reports": ("analysis_reports",),
+    "analysis:content": ("bedtime_advice", "analysis_reports"),
     "engagement:popup": ("popup_states", "inbox_messages"),
     "engagement:survey": ("survey_submissions",),
     "engagement:footprint": ("footprint_days",),
@@ -37,9 +36,10 @@ ANALYSIS_PARTS = PARTS - {
 }
 AVATAR_FIELDS = {"avatar_base64", "avatar_mime_type"}
 DETAIL_FIELDS = ("basic_info", "sleep_health", "sleep_mode")
-# Schema 2 stored these fields in separate parts. Schema 3 moves them into
-# profile:details and retires settings:sleep.
-V2_PARTS = PARTS | {"settings:sleep"}
+# Schema 4 combines the two analysis content parts. Schema 2 also stored
+# profile details in settings:sleep; schema 3 moved them to profile:details.
+V3_PARTS = (PARTS - {"analysis:content"}) | {"analysis:advice", "analysis:reports"}
+V2_PARTS = V3_PARTS | {"settings:sleep"}
 
 
 def encoded_uid(uid):
@@ -119,7 +119,7 @@ def assemble(parts, revision, *, copy_values=True):
 
 
 class ProfileRepository:
-    SCHEMA = 3
+    SCHEMA = 4
     REVISION_PREFIX = b"_meta:revision:"
     USER_PREFIX = b"_meta:user:"
 
@@ -163,7 +163,7 @@ class ProfileRepository:
 
     def _meta(self, reader, uid):
         meta = self._get(reader, key(uid, "meta"))
-        if meta is not None and (meta.get("schema_version") not in {2, self.SCHEMA} or not meta.get("migration_complete")):
+        if meta is not None and (meta.get("schema_version") not in {2, 3, self.SCHEMA} or not meta.get("migration_complete")):
             raise ValueError("unsupported or incomplete profile layout")
         return meta
 
@@ -176,6 +176,20 @@ class ProfileRepository:
                 raise ValueError(f"missing committed v2 profile part: {part}")
             loaded[part] = value
         return assemble(loaded, meta["commit_revision"])
+
+    def _read_v3(self, reader, uid, meta, selected=None):
+        """Read schema 3, mapping a requested v4 content part to both old keys."""
+        old_parts = V3_PARTS if selected is None else (selected - {"analysis:content"}) | (
+            {"analysis:advice", "analysis:reports"} if "analysis:content" in selected else set()
+        )
+        loaded = {}
+        for part in old_parts:
+            raw_key = f"p2:{encoded_uid(uid)}:{part}".encode()
+            value = self._get(reader, raw_key)
+            if value is None:
+                raise ValueError(f"missing committed v3 profile part: {part}")
+            loaded[part] = value
+        return assemble(loaded, meta["commit_revision"], copy_values=False)
 
     def read(self, uid, parts=None):
         selected = PARTS if parts is None else frozenset(parts)
@@ -194,6 +208,8 @@ class ProfileRepository:
             if meta["schema_version"] == 2:
                 all_parts, revision = decompose(self._read_v2(reader, uid, meta))
                 return assemble({p: all_parts[p] for p in selected}, revision)
+            if meta["schema_version"] == 3:
+                return self._read_v3(reader, uid, meta, selected)
             loaded = {}
             for part in selected:
                 value = self._get(reader, key(uid, part))
@@ -211,7 +227,9 @@ class ProfileRepository:
             meta = self._meta(reader, uid)
             if meta is not None and meta["schema_version"] == self.SCHEMA:
                 return "already_migrated"
-            raw = self._read_v2(reader, uid, meta) if meta is not None else self._get(reader, uid.encode())
+            raw = (self._read_v2(reader, uid, meta) if meta is not None and meta["schema_version"] == 2
+                   else self._read_v3(reader, uid, meta) if meta is not None and meta["schema_version"] == 3
+                   else self._get(reader, uid.encode()))
             if raw is None:
                 return "not_found"
             parts, revision = decompose(raw)
@@ -228,6 +246,8 @@ class ProfileRepository:
         }
         meta["schema_version"] = self.SCHEMA
         meta["part_revisions"].pop("settings:sleep", None)
+        meta["part_revisions"].pop("analysis:advice", None)
+        meta["part_revisions"].pop("analysis:reports", None)
         for part in changes:
             meta["part_revisions"][part] = revision
         meta["commit_revision"] = revision
@@ -235,8 +255,12 @@ class ProfileRepository:
         values[key(uid, "meta")] = meta
         values[self.REVISION_PREFIX + uid.encode()] = revision
         values[self.USER_PREFIX + encoded_uid(uid).encode()] = uid
-        retired = ((f"p2:{encoded_uid(uid)}:settings:sleep".encode(),)
-                   if old_meta is not None and old_meta["schema_version"] == 2 else ())
+        retired = []
+        if old_meta is not None and old_meta["schema_version"] == 2:
+            retired.append(f"p2:{encoded_uid(uid)}:settings:sleep".encode())
+        if old_meta is not None and old_meta["schema_version"] in {2, 3}:
+            retired.extend(f"p2:{encoded_uid(uid)}:{part}".encode()
+                           for part in ("analysis:advice", "analysis:reports"))
         self._batch(values, deletions=retired)
 
     def save(self, uid, data, parts=None):
@@ -254,6 +278,10 @@ class ProfileRepository:
                 changes = previous
             elif meta["schema_version"] == 2:
                 previous, old_revision = decompose(self._read_v2(reader, uid, meta))
+                previous.update({p: incoming[p] for p in selected})
+                changes = previous
+            elif meta["schema_version"] == 3:
+                previous, old_revision = decompose(self._read_v3(reader, uid, meta))
                 previous.update({p: incoming[p] for p in selected})
                 changes = previous
             else:
