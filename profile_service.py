@@ -1081,12 +1081,15 @@ class UserProfileServ:
 
   @staticmethod
   def _merge_sleep_data(old: list, new: list) -> list:
-    """按 timestamp 去重合并 sleep_data（同 timestamp 新记录覆盖旧记录），按时间升序，截断保留最近 N 条。"""
+    """按 timestamp 合并睡眠记录；同晚未传或传 null 的字段保留旧值。"""
     if not new:
       return old
     by_ts = {r.timestamp: r for r in old}
     for r in new:
-      by_ts[r.timestamp] = r
+      previous = by_ts.get(r.timestamp)
+      by_ts[r.timestamp] = (type(r).model_validate({
+        **previous.model_dump(), **r.model_dump(exclude_unset=True, exclude_none=True),
+      }) if previous is not None else r)
     merged = sorted(by_ts.values(), key=lambda r: r.timestamp)
     return merged[-UserProfileServ.MAX_SLEEP_DATA_LEN:]
 
@@ -1284,9 +1287,13 @@ class UserProfileServ:
     for field in ("sleep_health", "sleep_mode"):
       if field in new_profile.model_fields_set:
         incoming = getattr(new_profile, field)
+        if incoming is None:
+          continue
         previous = getattr(profile, field)
         if incoming is not None and previous is not None:
-          incoming = type(incoming).model_validate({**previous.model_dump(), **incoming.model_dump(exclude_unset=True)})
+          incoming = type(incoming).model_validate({
+            **previous.model_dump(), **incoming.model_dump(exclude_unset=True, exclude_none=True),
+          })
         setattr(profile, field, incoming)
     profile.long_term_profile = self._merge_profile(profile.long_term_profile, new_profile.long_term_profile)
     # 版本登记 + v1 purge 必须在 merge 前：purge 清的是存量里被覆盖天的旧口径样本
