@@ -668,7 +668,7 @@ def build_explore(d, profile: Optional[UserProfile]) -> dict:
     structure["continuous_sleep_minutes"] = continuous
   # 阶段占比分母用阶段跨度（sleep_span），不是卧床时长——见 sequence_summaries 注释
   tb = summaries.get("sleep_span") or 0
-  if tb and not has_unspecified_stage(latest, profile) and indices["state"] in {"baseline7_ready", "baseline30_ready"}:
+  if tb and not has_unspecified_stage(latest, profile):
     structure["rem_percent"]  = f"{round(summaries.get('rem_sleep_duration', 0) / tb * 100, 1)}%"
     structure["deep_percent"] = f"{round(summaries.get('deep_sleep_duration', 0) / tb * 100, 1)}%"
     structure["core_percent"] = f"{round(summaries.get('core_sleep_duration', 0) / tb * 100, 1)}%"
