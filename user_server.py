@@ -20,11 +20,11 @@ from aiohttp import ClientSession, web
 
 import analysis_builders
 import profile_query_gate
-from analysis_content import AnalysisContentService, explore_input_fingerprint
+from analysis_content import AnalysisContentService, explore_input_fingerprint, _profile_language
 from config import Config
 from common.jwt_keys import verify_token
 from profile_service import UserProfileServ
-from profile_repository import PARTS
+from profile_repository import PARTS, DEVICE_PARTS
 from user_profile import (
   UserProfile, ProfileRequest, ProfileResponse, ProfileData,
   ENGAGEMENT_RESPONSE_KEYS, keep_latest_engagement,
@@ -58,10 +58,7 @@ def get_http_status(resp: BaseResponse):
 
 PROFILE_VIEW_PARTS = {
   "app": frozenset({"profile:details", "profile:avatar"}),
-  "device": frozenset({
-    "profile:details", "internal:preferences", "plans:state", "sleep:records",
-    "scene:summary", "analysis:content", "recommendation:current",
-  }),
+  "device": DEVICE_PARTS,
 }
 PROFILE_VIEW_PARTS["compat"] = PROFILE_VIEW_PARTS["device"] | {"profile:avatar"}
 APP_PROFILE_FIELDS = frozenset({
@@ -74,9 +71,10 @@ DEVICE_PROFILE_FIELDS = frozenset({
 })
 DEVICE_TOP_FIELDS = frozenset({
   "revision", "profile", "basic_info", "uid_emb", "long_term_profile",
-  "sleep_plan", "sleep_data", "sleep_analysis", "analysis_reports", "bedtime_advice",
+  "sleep_data", "sleep_analysis", "analysis_reports", "bedtime_advice",
   "sleep_scenarios_reco", "standard_sop_reco", "sleep_health", "sleep_mode",
 })
+COMPAT_TOP_FIELDS = DEVICE_TOP_FIELDS
 assert all(parts <= PARTS for parts in PROFILE_VIEW_PARTS.values())
 
 
@@ -280,6 +278,7 @@ class UserServer:
     self.app.router.add_post('/ops/insight_rules', self.handle_ops_insight_rules_http)
     self.app.router.add_post('/ops/survey_list', self.handle_ops_survey_list_http)
     self.app.router.add_post('/ops/upload_image', self.handle_ops_upload_image_http)
+    self.app.router.add_post('/ops/refresh_user_llm', self.handle_ops_refresh_user_llm_http)
     # 弹窗主图公开访问（文件名是内容哈希，长缓存；路径即 ops/upload_image 返回的 URL）
     self.app.router.add_get('/popup_images/{name}', self.handle_popup_image_http)
 
@@ -441,8 +440,9 @@ class UserServer:
         })
         profile_dict = self._profile_response_body(profile, options)
         if view in {"device", "compat"}:
+          top_fields = DEVICE_TOP_FIELDS if view == "device" else COMPAT_TOP_FIELDS
           profile_dict = {field: value for field, value in profile_dict.items()
-                          if field in DEVICE_TOP_FIELDS}
+                          if field in top_fields}
           if isinstance(profile_dict.get("profile"), dict):
             profile_fields = (DEVICE_PROFILE_FIELDS if view == "device"
                               else DEVICE_PROFILE_FIELDS | APP_PROFILE_FIELDS)
@@ -659,7 +659,7 @@ class UserServer:
         auto_needed = False
 
     # 睡前建议独立按七天检查；即使本次没有新的睡眠夜晚，也可单独调度。
-    run_advice = bool(profile is not None and bedtime_advice_due(profile)
+    run_advice = bool(profile is not None and bedtime_advice_due(profile, language=_profile_language(profile))
                       and getattr(self, "llm", None) and self.llm.enabled)
     run_reco = skip_reco is False or (auto_needed and skip_reco is not True)
     run_analysis = skip_analysis is False or (auto_needed and skip_analysis is not True)
@@ -829,7 +829,7 @@ class UserServer:
       # data and recommendation outputs are not read from split storage.
       profile = await self._run_query(
         self.user_serv.get_profile_and_note_request_meta,
-        uid, req.data.timezone, req.data.language,
+        uid, req.data.timezone, req.data.language, request_type=req.request_type,
       )
 
       # 零睡眠记录用户：读路径即时补齐兜底建议（模板，无 LLM 成本），
@@ -1136,7 +1136,7 @@ class UserServer:
 
       def _do_sync() -> sleep_plan_service.SyncResult:
         with self.user_serv.uid_lock(uid):
-          profile = self.user_serv.get_profile(uid, {"plans:state", "request_meta"})
+          profile = self.user_serv.get_profile(uid, {"plans:state", "analysis:context"})
           stored = list(profile.sleep_plans) if profile else []
           result = sleep_plan_service.sync_plans(
             stored, incoming,
@@ -1150,7 +1150,7 @@ class UserServer:
             meta_changed = self.user_serv._note_request_meta(profile, d.timezone, d.language, fill_only=False)
           if result.changed or meta_changed:
             if profile is None:
-              profile = self.user_serv.get_or_create_parts(uid, {"plans:state", "request_meta"})
+              profile = self.user_serv.get_or_create_parts(uid, {"plans:state", "analysis:context"})
               self.user_serv._note_request_meta(profile, d.timezone, d.language, fill_only=False)
             profile.sleep_plans = result.plans
             profile.sleep_plans_synced_at = int(time.time())
@@ -1248,6 +1248,61 @@ class UserServer:
       return uid
     logging.warning("ops api rejected: uid=%s ops_role=%s", uid, role)
     return None
+
+  async def _run_forced_llm_refresh(self, uid: str) -> bool:
+    async with self._llm_semaphore:
+      return await self._run_llm_work(self.user_serv.update_profile_llm, uid, False, False, True)
+
+  async def handle_ops_refresh_user_llm_http(self, request: web.Request) -> web.Response:
+    """Admin-only, one-shot refresh of recommendations and all stored LLM prose."""
+    try:
+      body = await request.json()
+      admin_uid = await self._check_ops_admin(body.get("jwt_token") or "")
+      if admin_uid is None:
+        return web.json_response({"code": 403, "msg": "not an ops admin"}, status=403)
+      uid = body.get("uid")
+      if not isinstance(uid, str) or not uid.strip() or len(uid) > 128 or uid != uid.strip():
+        return web.json_response({"code": 400, "msg": "invalid uid"}, status=400)
+      if not self.llm.enabled:
+        return web.json_response({"code": 503, "msg": "LLM is disabled"}, status=503)
+      profile = await self._run_query(self.user_serv.get_profile, uid)
+      if profile is None:
+        return web.json_response({"code": 404, "msg": "profile not found"}, status=404)
+
+      async with self._llm_tracker_lock:
+        pending = self._llm_pending.get(uid)
+        if pending is not None and not pending.done():
+          return web.json_response({"code": 409, "msg": "LLM update already running"}, status=409)
+        task = asyncio.create_task(self._run_forced_llm_refresh(uid))
+        self._llm_pending[uid] = task
+        self._llm_tasks.add(task)
+        def cleanup(done):
+          self._llm_tasks.discard(done)
+          if self._llm_pending.get(uid) is done:
+            self._llm_pending.pop(uid, None)
+          self._llm_update_tracker[uid] = time.monotonic()
+        task.add_done_callback(cleanup)
+
+      logging.info("ops LLM refresh requested by uid=%s for uid=%s", admin_uid, uid)
+      updated = await asyncio.shield(task)
+      if not updated:
+        return web.json_response({"code": 500, "msg": "LLM refresh did not persist"}, status=500)
+      profile = await self._run_query(self.user_serv.get_profile, uid)
+      reports = profile.analysis_reports or {}
+      return web.json_response({"code": 0, "msg": "refresh completed; inspect result timestamps for partial LLM failures", "data": {
+        "uid": uid,
+        "language": _profile_language(profile),
+        "bedtime_advice": profile.bedtime_advice.model_dump(mode="json") if profile.bedtime_advice else None,
+        "sleep_insight": {"language": profile.sleep_insight.language, "generated_at": profile.sleep_insight.generated_at, "llm_used": profile.sleep_insight.llm_used} if profile.sleep_insight else None,
+        "analysis_reports": {key: [{"language": r.language, "generated_at": r.generated_at, "llm_used": r.llm_used} for r in items[-1:]] for key, items in reports.items()},
+        "sleep_scenarios_reco_count": len(profile.sleep_scenarios_reco or []),
+        "standard_sop_reco_count": len(profile.standard_sop_reco or []),
+      }})
+    except (json.JSONDecodeError, TypeError):
+      return web.json_response({"code": 400, "msg": "invalid request"}, status=400)
+    except Exception:
+      logging.exception("ops LLM refresh failed")
+      return web.json_response({"code": 500, "msg": "Internal server error"}, status=500)
 
   async def handle_ops_push_http(self, request: web.Request) -> web.Response:
     """接收运营后台发布的弹窗消息：校验管理员 → 校验消息 → 追加进运营配置（热加载生效，等 App 拉取）。"""

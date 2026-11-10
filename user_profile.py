@@ -429,9 +429,11 @@ class BedtimeAdvice(BaseModel):
 BEDTIME_ADVICE_INTERVAL_SECONDS = 7 * 86400
 
 
-def bedtime_advice_due(profile: "UserProfile", now: Optional[int] = None) -> bool:
+def bedtime_advice_due(profile: "UserProfile", now: Optional[int] = None, language: Optional[str] = None) -> bool:
   advice = getattr(profile, "bedtime_advice", None) if profile else None
   if advice is None or not advice.content.strip() or not advice.generated_at:
+    return True
+  if language is not None and advice.language != language:
     return True
   return (int(time.time()) if now is None else now) - advice.generated_at >= BEDTIME_ADVICE_INTERVAL_SECONDS
 

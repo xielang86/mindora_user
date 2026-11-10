@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import plyvel
 
-from profile_repository import ProfileRepository, V2_PARTS, V3_PARTS, decompose, encode, key
+from profile_repository import ProfileRepository, V2_PARTS, V3_PARTS, decompose_v4, encode, key
 from tool.migrate_profile_v2 import run
 
 
@@ -37,13 +37,13 @@ def test_legacy_read_migrate_and_partial_update_preserve_data(tmp_path):
                     "profile": {**original["profile"], "nickname": "new"}}
         assert repo.read("u1") == expected
         assert db.get(b"u1") == legacy_bytes
-        assert run(repo, "u1", "verify") == "verified_v4_legacy_stale"
+        assert run(repo, "u1", "verify") == "verified_v6_legacy_stale"
     finally:
         db.close()
 
 
 def _put_v2(db, uid, original):
-    parts, revision = decompose(original)
+    parts, revision = decompose_v4(original)
     content = parts.pop("analysis:content")
     parts["analysis:advice"] = {k: v for k, v in content.items() if k == "bedtime_advice"}
     parts["analysis:reports"] = {k: v for k, v in content.items() if k == "analysis_reports"}
@@ -67,7 +67,7 @@ def test_v3_analysis_parts_merge_without_revision_change(tmp_path):
         original = {"revision": 9, "bedtime_advice": {"content": "rest", "generated_at": 1},
                     "analysis_reports": {"analysis_sleep_day": [{"date": "2026-11-01", "modules": {}}]},
                     "sleep_insight": {"date": "2026-11-01"}, "future_top": {"keep": True}}
-        parts, revision = decompose(original)
+        parts, revision = decompose_v4(original)
         content = parts.pop("analysis:content")
         parts["analysis:advice"] = {"bedtime_advice": content["bedtime_advice"]}
         parts["analysis:reports"] = {"analysis_reports": content["analysis_reports"]}
@@ -78,14 +78,15 @@ def test_v3_analysis_parts_merge_without_revision_change(tmp_path):
                                           "part_revisions": {part: revision for part in V3_PARTS}}))
         repo = ProfileRepository(SimpleNamespace(storage_mode="leveldb", db=db))
         assert repo.read("u1") == original
-        assert repo.read("u1", {"analysis:content"}) == {
+        assert repo.read("u1", {"analysis:text"}) == {
             "revision": 9, "bedtime_advice": original["bedtime_advice"],
-            "analysis_reports": original["analysis_reports"]}
+            "analysis_reports": original["analysis_reports"],
+            "sleep_insight": original["sleep_insight"]}
         assert run(repo, "u1", "inspect") == "would_migrate"
         assert run(repo, "u1", "migrate") == "migrated"
         assert repo.read("u1") == original
-        assert json.loads(db.get(key("u1", "meta")))["schema_version"] == 4
-        assert db.get(key("u1", "analysis:content")) == encode(content)
+        assert json.loads(db.get(key("u1", "meta")))["schema_version"] == 6
+        assert json.loads(db.get(key("u1", "analysis:text")))["analysis_reports"] == original["analysis_reports"]
         assert db.get(b"p2:u1:analysis:advice") is None
         assert db.get(b"p2:u1:analysis:reports") is None
     finally:
@@ -113,7 +114,7 @@ def test_v2_fields_move_into_details_without_revision_change(tmp_path):
         assert run(repo, "u1", "inspect") == "would_migrate"
         assert run(repo, "u1", "migrate") == "migrated"
         assert repo.read("u1") == original
-        assert json.loads(db.get(key("u1", "meta")))["schema_version"] == 4
+        assert json.loads(db.get(key("u1", "meta")))["schema_version"] == 6
         assert db.get(b"p2:u1:settings:sleep") is None
         assert json.loads(db.get(key("u1", "profile:details"))) == {
             "basic_info": original["basic_info"],
@@ -121,7 +122,7 @@ def test_v2_fields_move_into_details_without_revision_change(tmp_path):
             "sleep_mode": original["sleep_mode"],
             "profile": {"nickname": "old"},
         }
-        assert run(repo, "u1", "verify") == "verified_v4_legacy_stale"
+        assert run(repo, "u1", "verify") == "verified_v6_legacy_stale"
     finally:
         db.close()
 

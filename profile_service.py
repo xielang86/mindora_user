@@ -27,12 +27,12 @@ try:
 except ImportError:
   plyvel = None
 
-from analysis_content import AnalysisContentService
+from analysis_content import AnalysisContentService, _profile_language
 from analysis_score import SCORE_VERSION, daily_score
 from common import util
 from config import Config
 from engagement_service import EngagementService
-from profile_repository import ProfileRepository, PARTS, ANALYSIS_PARTS
+from profile_repository import ProfileRepository, PARTS, ANALYSIS_PARTS, ANALYSIS_PARTS_BY_TYPE
 from llm import SleepAnalysisLLM
 from user_profile import (
   UserProfile, SleepScenario, Profile, SCENE_CMD_PREFIXES, short_scene_id,
@@ -490,7 +490,7 @@ class UserProfileServ:
                         fill_only: bool = True) -> None:
     """读路径（/analysis）登记请求环境：只在画像缺省时补缺，有变化才落盘。"""
     with self.uid_lock(uid):
-      profile = self.get_profile(uid, {"request_meta"})
+      profile = self.get_profile(uid, {"analysis:context"})
       if profile is None:
         return
       if self._note_request_meta(profile, timezone, language, fill_only=fill_only):
@@ -502,6 +502,7 @@ class UserProfileServ:
     timezone: Optional[str],
     language: Optional[str],
     fill_only: bool = True,
+    request_type: Optional[str] = None,
   ) -> Optional[UserProfile]:
     """Load analysis inputs from one snapshot; fill request metadata if missing.
 
@@ -509,7 +510,7 @@ class UserProfileServ:
     metadata fill cannot overwrite a concurrent update for the same user.
     """
     with self.uid_lock(uid):
-      profile = self.get_profile(uid, ANALYSIS_PARTS)
+      profile = self.get_profile(uid, ANALYSIS_PARTS_BY_TYPE.get(request_type, ANALYSIS_PARTS))
       if profile is None:
         return None
       if self._note_request_meta(profile, timezone, language, fill_only=fill_only):
@@ -713,7 +714,7 @@ class UserProfileServ:
     health_sync_days 也能回答（缺省版本 1），且被截断淘汰的天不会谎报。
     无画像返回 None。
     """
-    profile = self.get_profile(uid, {"internal:health", "internal:health_sync"})
+    profile = self.get_profile(uid, {"analysis:context", "internal:health_sync"})
     if profile is None:
       return None
     tz = self._resolve_tz(timezone)
@@ -1415,6 +1416,7 @@ class UserProfileServ:
     uid: str,
     skip_sleep_scenarios_reco_update: bool = False,
     skip_sleep_analysis_update: bool = False,
+    force: bool = False,
   ) -> bool:
     """Run LLM work for an existing profile and persist results.
 
@@ -1445,9 +1447,9 @@ class UserProfileServ:
       sleep_insight = None
       analysis_reports = None
     else:
-      sleep_insight = self.calc_sleep_insight(uid, llm_profile)
-      analysis_reports = self.calc_analysis_reports(uid, llm_profile)
-    bedtime_advice = self.content.calc_bedtime_advice(uid, llm_profile)
+      sleep_insight = self.content.calc_sleep_insight(uid, llm_profile, force=force) if force else self.calc_sleep_insight(uid, llm_profile)
+      analysis_reports = self.content.calc_analysis_reports(uid, llm_profile, force=force) if force else self.calc_analysis_reports(uid, llm_profile)
+    bedtime_advice = self.content.calc_bedtime_advice(uid, llm_profile, force=force) if force else self.content.calc_bedtime_advice(uid, llm_profile)
 
     with self.uid_lock(uid):
       profile = self.get_profile(uid)
@@ -1466,7 +1468,7 @@ class UserProfileServ:
         profile.sleep_insight = sleep_insight
       if analysis_reports is not None:
         profile.analysis_reports = analysis_reports
-      if bedtime_advice is not None and bedtime_advice_due(profile):
+      if bedtime_advice is not None and (force or bedtime_advice_due(profile, language=_profile_language(profile))):
         profile.bedtime_advice = bedtime_advice
       self.save_profile(uid, profile)
       logging.info("Profile llm updated uid=%s", uid)

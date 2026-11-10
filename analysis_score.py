@@ -9,7 +9,7 @@ from sleep_session_builder import cap_sleep_quality, resolve_sleep_quality
 from sleep_metrics import estimate_sleep_window, _timeline
 
 SCORE_VERSION = "mindora-score-v3-draft-3"
-INDEX_VERSION = "mindora-insight-v3-draft-3"
+INDEX_VERSION = "mindora-insight-v3-draft-4"
 LEGACY_SCORE_VERSION = "mindora-score-legacy-v1"
 WEIGHTS = {"duration": .35, "efficiency": .25, "continuity": .20, "schedule": .20}
 
