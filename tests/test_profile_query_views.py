@@ -78,6 +78,8 @@ def test_device_view_reads_four_parts_and_omits_avatar_history_and_plan(server):
     srv, reads = server
     body = _query(srv, "device", sleep_data_count=30, include_behaviors=True)
     assert reads == [PROFILE_VIEW_PARTS["device"]]
+    assert "plans:state" not in reads[0]
+    assert "analysis:context" not in reads[0]
     assert set(body) <= DEVICE_TOP_FIELDS
     assert set(body["profile"]) == DEVICE_PROFILE_FIELDS
     assert "avatar_base64" not in body["profile"]
@@ -109,6 +111,8 @@ def test_omitted_view_keeps_app_and_device_fields(server):
                                           sleep_data_count=30, include_behaviors=True))
     body = srv.handle_query_profile(req).data["user_profile"]
     assert reads == [PROFILE_VIEW_PARTS["compat"]]
+    assert "plans:state" not in reads[0]
+    assert "analysis:context" not in reads[0]
     assert len(reads[0]) == 5
     assert set(body) <= COMPAT_TOP_FIELDS
     assert "sleep_plan" not in body
