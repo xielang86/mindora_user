@@ -165,7 +165,7 @@ def run_client():
             "request_type": "query_profile",
             "timestamp": int(time.time()),
             "version": "1.0",
-            "data": {"uid": TEST_UID, "profile_view": "all"},
+            "data": {"uid": TEST_UID, "device_type": "pc"},
         }
         prof = (requests.post(base, json=q, timeout=10).json().get("data") or {}).get("user_profile") or {}
         insight = prof.get("sleep_insight")

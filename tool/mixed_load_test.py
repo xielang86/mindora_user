@@ -2,7 +2,7 @@
 """Mixed read/write HTTP load test for user_server.
 
 The default mix is revision:70, device:15, app:5, analysis:5, update:5.
-The app operation omits profile_view, exercising the compatibility default;
+The app operation omits device_type, exercising the legacy iOS default;
 app_only explicitly selects the two-part App projection. Remote targets are
 rejected unless --allow-remote is explicitly supplied.
 """
@@ -81,9 +81,9 @@ class LoadTest:
     if op == "revision":
       return "/user_profile", {**base, "request_type": "query_revision", "data": self.auth(uid)}
     if op in {"profile", "app", "app_only", "device"}:
-      view = {"profile": "all", "app_only": "app", "device": "device"}.get(op)
+      device_type = {"profile": "pc", "app_only": "ios", "device": "mindora"}.get(op)
       return "/user_profile", {**base, "request_type": "query_profile", "data": {
-        **self.auth(uid), **({"profile_view": view} if view else {}),
+        **self.auth(uid), **({"device_type": device_type} if device_type else {}),
       }}
     if op == "analysis":
       return "/analysis", {**base, "request_type": "analysis_explore", "data": {

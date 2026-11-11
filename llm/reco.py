@@ -4,6 +4,7 @@ import os
 import re
 import time
 import threading
+from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, List, Optional
@@ -37,7 +38,22 @@ _SOP_CANDIDATES_PATH = os.path.join(
     "reco_candidates.json",
 )
 
-_LLM_TRACE_LOG_PATH = Path(_REPO_ROOT) / "llm_request_response.log"
+_LLM_TRACE_LOG_PATH: Optional[Path] = None
+_LLM_TRACE_LOG_LOCK = threading.Lock()
+
+
+def configure_llm_trace(log_dir: str | Path) -> Path:
+    """Select one trace file per process; a restarted server gets a new name."""
+    global _LLM_TRACE_LOG_PATH
+    with _LLM_TRACE_LOG_LOCK:
+        if _LLM_TRACE_LOG_PATH is None:
+            directory = Path(log_dir)
+            directory.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S_%f")
+            path = directory / f"llm_request_response_{stamp}_{os.getpid()}.log"
+            path.touch(exist_ok=False)
+            _LLM_TRACE_LOG_PATH = path
+        return _LLM_TRACE_LOG_PATH
 
 _SCENARIO_CANDIDATES: list[dict[str, Any]] = [
     {
@@ -134,9 +150,12 @@ def _append_llm_trace(entry_type: str, flow: str, prompt: str, response_text: st
         lines.extend(["error:", error_text])
     lines.append("")
     try:
-        _LLM_TRACE_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with _LLM_TRACE_LOG_PATH.open("a", encoding="utf-8") as handle:
-            handle.write("\n".join(lines))
+        path = _LLM_TRACE_LOG_PATH or configure_llm_trace(
+            Path(os.getenv("RUN_DIR") or _REPO_ROOT) / "user_server_logs"
+        )
+        with _LLM_TRACE_LOG_LOCK:
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write("\n".join(lines))
     except Exception as e:
         logging.warning("failed to append llm trace log %s: %s", _LLM_TRACE_LOG_PATH, e)
 

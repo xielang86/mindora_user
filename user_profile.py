@@ -1,4 +1,4 @@
-from typing import Dict, List, Tuple, Any, Optional, Literal
+from typing import Dict, List, Tuple, Any, Optional
 import time
 
 from pydantic import (
@@ -824,7 +824,7 @@ class ProfileData(BaseModel):
   )
   device_type: Optional[str] = Field(
     None,
-    description="请求来源类型：设备端固定 mindora（common/device_id.DEVICE_TYPE）；App 复用本结构时填 ios/android 等",
+    description="请求来源类型：query_profile 用 mindora=设备、ios/android=App、pc=完整调试；缺省兼容旧 App，按 App 处理",
   )
   user_profile: Optional[UserProfile] = Field(None, description="user profile")
   language: Optional[str] = Field(None, description="界面语言，如 en、zh-Hans（健康同步 v2 必填）")
@@ -832,9 +832,6 @@ class ProfileData(BaseModel):
   health_schema_version: Optional[int] = Field(
     None,
     description="健康数据口径版本（健康数据同步接口_0814.md §8.3）；缺省按 1 处理",
-  )
-  profile_view: Literal["compat", "app", "device", "all"] = Field(
-    "compat", description="query_profile 固定响应视图；缺省兼容 App 和旧设备，all 用于完整调试查询",
   )
   # query_health_sync_state 对账窗口（§8.4）
   start_date: Optional[str] = Field(None, description="对账起始自然日 yyyy-MM-dd")

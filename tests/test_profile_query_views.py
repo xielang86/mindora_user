@@ -8,8 +8,8 @@ import profile_query_gate
 from profile_repository import ProfileRepository
 from user_profile import ProfileData, ProfileRequest, UserProfile
 from user_server import (
-    APP_PROFILE_FIELDS, COMPAT_TOP_FIELDS, DEVICE_PROFILE_FIELDS, DEVICE_TOP_FIELDS,
-    PROFILE_VIEW_PARTS, UserServer,
+    APP_PROFILE_FIELDS, DEVICE_PROFILE_FIELDS, DEVICE_TOP_FIELDS,
+    QUERY_PROFILE_PARTS, UserServer,
 )
 
 
@@ -54,20 +54,21 @@ def server(tmp_path, monkeypatch):
     db.close()
 
 
-def _query(server, view, **options):
+def _query(server, device_type, **options):
     req = ProfileRequest(
         request_type="query_profile", timestamp=1,
-        data=ProfileData(uid="u1", jwt_token="test", profile_view=view, **options),
+        data=ProfileData(uid="u1", jwt_token="test", device_type=device_type, **options),
     )
     resp = server.handle_query_profile(req)
     assert resp.code == 0
     return resp.data["user_profile"]
 
 
-def test_app_view_reads_two_parts_and_only_personal_fields(server):
+@pytest.mark.parametrize("device_type", ["ios", "android", None])
+def test_app_view_reads_two_parts_and_only_personal_fields(server, device_type):
     srv, reads = server
-    body = _query(srv, "app")
-    assert reads == [PROFILE_VIEW_PARTS["app"]]
+    body = _query(srv, device_type, profile_view="all")
+    assert reads == [QUERY_PROFILE_PARTS["app"]]
     assert set(body) == {"revision", "profile"}
     assert set(body["profile"]) == APP_PROFILE_FIELDS
     assert body["profile"]["avatar_base64"] == "x" * 4096
@@ -76,8 +77,9 @@ def test_app_view_reads_two_parts_and_only_personal_fields(server):
 
 def test_device_view_reads_four_parts_and_omits_avatar_history_and_plan(server):
     srv, reads = server
-    body = _query(srv, "device", sleep_data_count=30, include_behaviors=True)
-    assert reads == [PROFILE_VIEW_PARTS["device"]]
+    body = _query(srv, "mindora", sleep_data_count=30, include_behaviors=True,
+                  profile_view="app")
+    assert reads == [QUERY_PROFILE_PARTS["device"]]
     assert "plans:state" not in reads[0]
     assert "analysis:context" not in reads[0]
     assert set(body) <= DEVICE_TOP_FIELDS
@@ -96,7 +98,7 @@ def test_device_view_reads_four_parts_and_omits_avatar_history_and_plan(server):
 
 def test_all_view_keeps_complete_query_and_legacy_flags(server):
     srv, reads = server
-    body = _query(srv, "all", sleep_data_count=2, include_behaviors=True)
+    body = _query(srv, "pc", sleep_data_count=2, include_behaviors=True)
     assert reads == [None]
     assert "behaviors" in body
     assert "avatar_base64" in body["profile"]
@@ -104,27 +106,26 @@ def test_all_view_keeps_complete_query_and_legacy_flags(server):
     assert len(body["sleep_data"]) == 2
 
 
-def test_omitted_view_keeps_app_and_device_fields(server):
+def test_omitted_device_type_uses_app_view_even_with_legacy_profile_view(server):
     srv, reads = server
     req = ProfileRequest(request_type="query_profile", timestamp=1,
                          data=ProfileData(uid="u1", jwt_token="test",
-                                          sleep_data_count=30, include_behaviors=True))
+                                          sleep_data_count=30, include_behaviors=True,
+                                          profile_view="device"))
     body = srv.handle_query_profile(req).data["user_profile"]
-    assert reads == [PROFILE_VIEW_PARTS["compat"]]
-    assert "plans:state" not in reads[0]
-    assert "analysis:context" not in reads[0]
-    assert len(reads[0]) == 5
-    assert set(body) <= COMPAT_TOP_FIELDS
-    assert "sleep_plan" not in body
-    assert set(body["profile"]) == APP_PROFILE_FIELDS | DEVICE_PROFILE_FIELDS
+    assert reads == [QUERY_PROFILE_PARTS["app"]]
+    assert set(body) == {"revision", "profile"}
+    assert set(body["profile"]) == APP_PROFILE_FIELDS
     assert body["profile"]["phone"] == "123"
     assert body["profile"]["avatar_base64"] == "x" * 4096
     assert body["profile"]["address_list"][0]["id"] == "addr1"
-    assert body["basic_info"] == {"goal": "sleep"}
-    assert len(body["sleep_data"]) == 1
-    assert "behaviors" not in body
+    assert "sleep_data" not in body
 
 
-def test_unknown_view_rejected():
-    with pytest.raises(ValueError):
-        ProfileData(uid="u1", jwt_token="test", profile_view="internal")
+def test_unknown_device_type_rejected(server):
+    srv, reads = server
+    req = ProfileRequest(request_type="query_profile", timestamp=1,
+                         data=ProfileData(uid="u1", jwt_token="test", device_type="unknown"))
+    resp = srv.handle_query_profile(req)
+    assert resp.code == 400
+    assert reads == []

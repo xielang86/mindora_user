@@ -38,6 +38,7 @@ from ops_config import append_popup, save_survey
 from insight_rules_config import save_insight_rules, insight_rules_status
 from uid.uuid import get_or_create_uuid
 from llm import SleepAnalysisLLM, deep_merge
+from llm.reco import configure_llm_trace
 import sleep_plan_service
 from user_profile import SleepPlanSyncRequest
 import logger
@@ -56,11 +57,14 @@ def get_http_status(resp: BaseResponse):
   return status
 
 
-PROFILE_VIEW_PARTS = {
+QUERY_PROFILE_PARTS = {
   "app": frozenset({"profile:details", "profile:avatar"}),
   "device": DEVICE_PARTS,
 }
-PROFILE_VIEW_PARTS["compat"] = PROFILE_VIEW_PARTS["device"] | {"profile:avatar"}
+QUERY_PROFILE_VIEW_BY_DEVICE_TYPE = {
+  None: "app",  # 当前 iOS 查询尚未发送 device_type
+  "ios": "app", "android": "app", "mindora": "device", "pc": "all",
+}
 APP_PROFILE_FIELDS = frozenset({
   "nickname", "gender", "age", "birthday", "email", "phone", "weight", "height",
   "address_list", "avatar_base64", "avatar_mime_type",
@@ -74,8 +78,7 @@ DEVICE_TOP_FIELDS = frozenset({
   "sleep_data", "sleep_analysis", "analysis_reports", "bedtime_advice",
   "sleep_scenarios_reco", "standard_sop_reco", "sleep_health", "sleep_mode",
 })
-COMPAT_TOP_FIELDS = DEVICE_TOP_FIELDS
-assert all(parts <= PARTS for parts in PROFILE_VIEW_PARTS.values())
+assert all(parts <= PARTS for parts in QUERY_PROFILE_PARTS.values())
 
 
 # -------------------- 弹窗主图上传（ops 后台） --------------------
@@ -422,8 +425,13 @@ class UserServer:
         request_type=request.request_type, data=None,
       )
 
-    view = request.data.profile_view
-    profile = self.user_serv.get_profile(uid, PROFILE_VIEW_PARTS[view]) if view != "all" else self.user_serv.get_profile(uid)
+    view = QUERY_PROFILE_VIEW_BY_DEVICE_TYPE.get(request.data.device_type)
+    if view is None:
+      return ProfileResponse(
+        code=400, msg="unsupported device_type for query_profile",
+        request_type=request.request_type, data=None,
+      )
+    profile = self.user_serv.get_profile(uid, QUERY_PROFILE_PARTS[view]) if view != "all" else self.user_serv.get_profile(uid)
     if profile:
       logging.debug("profile found uid=%s", uid)
       if view == "app":
@@ -439,16 +447,13 @@ class UserServer:
           "include_sop_tag_profile": False, "include_sop_recommendation_details": False,
         })
         profile_dict = self._profile_response_body(profile, options)
-        if view in {"device", "compat"}:
-          top_fields = DEVICE_TOP_FIELDS if view == "device" else COMPAT_TOP_FIELDS
+        if view == "device":
           profile_dict = {field: value for field, value in profile_dict.items()
-                          if field in top_fields}
+                          if field in DEVICE_TOP_FIELDS}
           if isinstance(profile_dict.get("profile"), dict):
-            profile_fields = (DEVICE_PROFILE_FIELDS if view == "device"
-                              else DEVICE_PROFILE_FIELDS | APP_PROFILE_FIELDS)
             profile_dict["profile"] = {
               field: value for field, value in profile_dict["profile"].items()
-              if field in profile_fields
+              if field in DEVICE_PROFILE_FIELDS
             }
           if isinstance(profile_dict.get("analysis_reports"), dict):
             profile_dict["analysis_reports"] = {
@@ -1622,6 +1627,7 @@ class UserServer:
 
   async def start_http(self):
     """启动HTTP服务器"""
+    configure_llm_trace(f"{run_dir}/user_server_logs")
     access_log = logging.getLogger("aiohttp.access") if Config.USER_SERVER_ACCESS_LOG_ENABLED else None
     runner = web.AppRunner(self.app, access_log=access_log)
     await runner.setup()
