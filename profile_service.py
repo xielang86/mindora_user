@@ -27,11 +27,12 @@ try:
 except ImportError:
   plyvel = None
 
-from analysis_content import AnalysisContentService
+from analysis_content import AnalysisContentService, _profile_language
 from analysis_score import SCORE_VERSION, daily_score
 from common import util
 from config import Config
 from engagement_service import EngagementService
+from profile_repository import ProfileRepository, PARTS, ANALYSIS_PARTS, ANALYSIS_PARTS_BY_TYPE
 from llm import SleepAnalysisLLM
 from user_profile import (
   UserProfile, SleepScenario, Profile, SCENE_CMD_PREFIXES, short_scene_id,
@@ -192,7 +193,12 @@ class UserProfileServ:
     logging.info(f"user profile storage mode={self.storage_mode}")
 
   def _profile_to_json_data(self, profile: UserProfile) -> dict:
-    return profile.model_dump(mode="json")
+    data = profile.model_dump(mode="json")
+    # Preserve forward/legacy JSON fields ignored by typed DTO validation.
+    data.update(getattr(profile, "_storage_top_extra", {}))
+    if isinstance(data.get("profile"), dict):
+      data["profile"].update(getattr(profile, "_storage_profile_extra", {}))
+    return data
 
   def _load_profiles_from_text_unlocked(self) -> dict[str, Any]:
     if not self.json_path.exists():
@@ -219,28 +225,36 @@ class UserProfileServ:
   def _flush_text_profiles_unlocked(self):
     self._save_profiles_to_text_unlocked(self.text_profiles)
 
-  def get_profile(self, uid: str) -> Optional[UserProfile]:
-    """读取单个用户画像"""
+  @property
+  def repository(self):
+    if "_repository" not in self.__dict__:
+      self._repository = ProfileRepository(self)
+    return self._repository
+
+  def get_profile(self, uid: str, parts=None) -> Optional[UserProfile]:
+    """Legacy DTO assembled from a consistent set of storage parts."""
     if not uid or not isinstance(uid, str):
-      logging.error(f"erro uid : {uid}")
       return None
+    data = self.repository.read(uid, parts)
+    if data is None:
+      return None
+    profile = UserProfile.model_validate(data)
+    # Explicit capability: save_profile may only write the parts actually read.
+    object.__setattr__(profile, "_storage_parts", PARTS if parts is None else frozenset(parts))
+    object.__setattr__(profile, "_storage_top_extra", {
+      k: v for k, v in data.items() if k not in UserProfile.model_fields
+    })
+    object.__setattr__(profile, "_storage_profile_extra", {
+      k: v for k, v in (data.get("profile") or {}).items() if k not in Profile.model_fields
+    })
+    return profile
 
-    if self.storage_mode == "leveldb":
-      # LevelDB supports concurrent point reads. Do not serialize all users on
-      # the global Python lock; a get observes either the old or new full value.
-      data = self.db.get(uid.encode('utf-8'))
-      if data:
-        logging.debug("get from leveldb uid=%s size=%d bytes", uid, len(data))
-        return UserProfile.model_validate(json.loads(data.decode('utf-8')))
-      logging.debug("get from leveldb uid=%s not found", uid)
-      return None
-
-    with self.lock:
-      data = self.text_profiles.get(uid)
-      logging.debug("get from json txt uid=%s found=%s", uid, data is not None)
-      if data is not None:
-        return UserProfile.model_validate(data)
-      return None
+  def get_or_create_parts(self, uid: str, parts):
+    profile = self.get_profile(uid, parts)
+    if profile is None:
+      profile = UserProfile()
+      object.__setattr__(profile, "_storage_parts", frozenset(parts))
+    return profile
 
   def uid_lock(self, uid: str):
     """Return the stable striped lock used for one user's mutations."""
@@ -307,21 +321,9 @@ class UserProfileServ:
         profile.sleep_data.sort(key=lambda r: r.timestamp)
       self._cap_sleep_record_lists(profile)
       self._cap_engagement_containers(profile)
-      profile.revision = (profile.revision or 0) + 1
-      if self.storage_mode == "leveldb":
-        data = json.dumps(self._profile_to_json_data(profile)).encode('utf-8')
-        with self.db.write_batch(transaction=True) as batch:
-          batch.put(uid.encode('utf-8'), data)
-          batch.put(
-            (self.REVISION_KEY_PREFIX + uid).encode("utf-8"),
-            str(profile.revision).encode("ascii"),
-          )
-        return
-
-      with self.lock:
-        self.text_profiles[uid] = self._profile_to_json_data(profile)
-        self.text_profiles[self.REVISION_KEY_PREFIX + uid] = profile.revision
-        self._flush_text_profiles_unlocked()
+      profile.revision = self.repository.save(
+        uid, self._profile_to_json_data(profile), getattr(profile, "_storage_parts", None),
+      )
 
   def get_revision(self, uid: str) -> int:
     """Read the compact revision key without constructing a UserProfile."""
@@ -488,7 +490,7 @@ class UserProfileServ:
                         fill_only: bool = True) -> None:
     """读路径（/analysis）登记请求环境：只在画像缺省时补缺，有变化才落盘。"""
     with self.uid_lock(uid):
-      profile = self.get_profile(uid)
+      profile = self.get_profile(uid, {"analysis:context"})
       if profile is None:
         return
       if self._note_request_meta(profile, timezone, language, fill_only=fill_only):
@@ -500,14 +502,15 @@ class UserProfileServ:
     timezone: Optional[str],
     language: Optional[str],
     fill_only: bool = True,
+    request_type: Optional[str] = None,
   ) -> Optional[UserProfile]:
-    """Load once for /analysis and persist request metadata only if missing.
+    """Load analysis inputs from one snapshot; fill request metadata if missing.
 
     The whole read-modify-write is protected by the UID stripe, so a first-time
     metadata fill cannot overwrite a concurrent update for the same user.
     """
     with self.uid_lock(uid):
-      profile = self.get_profile(uid)
+      profile = self.get_profile(uid, ANALYSIS_PARTS_BY_TYPE.get(request_type, ANALYSIS_PARTS))
       if profile is None:
         return None
       if self._note_request_meta(profile, timezone, language, fill_only=fill_only):
@@ -522,7 +525,7 @@ class UserProfileServ:
     update that arrived after the request's initial read.
     """
     with self.uid_lock(uid):
-      profile = self.get_profile(uid)
+      profile = self.get_profile(uid, ANALYSIS_PARTS)
       if profile is None or profile.sleep_data:
         return profile
       if self.content.ensure_fallback_content(uid, profile):
@@ -530,14 +533,8 @@ class UserProfileServ:
       return profile
 
   def list_uids(self) -> list:
-    """全部用户 uid（兜底扫描用）；排除 "_meta:" 前缀的全局 KV。"""
-    with self.lock:
-      if self.storage_mode == "leveldb":
-        return [
-          k.decode("utf-8") for k, _v in self.db.iterator()
-          if not k.startswith(b"_meta:")
-        ]
-      return [k for k in self.text_profiles if not k.startswith("_meta:")]
+    """Enumerate legacy users and the explicit v2 user directory, never parts."""
+    return self.repository.list_uids()
 
   # -------------------- 健康数据口径版本（健康数据同步接口_0814.md §8）--------------------
   @staticmethod
@@ -717,7 +714,7 @@ class UserProfileServ:
     health_sync_days 也能回答（缺省版本 1），且被截断淘汰的天不会谎报。
     无画像返回 None。
     """
-    profile = self.get_profile(uid)
+    profile = self.get_profile(uid, {"analysis:context", "internal:health_sync"})
     if profile is None:
       return None
     tz = self._resolve_tz(timezone)
@@ -1085,12 +1082,15 @@ class UserProfileServ:
 
   @staticmethod
   def _merge_sleep_data(old: list, new: list) -> list:
-    """按 timestamp 去重合并 sleep_data（同 timestamp 新记录覆盖旧记录），按时间升序，截断保留最近 N 条。"""
+    """按 timestamp 合并睡眠记录；同晚未传或传 null 的字段保留旧值。"""
     if not new:
       return old
     by_ts = {r.timestamp: r for r in old}
     for r in new:
-      by_ts[r.timestamp] = r
+      previous = by_ts.get(r.timestamp)
+      by_ts[r.timestamp] = (type(r).model_validate({
+        **previous.model_dump(), **r.model_dump(exclude_unset=True, exclude_none=True),
+      }) if previous is not None else r)
     merged = sorted(by_ts.values(), key=lambda r: r.timestamp)
     return merged[-UserProfileServ.MAX_SLEEP_DATA_LEN:]
 
@@ -1288,9 +1288,13 @@ class UserProfileServ:
     for field in ("sleep_health", "sleep_mode"):
       if field in new_profile.model_fields_set:
         incoming = getattr(new_profile, field)
+        if incoming is None:
+          continue
         previous = getattr(profile, field)
         if incoming is not None and previous is not None:
-          incoming = type(incoming).model_validate({**previous.model_dump(), **incoming.model_dump(exclude_unset=True)})
+          incoming = type(incoming).model_validate({
+            **previous.model_dump(), **incoming.model_dump(exclude_unset=True, exclude_none=True),
+          })
         setattr(profile, field, incoming)
     profile.long_term_profile = self._merge_profile(profile.long_term_profile, new_profile.long_term_profile)
     # 版本登记 + v1 purge 必须在 merge 前：purge 清的是存量里被覆盖天的旧口径样本
@@ -1412,6 +1416,7 @@ class UserProfileServ:
     uid: str,
     skip_sleep_scenarios_reco_update: bool = False,
     skip_sleep_analysis_update: bool = False,
+    force: bool = False,
   ) -> bool:
     """Run LLM work for an existing profile and persist results.
 
@@ -1442,9 +1447,9 @@ class UserProfileServ:
       sleep_insight = None
       analysis_reports = None
     else:
-      sleep_insight = self.calc_sleep_insight(uid, llm_profile)
-      analysis_reports = self.calc_analysis_reports(uid, llm_profile)
-    bedtime_advice = self.content.calc_bedtime_advice(uid, llm_profile)
+      sleep_insight = self.content.calc_sleep_insight(uid, llm_profile, force=force) if force else self.calc_sleep_insight(uid, llm_profile)
+      analysis_reports = self.content.calc_analysis_reports(uid, llm_profile, force=force) if force else self.calc_analysis_reports(uid, llm_profile)
+    bedtime_advice = self.content.calc_bedtime_advice(uid, llm_profile, force=force) if force else self.content.calc_bedtime_advice(uid, llm_profile)
 
     with self.uid_lock(uid):
       profile = self.get_profile(uid)
@@ -1463,7 +1468,7 @@ class UserProfileServ:
         profile.sleep_insight = sleep_insight
       if analysis_reports is not None:
         profile.analysis_reports = analysis_reports
-      if bedtime_advice is not None and bedtime_advice_due(profile):
+      if bedtime_advice is not None and (force or bedtime_advice_due(profile, language=_profile_language(profile))):
         profile.bedtime_advice = bedtime_advice
       self.save_profile(uid, profile)
       logging.info("Profile llm updated uid=%s", uid)

@@ -639,7 +639,7 @@ def scene_night_stats(profile: UserProfile, scene_id: str, *, end_date: datetime
         s = attribute_scene_to_night(profile.mindora_record, r.timestamp)
         if s and short_scene_id(s) == short:
             n += 1
-            scored = daily_score(r, profile)
+            scored = daily_score(r, profile, tz=tz)
             if scored is not None:
                 scores.append(scored["score"])
             if (onset := resolve_sleep_onset(r)) is not None:
@@ -992,6 +992,19 @@ def build_sleep_day_modules(profile: UserProfile, base: Baseline, lang: str) -> 
                                          lang, _t("day_scene_none", lang))
     else:
         scene_description = _t("day_scene_none", lang)
+
+    if not latest.sleep_status:
+        unavailable = {
+            "zh-Hans": "这晚没有睡眠分期数据，暂无法解读该阶段。",
+            "zh-Hant": "這晚沒有睡眠分期資料，暫無法解讀該階段。",
+            "en": "No sleep-stage data was recorded for this night, so this stage cannot be interpreted.",
+        }.get(_canonical_lang(lang), "No sleep-stage data was recorded for this night.")
+        return {
+            "sleep_scenarios": {"title": scene_display_name(scene_id) if scene_id else "",
+                                "description": scene_description},
+            "stage_insights": {stage: {"description": unavailable}
+                               for stage in ("awake", "rem", "core", "deep")},
+        }
 
     awake_count = int(round(summ.get("night_awake_count") or 0))
     awake_min = int(round(summ.get("night_awake_duration") or 0))
@@ -1383,24 +1396,30 @@ def compute_insight_indices(profile: UserProfile, base: Baseline) -> dict:
             rr_s = _clamp(100 - dev / p["trend_dev_full_pct"] * 100)
     sub["onset"] = {"sol": sol_s, "hr_trend": hr_s, "rr_trend": rr_s}
 
-    # 睡眠结构：时长分 + 连续性分 + 阶段稳定分
+    # 睡眠结构：时长分 + 连续性分 + 阶段稳定分。
     dur_s = cont_s = stage_s = None
-    # 账号级计划（sleep_plans 里 active 的那条）优先；UserProfile.sleep_plan 是设备端
-    # 老字段、全仓无写入方，恒为 None，只作兼容兜底。没有 target 时时长分不参与打分。
-    plan = effective_sleep_plan(profile, min(s.start_time for s in latest.sleep_status)) if latest is not None and latest.sleep_status else None
-    target = getattr(plan, "target_minutes", None) or getattr(plan, "target_duration_min", None)
     summ = latest.sequence_summaries if (latest and latest.sleep_status) else {}
-    tst = summ.get("total_sleep_duration", 0) if summ else None
-    if tst is not None and target:
-        dur_s = _clamp(100 - abs(tst - target) / 1.5)
+    if summ:
+        plan = effective_sleep_plan(profile, min(s.start_time for s in latest.sleep_status))
+        target = getattr(plan, "target_minutes", None) or getattr(plan, "target_duration_min", None) or 480
+        tst = summ.get("total_sleep_duration")
+        if tst is not None:
+            dur_s = _clamp(100 - abs(tst - target) / 1.5)
+    # Use the full stage span (sleep + awake), so awake share remains in [0, 1].
+    # 0–3% awake gets 100; 97–100% gets 0; interpolate linearly between.
+    span = summ.get("sleep_span") if summ else None
     waso = summ.get("night_awake_duration") if summ else None
-    awc = summ.get("night_awake_count") if summ else None
-    if waso is not None and awc is not None:
-        cont_s = _clamp(100 - waso * p["waso_penalty_per_min"] - p["awake_extra_penalty"] * max(awc - 1, 0))
-    deltas = []
+    if span is not None and span > 0 and waso is not None:
+        full = p["awake_full_score_pct"] / 100
+        zero = p["awake_zero_score_pct"] / 100
+        if 0 <= full < zero <= 1:
+            awake_share = _clamp(waso / span, 0, 1)
+            cont_s = _clamp((zero - awake_share) / (zero - full) * 100)
+    # 近 7 天至少 4 晚（含当前夜），用此前夜晚建立个人分期基线。
     prior_nights = len([r for r in base.nights_7d if r is not latest])
-    if (latest is not None and summ and not has_unspecified_stage(latest, profile)
-        and prior_nights >= R["data_state"]["baseline7_min_nights"]):
+    deltas = []
+    if (summ and not has_unspecified_stage(latest, profile)
+        and prior_nights >= R["data_state"]["baseline7_min_nights"] - 1):
         for stage, base_mean in base.stage7.items():
             if base_mean:
                 key = {"rem": "rem_sleep_duration", "core": "core_sleep_duration",

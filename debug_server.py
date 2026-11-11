@@ -13,11 +13,10 @@ for var in proxy_vars:
 # USER_SERVER_URL = "https://api.mindora316.com/user_server/user_profile"
 USER_SERVER_URL = "http://127.0.0.1:9001/user_profile"
 TEST_UID = "test_debug_user_001"
-LOG_DIR = Path(__file__).resolve().parent / "user_server_logs"
+LOG_DIR = Path(os.getenv("RUN_DIR") or Path(__file__).resolve().parent) / "user_server_logs"
 LOG_TAIL_LINES = 120
 LOG_TAIL_MAX_BYTES = 512 * 1024
 LOG_TAIL_CHUNK_BYTES = 64 * 1024
-LLM_TRACE_LOG_PATH = Path(__file__).resolve().parent / "llm_request_response.log"
 
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -143,7 +142,7 @@ HTML_TEMPLATE = """
             </label>
             <div class="status-chip" id="llmTraceStatus">LLM 日志等待刷新</div>
         </div>
-        <div class="log-meta" id="llmTraceMeta">展示 `llm_request_response.log` 的最新内容，包含发送给 LLM 的 prompt 和收到的 response。</div>
+        <div class="log-meta" id="llmTraceMeta">展示 `user_server_logs/` 中本次服务启动的 LLM 日志，包含发送给 LLM 的 prompt 和收到的 response。</div>
         <pre class="log-viewer" id="llmTraceViewer">点击“刷新 LLM 日志”后加载内容...</pre>
     </div>
 
@@ -306,7 +305,7 @@ HTML_TEMPLATE = """
         }
 
         async function fetchScenarios() {
-            const payload = { request_type: 'query_profile', data: { uid: TEST_UID }, timestamp:  Math.floor(Date.now() / 1000) };
+            const payload = { request_type: 'query_profile', data: { uid: TEST_UID, device_type: 'pc' }, timestamp:  Math.floor(Date.now() / 1000) };
             try {
                 const resp = await fetch('/api/proxy', {
                     method: 'POST',
@@ -487,11 +486,21 @@ def _read_latest_user_server_log():
     if not LOG_DIR.exists() or not LOG_DIR.is_dir():
         raise FileNotFoundError(f"log dir not found: {LOG_DIR}")
 
-    log_files = [path for path in LOG_DIR.iterdir() if path.is_file()]
+    log_files = [path for path in LOG_DIR.glob("log_*.log") if path.is_file()]
     if not log_files:
         raise FileNotFoundError(f"no log files found in {LOG_DIR}")
 
-    latest_log = max(log_files, key=lambda path: path.stat().st_mtime)
+    latest_log = max(log_files, key=lambda path: path.name)
+    return _read_log_tail(latest_log)
+
+
+def _read_latest_llm_trace_log():
+    if not LOG_DIR.exists() or not LOG_DIR.is_dir():
+        raise FileNotFoundError(f"log dir not found: {LOG_DIR}")
+    log_files = [path for path in LOG_DIR.glob("llm_request_response_*.log") if path.is_file()]
+    if not log_files:
+        raise FileNotFoundError(f"no LLM trace log found in {LOG_DIR}")
+    latest_log = max(log_files, key=lambda path: path.name)
     return _read_log_tail(latest_log)
 
 @app.route('/')
@@ -531,7 +540,7 @@ def user_server_log():
 @app.route('/api/llm-trace-log', methods=['GET'])
 def llm_trace_log():
     try:
-        payload = _read_log_tail(LLM_TRACE_LOG_PATH)
+        payload = _read_latest_llm_trace_log()
         return jsonify({"code": 0, "msg": "ok", **payload})
     except FileNotFoundError as e:
         return jsonify({"code": -1, "msg": str(e)}), 404

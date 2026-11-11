@@ -189,12 +189,14 @@ def _lang_closing(language: str) -> str:
 
 _CJK_RE = re.compile(r"[一-鿿぀-ヿ가-힯]")
 
-def _language_matches(result: dict, language: str) -> bool:
+def _language_matches(result: dict, language: str, request_type: str = "") -> bool:
     """输出语言校验：CJK 语言请求的结果必须含 CJK 字符。
 
     K3 在英文主导的 prompt 下会随机整篇漂成英文（prompt 加固只能降低概率），
     服务端校验 + 重试兜底；非 CJK 语言不校验（拉丁/英文之间漂移不判）。
     """
+    if request_type == "bedtime_advice" and language == "en":
+        return not bool(_CJK_RE.search(str(result.get("content", ""))))
     if not language.startswith(("zh", "ja", "ko")):
         return True
     return bool(_CJK_RE.search(json.dumps(result, ensure_ascii=False)))
@@ -671,7 +673,7 @@ class SleepAnalysisLLM:
                 result = self._parse(raw)
                 if result is None:
                     break  # 调用失败/非 JSON：换下一个方向
-                if _language_matches(result, language):
+                if _language_matches(result, language, request_type):
                     self._last_good[request_type] = route_name
                     return result
                 logging.warning("LLM output not in %s (route=%s, request_type=%s), retry %d/2", language, route_name, request_type, attempt)
@@ -728,7 +730,7 @@ class SleepAnalysisLLM:
                 if result is None:
                     logging.warning("LLM returned non-JSON (route=%s, request_type=%s)", route_name, request_type)
                     break  # 换下一个方向
-                if _language_matches(result, language):
+                if _language_matches(result, language, request_type):
                     self._last_good[request_type] = route_name
                     return result
                 logging.warning("LLM output not in %s (route=%s, request_type=%s), retry %d/2", language, route_name, request_type, attempt)

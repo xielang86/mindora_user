@@ -429,9 +429,11 @@ class BedtimeAdvice(BaseModel):
 BEDTIME_ADVICE_INTERVAL_SECONDS = 7 * 86400
 
 
-def bedtime_advice_due(profile: "UserProfile", now: Optional[int] = None) -> bool:
+def bedtime_advice_due(profile: "UserProfile", now: Optional[int] = None, language: Optional[str] = None) -> bool:
   advice = getattr(profile, "bedtime_advice", None) if profile else None
   if advice is None or not advice.content.strip() or not advice.generated_at:
+    return True
+  if language is not None and advice.language != language:
     return True
   return (int(time.time()) if now is None else now) - advice.generated_at >= BEDTIME_ADVICE_INTERVAL_SECONDS
 
@@ -822,7 +824,7 @@ class ProfileData(BaseModel):
   )
   device_type: Optional[str] = Field(
     None,
-    description="请求来源类型：设备端固定 mindora（common/device_id.DEVICE_TYPE）；App 复用本结构时填 ios/android 等",
+    description="请求来源类型：query_profile 用 mindora=设备、ios/android=App、pc=完整调试；缺省兼容旧 App，按 App 处理",
   )
   user_profile: Optional[UserProfile] = Field(None, description="user profile")
   language: Optional[str] = Field(None, description="界面语言，如 en、zh-Hans（健康同步 v2 必填）")
@@ -849,6 +851,7 @@ class ProfileData(BaseModel):
   # 返回的每条 sleep_data 附计算属性 sequence_summaries（各阶段时长/觉醒统计）。
   # 旧布尔字段 include_sleep_data 由 before-validator 映射（false→0 / true→全部 30 晚）
   sleep_data_count: int = Field(1, ge=0, description="query_profile 响应携带最近 N 晚 sleep_data（附 sequence_summaries）；0=不携带，缺省 1")
+  include_sleep_status: bool = Field(True, description="query_profile 是否返回每晚 sleep_status 阶段列表；False 时仍返回 sequence_summaries 和 onset")
   include_behaviors: bool = Field(True, description="query_profile 响应是否携带 behaviors，默认 True；为 False 时同时剔除 health_sync_days")
   include_sop_tag_profile: bool = Field(False, description="query_profile 响应是否携带 sop_tag_profile，默认 False")
   include_sop_recommendation_details: bool = Field(False, description="query_profile 响应是否携带 sop_recommendation_details，默认 False")

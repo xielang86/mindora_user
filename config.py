@@ -161,18 +161,18 @@ class Config:
               "min_valid_7d": 4, "min_valid_30d": 15,
               "min_change": {"tst_min": 20, "sol_min": 5, "waso_min": 10,
                              "awake_count": 1, "clock_min": 15}},
-    # AN_ONSET_INDEX / AN_STRUCTURE_INDEX / AN_STABILITY_INDEX（建议v1 权重，
-    # 缺失子分按剩余权重归一）；label_bands 为产品状态分层（非医学等级），待确认
+    # AN_ONSET_INDEX / AN_STRUCTURE_INDEX / AN_STABILITY_INDEX 缺失子分按剩余权重归一；
+    # 结构指数保留时长/连续性/阶段稳定三子分，连续性按清醒占比分段映射。
     "indices": {
       "onset":     {"weights": {"sol": 0.70, "hr_trend": 0.15, "rr_trend": 0.15}},
       "structure": {"weights": {"duration": 0.45, "continuity": 0.35, "stage_stability": 0.20}},
       "stability": {"weights": {"continuity": 0.50, "hr_stability": 0.25, "rr_stability": 0.25}},
       "label_bands": [[80, "excellent"], [60, "good"], [0, "fair"]],
-      # 子分公式常量（建议v1，待产品确认）
+      # 子分公式常量
       "subscore_params": {"sol_full_min": 10, "sol_penalty_per_min": 2,
                           "trend_dev_full_pct": 50, "stage_delta_full_pct": 100,
                           "hr_range_full_pct": 50, "resp_var_full_pct": 50,
-                          "waso_penalty_per_min": 2, "awake_extra_penalty": 10},
+                          "awake_full_score_pct": 3, "awake_zero_score_pct": 97},
     },
     # 洞察文案禁用词（规范生成限制；同时用于 LLM 润色输出校验）
     "forbidden_terms": ["stress", "anxiety", "insomnia", "treatment", "diagnos",

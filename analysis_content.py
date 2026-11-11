@@ -117,11 +117,11 @@ class AnalysisContentService:
   def llm(self):
     return self._get_llm()
 
-  def calc_bedtime_advice(self, uid: str, profile: UserProfile) -> Optional[BedtimeAdvice]:
+  def calc_bedtime_advice(self, uid: str, profile: UserProfile, force: bool = False) -> Optional[BedtimeAdvice]:
     """Generate one advice item when absent or at least seven days old."""
-    if not bedtime_advice_due(profile) or not self.llm or not self.llm.enabled:
-      return None
     language = _profile_language(profile)
+    if (not force and not bedtime_advice_due(profile, language=language)) or not self.llm or not self.llm.enabled:
+      return None
 
     class _AdviceData:
       date = ""
@@ -155,7 +155,7 @@ class AnalysisContentService:
     ("micro_education", 5),
   ]
 
-  def calc_sleep_insight(self, uid: str, profile: UserProfile) -> Optional[SleepInsightReport]:
+  def calc_sleep_insight(self, uid: str, profile: UserProfile, force: bool = False) -> Optional[SleepInsightReport]:
     """Generate the 6-module insight report (mindora_advice.md 模块0-5).
 
     生成方式（对照规范 v3 §4）：规则引擎先算结构化结论并填模板（llm_used=False，
@@ -184,7 +184,7 @@ class AnalysisContentService:
         profile, lang,
         _today_in_tz(profile.last_request_timezone).isoformat(), now,
       )
-    if existing and existing.generated_at and existing.llm_used \
+    if not force and existing and existing.generated_at and existing.llm_used \
         and existing.language == lang and existing.date == today_str \
         and existing.input_fingerprint == explore_input_fingerprint(profile, lang):
       newest_sleep_ts = max(
@@ -402,7 +402,7 @@ class AnalysisContentService:
     kept.sort(key=lambda r: (r.end_date or r.date, r.generated_at))
     return kept[-retention:]
 
-  def calc_analysis_reports(self, uid: str, profile: UserProfile, language: Optional[str] = None) -> Optional[dict]:
+  def calc_analysis_reports(self, uid: str, profile: UserProfile, language: Optional[str] = None, force: bool = False) -> Optional[dict]:
     """异步生成 5 个分析能力的当前周期文案报告，返回更新后的 analysis_reports。
 
     在 update_profile 的后台 LLM 更新中调用；/analysis 请求时只读库。
@@ -504,7 +504,7 @@ class AnalysisContentService:
       # 当前周期已有同语言真实报告 → 复用，不重复调 LLM；语言漂移视为过期，重生成。
       # 规则模板报告（llm_used=False）不算——下次周期自然重算并尝试 LLM 润色
       current = _current_report(request_type, start_date, end_date, date)
-      if current is not None and current.llm_used and current.language == language \
+      if not force and current is not None and current.llm_used and current.language == language \
           and current.input_fingerprint == explore_input_fingerprint(profile, language):
         continue
 

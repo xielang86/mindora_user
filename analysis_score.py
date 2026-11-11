@@ -1,38 +1,22 @@
 """Versioned Mindora display score from observed nightly metrics (v3 draft)."""
 from __future__ import annotations
 
-import math
+import datetime
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 from user_profile import SleepResult, UserProfile, active_sleep_plan
 from sleep_session_builder import cap_sleep_quality, resolve_sleep_quality
 from sleep_metrics import estimate_sleep_window, _timeline
 
-SCORE_VERSION = "mindora-score-v3-draft-3"
-INDEX_VERSION = "mindora-insight-v3-draft-3"
+SCORE_VERSION = "mindora-score-v3-draft-4"
+INDEX_VERSION = "mindora-insight-v3-draft-4"
 LEGACY_SCORE_VERSION = "mindora-score-legacy-v1"
 WEIGHTS = {"duration": .35, "efficiency": .25, "continuity": .20, "schedule": .20}
 
 
 def _clamp(value: float) -> float:
   return max(0.0, min(100.0, value))
-
-
-def _clock(value) -> Optional[int]:
-  if isinstance(value, int) and 0 <= value < 1440:
-    return value
-  if isinstance(value, str):
-    try:
-      hour, minute = map(int, value.split(":"))
-      if 0 <= hour < 24 and 0 <= minute < 60:
-        return hour * 60 + minute
-    except ValueError:
-      pass
-  return None
-
-
-def _clock_distance(a: int, b: int) -> int:
-  return abs((a - b + 720) % 1440 - 720)
 
 
 def _bed_minutes(intervals: list[tuple[int, int]]) -> Optional[float]:
@@ -58,8 +42,25 @@ def effective_sleep_plan(profile: UserProfile, night_start_ts: int):
   return legacy
 
 
-def daily_score(record: SleepResult, profile: UserProfile) -> Optional[dict]:
-  """AN_SCORE with documented estimates when measured targets or TIB are absent."""
+def _insight_indices_for_night(record: SleepResult, profile: UserProfile, tz=None) -> dict:
+  """Compute the two insight indices for this night, excluding later nights."""
+  from insight_rules import compute_baselines, compute_insight_indices
+  if tz is None:
+    try:
+      tz = ZoneInfo(profile.last_request_timezone or "UTC")
+    except (KeyError, ValueError):
+      tz = datetime.timezone.utc
+  history = [night for night in profile.sleep_data if night.timestamp < record.timestamp]
+  history.append(record)
+  night_profile = profile.model_copy(update={"sleep_data": history})
+  base = compute_baselines(night_profile, tz)
+  if base.latest is None or base.latest.timestamp != record.timestamp:
+    return {}
+  return compute_insight_indices(night_profile, base)
+
+
+def daily_score(record: SleepResult, profile: UserProfile, *, tz=None, insight_indices=None) -> Optional[dict]:
+  """AN_SCORE using each night's structure and stability insight indices."""
   def legacy():
     raw = resolve_sleep_quality(record)
     return {"score": int(raw), "score_version": LEGACY_SCORE_VERSION,
@@ -71,13 +72,7 @@ def daily_score(record: SleepResult, profile: UserProfile) -> Optional[dict]:
   if not sleep_rows:
     return legacy()
   tst = sum(end - start for start, end in sleep_rows) / 60
-  first_sleep, last_sleep = sleep_rows[0][0], sleep_rows[-1][1]
-  wake_rows = [(max(start, first_sleep), min(end, last_sleep)) for start, end, kind in rows
-               if kind == "awake" and end > first_sleep and start < last_sleep]
-  waso = sum(end - start for start, end in wake_rows) / 60
-  wake_episodes = sum(1 for i, (start, _) in enumerate(wake_rows)
-                      if i == 0 or start > wake_rows[i-1][1])
-  scores: dict[str, float] = {"continuity": _clamp(100 - 2 * waso - 10 * max(wake_episodes - 1, 0))}
+  scores: dict[str, float] = {}
   estimated_dimensions = []
 
   plan = effective_sleep_plan(profile, min(s.start_time for s in record.sleep_status))
@@ -101,28 +96,28 @@ def daily_score(record: SleepResult, profile: UserProfile) -> Optional[dict]:
       estimated_dimensions.append("efficiency")
     scores["efficiency"] = efficiency
 
-  target_sleep = _clock(getattr(plan, "sleep_time", None) or getattr(plan, "target_bed_time", None))
-  target_wake = _clock(getattr(plan, "wake_time", None) or getattr(plan, "target_wake_time", None))
-  actual_sleep = _clock(record.first_sleep_time)
-  actual_wake = _clock(record.wake_time)
-  if None not in (target_sleep, target_wake, actual_sleep, actual_wake):
-    delta = (_clock_distance(actual_sleep, target_sleep) +
-             _clock_distance(actual_wake, target_wake)) / 2
-    scores["schedule"] = _clamp(100 - delta / 1.2)
+  indices = insight_indices if insight_indices is not None else _insight_indices_for_night(record, profile, tz)
+  # Keep the response's established dimension names for client compatibility.
+  # Both values come from the same night's /analysis_explore cards.
+  if indices.get("stability_index") is not None:
+    scores["continuity"] = indices["stability_index"]
+  if indices.get("structure_index") is not None:
+    scores["schedule"] = indices["structure_index"]
 
   if len(scores) < 3:
     return legacy()
   weight = sum(WEIGHTS[k] for k in scores)
   value = round(cap_sleep_quality(sum(WEIGHTS[k] * v for k, v in scores.items()) / weight, tst))
   return {"score": value, "score_version": SCORE_VERSION,
+          "dimension_scores": {k: round(v) for k, v in sorted(scores.items())},
           "available_dimensions": sorted(scores), "dimension_count": len(scores),
           "estimated_dimensions": sorted(estimated_dimensions),
           "duration_target_source": target_source,
           "in_bed_source": window["source"] if window else "unavailable"}
 
 
-def period_score(records: list[SleepResult], profile: UserProfile) -> Optional[dict]:
-  scores = [daily_score(record, profile) for record in records]
+def period_score(records: list[SleepResult], profile: UserProfile, *, tz=None) -> Optional[dict]:
+  scores = [daily_score(record, profile, tz=tz) for record in records]
   # Keep one score version in an aggregate; never mix historical raw and v3.
   latest = max(((r.timestamp, s["score_version"]) for r, s in zip(records, scores) if s), default=None)
   version = latest[1] if latest else None
