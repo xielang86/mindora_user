@@ -14,13 +14,13 @@ from __future__ import annotations
 import datetime
 import math
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
 from analysis_fallback import _canonical_lang, _nickname
 from sleep_session_builder import resolve_sleep_onset
-from sleep_metrics import build_sleep_metrics, has_unspecified_stage
+from sleep_metrics import build_sleep_metrics, has_unspecified_stage, score_stage_summary
 from analysis_score import daily_score, effective_sleep_plan
 from insight_rules_config import get_insight_rules
 from user_profile import UserProfile, SleepResult, short_scene_id, active_sleep_plan
@@ -1371,8 +1371,54 @@ def _clamp(v: float, lo: float = 0.0, hi: float = 100.0) -> float:
     return max(lo, min(hi, v))
 
 
+def _index_baseline(profile: UserProfile, base: Baseline) -> Baseline:
+    """Seven elapsed days before this stage-defined night, independent of timezone."""
+    latest = base.latest
+    current = score_stage_summary(latest) if latest else None
+    if current is None:
+        return base
+    end_ts = current["end_ts"]
+    prior = []
+    for record in profile.sleep_data or []:
+        if record is latest:
+            continue
+        summary = score_stage_summary(record) if record.sleep_status else None
+        if summary and end_ts - 7 * 86400 <= summary["end_ts"] < end_ts:
+            prior.append(record)
+
+    def mean_field(field: str):
+        values = [getattr(row, field) for row in prior if getattr(row, field) is not None]
+        return _mean(values) if values else None
+
+    keys = {"rem": "rem_sleep_duration", "core": "core_sleep_duration",
+            "deep": "deep_sleep_duration", "awake": "night_awake_duration"}
+    summaries = [score_stage_summary(row) for row in prior]
+    stage7 = {stage: _mean([s[key] for s in summaries]) if summaries else None
+              for stage, key in keys.items()}
+    return replace(base, nights_7d=prior + [latest], stage7=stage7,
+                   hr_base7=mean_field("hr_before_sleep"),
+                   rr_base7=mean_field("rr_before_sleep"))
+
+
+def compute_night_indices(profile: UserProfile, night: SleepResult) -> dict:
+    """Compute the three display indices for one historical or current night."""
+    target = score_stage_summary(night)
+    if target is None:
+        return {"onset_index": None, "structure_index": None, "stability_index": None}
+    history = []
+    for row in profile.sleep_data or []:
+        summary = score_stage_summary(row) if row.sleep_status else None
+        if row is night or (summary and summary["end_ts"] < target["end_ts"]):
+            history.append(row)
+    view = profile.model_copy(update={"sleep_data": history})
+    base = compute_baselines(view, datetime.timezone.utc)
+    base.latest = night
+    return compute_insight_indices(view, base)
+
+
 def compute_insight_indices(profile: UserProfile, base: Baseline) -> dict:
     """三个展示指数；缺失子分按剩余权重归一，缺失全部返回 None。"""
+    base = _index_baseline(profile, base)
     p = R["indices"]["subscore_params"]
     latest = base.latest
     sub: dict[str, Optional[float]] = {}
@@ -1398,7 +1444,7 @@ def compute_insight_indices(profile: UserProfile, base: Baseline) -> dict:
 
     # 睡眠结构：时长分 + 连续性分 + 阶段稳定分。
     dur_s = cont_s = stage_s = None
-    summ = latest.sequence_summaries if (latest and latest.sleep_status) else {}
+    summ = score_stage_summary(latest) if (latest and latest.sleep_status) else {}
     if summ:
         plan = effective_sleep_plan(profile, min(s.start_time for s in latest.sleep_status))
         target = getattr(plan, "target_minutes", None) or getattr(plan, "target_duration_min", None) or 480

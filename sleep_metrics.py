@@ -42,6 +42,35 @@ def _timeline(record):
   return out
 
 
+def score_stage_summary(record):
+  """Night-stage totals inside the first-to-last asleep interval (Unix seconds)."""
+  rows = _timeline(record)
+  asleep = [(a, b) for a, b, kind in rows if kind != "awake"]
+  if not asleep:
+    return None
+  first, last = asleep[0][0], asleep[-1][1]
+  durations = {kind: 0.0 for kind in ("rem", "core", "deep", "unspecified", "awake")}
+  wake_episodes = 0
+  previous_wake_end = None
+  for start, end, kind in rows:
+    start, end = max(start, first), min(end, last)
+    if end <= start:
+      continue
+    durations[kind] += (end - start) / 60
+    if kind == "awake":
+      if previous_wake_end is None or start > previous_wake_end:
+        wake_episodes += 1
+      previous_wake_end = end
+  tst = sum(value for kind, value in durations.items() if kind != "awake")
+  return {"start_ts": first, "end_ts": last, "total_sleep_duration": tst,
+          "sleep_span": tst + durations["awake"],
+          "night_awake_duration": durations["awake"],
+          "night_awake_count": wake_episodes,
+          "rem_sleep_duration": durations["rem"],
+          "core_sleep_duration": durations["core"],
+          "deep_sleep_duration": durations["deep"]}
+
+
 def _bed_intervals(record, behaviors, rows):
   candidates = list(record.in_bed_intervals)
   for entry in (behaviors or {}).get("sleep_in_bed", []) or []:

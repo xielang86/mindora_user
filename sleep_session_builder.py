@@ -15,8 +15,8 @@ SleepResult 行（source="healthkit" 标记）。
   - onset 按 md §6.1：lightsOut = inBed 起点（严格早于会话起点才采用，否则取会话起点），
     终点 = 首次累计睡够 5 分钟（≤1 分钟碎醒不打断）；第一段即睡着 → 统一估计 10 分钟；
     上限 240 分钟
-  - 得分为派生启发式（本文件底部注明公式）：sleep_quality 由时长/效率/结构加权，
-    soe 由 onset 基础分和早期睡眠稳定性推出，sleep_arch_index 由 deep/rem/core 三阶段均衡度，night_var_index 由觉醒情况
+  - 四个分数字段在 profile_service 合并后由 sleep_score_cache 统一填充；
+    此处仅产生原始阶段、入睡用时和体征，避免写入旧版启发式分数
   - hr_min/hr_max 不在这里填：profile_service._update_night_hr_range 按会话起点
     配对 v2 的 sleep_heart_rate_min/max 写入
   - 设备（Mindora）上报的 SleepResult 优先：会话窗口内已有非合成行则跳过该晚；
@@ -357,34 +357,7 @@ def build_sleep_result(session: SleepSession, behaviors: dict, tz: datetime.tzin
     for s, e, t in session.intervals
   ]
 
-  asleep_sec = session.asleep_seconds()
-  awake_sec = sum(e - s for s, e, t in session.intervals if t == "awake")
-  deep_sec = sum(e - s for s, e, t in session.intervals if t == "deep")
-  rem_sec = sum(e - s for s, e, t in session.intervals if t == "rem")
-  in_bed_sec = sum(e - s for s, e in session.in_bed) or None
-
   onset_min, lights_out = _compute_onset(session)
-
-  # ── 派生得分（启发式，无设备算法时让各 score 卡有真实数据支撑）────────────
-  # duration：总睡眠对标 8h；structure：三阶段均衡度；efficiency：总睡眠/卧床
-  duration_score = min(asleep_sec / (8 * 3600), 1.0) * 100
-  core_sec = sum(e - s for s, e, t in session.intervals if t == "core")
-  structure_score = score_sleep_structure(deep_sec, rem_sec, core_sec)
-  efficiency = asleep_sec / in_bed_sec if in_bed_sec else None
-  if efficiency is not None:
-    quality = 0.5 * duration_score + 0.25 * efficiency * 100 + 0.25 * (structure_score or 0)
-  else:
-    quality = 0.6 * duration_score + 0.4 * (structure_score or 0)
-
-  # SOE（入睡效率）：7 分钟内满分；7→40 分钟 100→60；
-  # 40→120 分钟 60→10；120→240 分钟 10→1，分段线性。
-  soe = _score_onset_with_stability(onset_min, session.intervals)
-
-  # night_var_index（夜间波动分）：觉醒次数与觉醒时长占比罚分
-  span_sec = asleep_sec + awake_sec
-  awake_count = sum(1 for _s, _e, t in session.intervals if t == "awake")
-  awake_share = awake_sec / span_sec if span_sec else 0.0
-  night_var = max(0.0, 100.0 - awake_count * 8 - awake_share * 100)
 
   # ── 窗口内体征 ────────────────────────────────────────────────────────────
   hrv = _mean(_window_values(behaviors, "sleep_heart_rate_variability_sdnn", start, end))
@@ -400,11 +373,7 @@ def build_sleep_result(session: SleepSession, behaviors: dict, tz: datetime.tzin
   return SleepResult(
     timestamp=end,  # 醒来时刻；_analysis_needed 以它归日
     in_bed_intervals=list(session.in_bed),
-    sleep_quality=round(cap_sleep_quality(quality, asleep_sec / 60.0), 1),
-    soe=soe,
     onset=round(onset_min, 1) if onset_min is not None else None,
-    sleep_arch_index=round(structure_score, 1) if structure_score is not None else None,
-    night_var_index=round(night_var, 1),
     first_sleep_time=None if onset_min is None else _hhmm(int(lights_out + onset_min * 60), tz),
     bed_time=_hhmm(lights_out, tz),
     wake_time=_hhmm(end, tz),

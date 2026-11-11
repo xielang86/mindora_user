@@ -11,6 +11,7 @@ from user_server import (
     APP_PROFILE_FIELDS, DEVICE_PROFILE_FIELDS, DEVICE_TOP_FIELDS,
     QUERY_PROFILE_PARTS, UserServer,
 )
+from analysis_score import INDEX_VERSION
 
 
 @pytest.fixture
@@ -33,8 +34,8 @@ def server(tmp_path, monkeypatch):
         "long_term_profile": [["quiet", 0.5]],
         "sleep_plan": {"target_duration_min": 480, "updated_at": 100},
         "sleep_data": [
-            {"timestamp": 1000, "sleep_quality": 70},
-            {"timestamp": 2000, "sleep_quality": 80},
+            {"timestamp": 1000, "score_version": "mindora-score-unavailable-v1", "index_version": INDEX_VERSION},
+            {"timestamp": 2000, "score_version": "mindora-score-unavailable-v1", "index_version": INDEX_VERSION},
         ],
         "behaviors": {"heart_rate": [[1000, 60]]},
     })

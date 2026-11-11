@@ -29,6 +29,7 @@ except ImportError:
 
 from analysis_content import AnalysisContentService, _profile_language
 from analysis_score import SCORE_VERSION, daily_score
+from sleep_score_cache import refresh_score_cache, score_cache_ready, cached_daily_score
 from common import util
 from config import Config
 from engagement_service import EngagementService
@@ -513,9 +514,23 @@ class UserProfileServ:
       profile = self.get_profile(uid, ANALYSIS_PARTS_BY_TYPE.get(request_type, ANALYSIS_PARTS))
       if profile is None:
         return None
-      if self._note_request_meta(profile, timezone, language, fill_only=fill_only):
+      changed = self._note_request_meta(profile, timezone, language, fill_only=fill_only)
+      if not score_cache_ready(profile):
+        changed = refresh_score_cache(profile) or changed
+      if changed:
         self.save_profile(uid, profile)
       return profile
+
+  def refresh_score_cache_for_uid(self, uid: str) -> bool:
+    """Upgrade old sleep scores before a device/app query_profile projection."""
+    with self.uid_lock(uid):
+      profile = self.get_profile(uid, {"sleep:records", "analysis:context"})
+      if profile is None or score_cache_ready(profile):
+        return False
+      changed = refresh_score_cache(profile)
+      if changed:
+        self.save_profile(uid, profile)
+      return changed
 
   def ensure_fallback_content_for_uid(self, uid: str) -> Optional[UserProfile]:
     """Atomically add zero-data fallback content and return the current profile.
@@ -699,6 +714,7 @@ class UserProfileServ:
     """
     stats: dict = {"synthesized": self._synthesize_sleep_data(profile)}
     self._update_night_hr_range(profile)
+    stats["scores_refreshed"] = refresh_score_cache(profile)
     return stats
 
   def query_health_sync_days(
@@ -948,7 +964,7 @@ class UserProfileServ:
     for record in profile.sleep_data:
       if record.timestamp < cutoff_ts:
         continue
-      scored = daily_score(record, profile)
+      scored = cached_daily_score(record, profile)
       if scored is None:
         continue
 
@@ -1271,10 +1287,11 @@ class UserProfileServ:
       # 否则首包场景事件丢失，most_used_scene 永远为空
       self._update_mindora_record(new_profile, new_profile)
       self._update_scene_stats(new_profile)
-      self._update_best_scene_by_sleep_quality(new_profile)
       self._synthesize_sleep_data(new_profile)
       self._update_night_hr_range(new_profile)
       self._update_goal_achieved(new_profile)
+      refresh_score_cache(new_profile)
+      self._update_best_scene_by_sleep_quality(new_profile)
       rebuild_sop_tag_profile(new_profile)
       return new_profile
 
@@ -1306,9 +1323,10 @@ class UserProfileServ:
     # aggregate SOP play events into mindora_record so we can keep behaviors small
     self._update_mindora_record(profile, new_profile)
     self._update_scene_stats(profile)
-    self._update_best_scene_by_sleep_quality(profile)
     self._update_night_hr_range(profile)
     self._update_goal_achieved(profile)
+    refresh_score_cache(profile)
+    self._update_best_scene_by_sleep_quality(profile)
     rebuild_sop_tag_profile(profile)
     return profile
 

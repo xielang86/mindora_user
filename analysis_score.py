@@ -1,16 +1,14 @@
 """Versioned Mindora display score from observed nightly metrics (v3 draft)."""
 from __future__ import annotations
 
-import datetime
 from typing import Optional
-from zoneinfo import ZoneInfo
 
 from user_profile import SleepResult, UserProfile, active_sleep_plan
 from sleep_session_builder import cap_sleep_quality, resolve_sleep_quality
 from sleep_metrics import estimate_sleep_window, _timeline
 
-SCORE_VERSION = "mindora-score-v3-draft-4"
-INDEX_VERSION = "mindora-insight-v3-draft-4"
+SCORE_VERSION = "mindora-score-v3-draft-5"
+INDEX_VERSION = "mindora-insight-v3-draft-5"
 LEGACY_SCORE_VERSION = "mindora-score-legacy-v1"
 WEIGHTS = {"duration": .35, "efficiency": .25, "continuity": .20, "schedule": .20}
 
@@ -43,20 +41,9 @@ def effective_sleep_plan(profile: UserProfile, night_start_ts: int):
 
 
 def _insight_indices_for_night(record: SleepResult, profile: UserProfile, tz=None) -> dict:
-  """Compute the two insight indices for this night, excluding later nights."""
-  from insight_rules import compute_baselines, compute_insight_indices
-  if tz is None:
-    try:
-      tz = ZoneInfo(profile.last_request_timezone or "UTC")
-    except (KeyError, ValueError):
-      tz = datetime.timezone.utc
-  history = [night for night in profile.sleep_data if night.timestamp < record.timestamp]
-  history.append(record)
-  night_profile = profile.model_copy(update={"sleep_data": history})
-  base = compute_baselines(night_profile, tz)
-  if base.latest is None or base.latest.timestamp != record.timestamp:
-    return {}
-  return compute_insight_indices(night_profile, base)
+  """Compute the two insight indices from stage timestamps, not upload time."""
+  from insight_rules import compute_night_indices
+  return compute_night_indices(profile, record)
 
 
 def daily_score(record: SleepResult, profile: UserProfile, *, tz=None, insight_indices=None) -> Optional[dict]:

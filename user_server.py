@@ -367,7 +367,7 @@ class UserServer:
         records = records[-count:]
       profile_dict["sleep_data"] = [
         {**r.model_dump(), "onset": resolve_sleep_onset(r),
-         "soe": resolve_sleep_onset_efficiency(r), "sequence_summaries": r.sequence_summaries}
+         "soe": r.soe, "sequence_summaries": r.sequence_summaries}
         for r in records
       ]
       if _switch("include_sleep_status") is False:
@@ -436,6 +436,10 @@ class UserServer:
       )
     profile = self.user_serv.get_profile(uid, QUERY_PROFILE_PARTS[view]) if view != "all" else self.user_serv.get_profile(uid)
     if profile:
+      from sleep_score_cache import score_cache_ready
+      if profile.sleep_data and not score_cache_ready(profile):
+        if self.user_serv.refresh_score_cache_for_uid(uid):
+          profile = self.user_serv.get_profile(uid, QUERY_PROFILE_PARTS[view]) if view != "all" else self.user_serv.get_profile(uid)
       logging.debug("profile found uid=%s", uid)
       if view == "app":
         details = profile.profile.model_dump() if profile.profile is not None else None
@@ -1144,7 +1148,7 @@ class UserServer:
 
       def _do_sync() -> sleep_plan_service.SyncResult:
         with self.user_serv.uid_lock(uid):
-          profile = self.user_serv.get_profile(uid, {"plans:state", "analysis:context"})
+          profile = self.user_serv.get_profile(uid, {"plans:state", "analysis:context", "sleep:records"})
           stored = list(profile.sleep_plans) if profile else []
           result = sleep_plan_service.sync_plans(
             stored, incoming,
@@ -1158,10 +1162,13 @@ class UserServer:
             meta_changed = self.user_serv._note_request_meta(profile, d.timezone, d.language, fill_only=False)
           if result.changed or meta_changed:
             if profile is None:
-              profile = self.user_serv.get_or_create_parts(uid, {"plans:state", "analysis:context"})
+              profile = self.user_serv.get_or_create_parts(uid, {"plans:state", "analysis:context", "sleep:records"})
               self.user_serv._note_request_meta(profile, d.timezone, d.language, fill_only=False)
             profile.sleep_plans = result.plans
             profile.sleep_plans_synced_at = int(time.time())
+            if result.changed:
+              from sleep_score_cache import refresh_score_cache
+              refresh_score_cache(profile)
             self.user_serv.save_profile(uid, profile)
           return result
 

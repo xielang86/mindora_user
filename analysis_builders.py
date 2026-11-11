@@ -15,7 +15,8 @@ from typing import Optional
 from sleep_session_builder import resolve_sleep_onset
 from sleep_session_builder import mean_sleep_duration
 from sleep_metrics import MAX_PLAY_TO_SLEEP, build_sleep_metrics, estimate_sleep_window, has_unspecified_stage
-from analysis_score import SCORE_VERSION, INDEX_VERSION, daily_score, period_score
+from analysis_score import SCORE_VERSION, INDEX_VERSION
+from sleep_score_cache import cached_daily_score, cached_period_score, cached_night_indices
 from analysis_content import AnalysisContentService
 from user_profile import UserProfile, short_scene_id
 
@@ -161,7 +162,7 @@ def get_overall_score(profile: UserProfile, tz: Optional[datetime.tzinfo] = None
   lo = today - datetime.timedelta(days=DAY_LOOKBACK_DAYS - 1)
   records = [s for s in profile.sleep_data
              if lo <= datetime.datetime.fromtimestamp(s.timestamp, tz).date() <= today]
-  scored = period_score(records, profile, tz=tz)
+  scored = cached_period_score(records, profile, tz=tz)
   return scored["score"] if scored else None
 
 
@@ -178,14 +179,14 @@ def _window_avg_score(profile: Optional[UserProfile], start: str, end: str,
     return None
   records = [s for s in profile.sleep_data
              if start_d <= datetime.datetime.fromtimestamp(s.timestamp, tz).date() <= end_d]
-  scored = period_score(records, profile, tz=tz)
+  scored = cached_period_score(records, profile, tz=tz)
   return scored["score"] if scored else None
 
 
 def _window_score_label(profile, start, end, tz, score: int) -> str:
   records = [r for r in profile.sleep_data
              if start <= datetime.datetime.fromtimestamp(r.timestamp, tz).date().isoformat() <= end
-             and daily_score(r, profile, tz=tz) is not None]
+             and cached_daily_score(r, profile, tz=tz) is not None]
   duration = mean_sleep_duration(records)
   return "Insufficient Sleep" if duration is not None and duration < 300 else _score_label(score)
 
@@ -360,7 +361,7 @@ def _week_scene_score(profile: UserProfile, scene: dict, tz=None) -> dict:
         if 0 < first_sleep - started <= MAX_PLAY_TO_SLEEP and (closest is None or started > closest[0]):
           closest = (started, short_scene_id(scene_id))
     if closest and closest[1] == scene["scene_id"]:
-      scored = daily_score(night, profile, tz=tz)
+      scored = cached_daily_score(night, profile, tz=tz)
       if scored and scored["score_version"] == SCORE_VERSION:
         associated.append(scored["score"])
   if len(associated) >= 2:
@@ -384,7 +385,7 @@ def build_overview(d, profile: Optional[UserProfile]) -> dict:
   # 首页总分取最新有效夜的版本化 AN_SCORE。
   latest = _fresh_latest(profile, tz)
   metrics = build_sleep_metrics(latest, profile, tz)
-  scored = daily_score(latest, profile, tz=tz) if latest and profile else None
+  scored = cached_daily_score(latest, profile, tz=tz) if latest and profile else None
   if scored:
     result["overall_score"] = {**scored, "date": date}
 
@@ -431,8 +432,7 @@ def build_sleep_day(d, profile: Optional[UserProfile]) -> dict:
   result: dict = {}
 
   # 日页入睡表现与探索页共用指数，估算来源在 sleep_metrics 中标明。
-  from insight_rules import compute_baselines, compute_insight_indices
-  onset_index = compute_insight_indices(profile, compute_baselines(profile, tz))["onset_index"] if profile and latest else None
+  onset_index = cached_night_indices(latest, profile)["onset_index"] if profile and latest else None
   if onset_index is not None:
     result["score_summary"] = {"score": onset_index, "score_version": INDEX_VERSION, "date": date}
 
@@ -489,7 +489,7 @@ def build_sleep_week(d, profile: Optional[UserProfile]) -> dict:
 
   # 周窗口平均评分 + 评价；无数据省略（md：顶部评分由服务端按周窗口数据返回）
   records = [s for s in profile.sleep_data if start <= datetime.datetime.fromtimestamp(s.timestamp, tz).date().isoformat() <= end] if profile and eff_start else []
-  scored = period_score(records, profile, tz=tz) if profile else None
+  scored = cached_period_score(records, profile, tz=tz) if profile else None
   if scored:
     result["score_summary"] = {
       **scored, "label": _localize(_window_score_label(profile, start, end, tz, scored["score"]), d.language), "start_date": start, "end_date": end,
@@ -527,7 +527,7 @@ def build_sleep_month(d, profile: Optional[UserProfile]) -> dict:
 
   # 月窗口平均评分 + 评价
   records = [s for s in profile.sleep_data if start <= datetime.datetime.fromtimestamp(s.timestamp, tz).date().isoformat() <= end] if profile and eff_start else []
-  scored = period_score(records, profile, tz=tz) if profile else None
+  scored = cached_period_score(records, profile, tz=tz) if profile else None
   if scored:
     result["score_summary"] = {
       **scored, "label": _localize(_window_score_label(profile, start, end, tz, scored["score"]), d.language), "start_date": start, "end_date": end,
@@ -541,7 +541,7 @@ def build_sleep_month(d, profile: Optional[UserProfile]) -> dict:
     for sr in profile.sleep_data:
       day = datetime.datetime.fromtimestamp(sr.timestamp, tz).date()
       if start_d <= day <= end_d:
-        nightly = daily_score(sr, profile, tz=tz)
+        nightly = cached_daily_score(sr, profile, tz=tz)
         if nightly:
           score_series.append({"date": day.isoformat(), **nightly})
   result["sleep_trends"] = {
@@ -623,10 +623,10 @@ def build_explore(d, profile: Optional[UserProfile]) -> dict:
 
   # 顶部总分环：总分=当夜 AN_SCORE；三段分值为洞察指数。
   from sleep_session_builder import resolve_sleep_onset
-  from insight_rules import compute_baselines, compute_insight_indices, index_label
-  indices = compute_insight_indices(profile, compute_baselines(profile, tz))
+  from insight_rules import index_label
+  indices = cached_night_indices(latest, profile)
   score_summary: dict = {"title": _localize("Sleep Score", d.language), "date": date}
-  scored = daily_score(latest, profile, tz=tz, insight_indices=indices)
+  scored = cached_daily_score(latest, profile, tz=tz, insight_indices=indices)
   if scored:
     score_summary.update(scored)
   for field, source in (("efficiency_score", "onset_index"), ("structure_score", "structure_index"),

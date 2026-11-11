@@ -155,11 +155,14 @@ def _classify_awake_type(awake_count: int, awake_minutes: float) -> Optional[str
 
 class SleepResult(BaseModel):
   timestamp: int = Field(..., description="数据 update 时间戳（秒级）")
-  sleep_quality: Optional[float] = Field(None, description="睡眠得分，范围0-100") 
-  soe: Optional[float] = Field(None, description="入睡效率，范围0-100")
+  sleep_quality: Optional[float] = Field(None, description="版本化 AN_SCORE 综合分，范围0-100")
+  soe: Optional[float] = Field(None, description="版本化入睡表现指数，范围0-100")
   onset: Optional[float] = Field(None, description="入睡时长，范围0-100, minites")
-  sleep_arch_index: Optional[float] = Field(None, description="睡眠结构，包含快速动眼、核心、深度睡眠占比，单位%")
-  night_var_index: Optional[float] = Field(None, description="夜间波动，包含觉醒次数、觉醒时长、心率波动等，单位%")
+  sleep_arch_index: Optional[float] = Field(None, description="版本化睡眠结构指数，范围0-100")
+  night_var_index: Optional[float] = Field(None, description="版本化夜间稳定度指数，范围0-100")
+  score_version: Optional[str] = Field(None, description="sleep_quality 的评分版本")
+  index_version: Optional[str] = Field(None, description="soe/sleep_arch_index/night_var_index 的指数版本")
+  score_details: Optional[Dict[str, Any]] = Field(None, description="AN_SCORE 的版本化明细缓存")
 
   first_sleep_time: Optional[str] = Field(None, description="首次入睡时间（首次进入快速动眼期时间）, 00:00")
   bed_time: Optional[str] = Field(None, description="开始卧床时间, 23:30")
