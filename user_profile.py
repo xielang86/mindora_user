@@ -851,6 +851,7 @@ class ProfileData(BaseModel):
   # 返回的每条 sleep_data 附计算属性 sequence_summaries（各阶段时长/觉醒统计）。
   # 旧布尔字段 include_sleep_data 由 before-validator 映射（false→0 / true→全部 30 晚）
   sleep_data_count: int = Field(1, ge=0, description="query_profile 响应携带最近 N 晚 sleep_data（附 sequence_summaries）；0=不携带，缺省 1")
+  include_sleep_status: bool = Field(True, description="query_profile 是否返回每晚 sleep_status 阶段列表；False 时仍返回 sequence_summaries 和 onset")
   include_behaviors: bool = Field(True, description="query_profile 响应是否携带 behaviors，默认 True；为 False 时同时剔除 health_sync_days")
   include_sop_tag_profile: bool = Field(False, description="query_profile 响应是否携带 sop_tag_profile，默认 False")
   include_sop_recommendation_details: bool = Field(False, description="query_profile 响应是否携带 sop_recommendation_details，默认 False")

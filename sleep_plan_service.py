@@ -29,7 +29,19 @@ REMINDER_MINUTES_CHOICES = (15, 30, 60, 90)
 ALARM_SOUND_IDS = ("temple_bell", "sunlit_coast", "rainforest_mist")
 SLEEP_AID_CATEGORIES = ("smart", "preference", "trending")
 MIN_TARGET_MINUTES = 60
-MAX_CUSTOM_NAME_LEN = 10
+# 名称预算：中文/全角 12 字，英文/半角 28 字；用 84 个单位保证混排两端一致。
+MAX_CUSTOM_NAME_UNITS = 84
+
+
+def custom_name_units(name: str) -> int:
+  def is_wide(char: str) -> bool:
+    cp = ord(char)
+    return (0x2E80 <= cp <= 0xA4CF or 0xAC00 <= cp <= 0xD7AF
+            or 0xF900 <= cp <= 0xFAFF or 0xFE10 <= cp <= 0xFE6F
+            or 0xFF01 <= cp <= 0xFF60 or 0xFFE0 <= cp <= 0xFFE6
+            or 0x20000 <= cp <= 0x3FFFF)
+
+  return sum(7 if is_wide(char) else 3 for char in name)
 
 # 额度表（§6②）：键为服务端等级（common/user_rights.py 的 free/pro/premium），
 # 文档里的 "basic（普通会员）" 对应服务端 pro。
@@ -140,7 +152,7 @@ def validate_full_plan(plan: SyncedSleepPlan) -> Optional[str]:
     return "invalid_cycle"
 
   if plan.kind == "custom":
-    if len(plan.custom_name or "") > MAX_CUSTOM_NAME_LEN:
+    if custom_name_units(plan.custom_name or "") > MAX_CUSTOM_NAME_UNITS:
       return "invalid_name"  # 服务端拒绝，不要静默截断（否则两端名称不一致）
     if plan.cycle.type != "weekdays":
       return "invalid_cycle"

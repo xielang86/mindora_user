@@ -639,7 +639,7 @@ def scene_night_stats(profile: UserProfile, scene_id: str, *, end_date: datetime
         s = attribute_scene_to_night(profile.mindora_record, r.timestamp)
         if s and short_scene_id(s) == short:
             n += 1
-            scored = daily_score(r, profile)
+            scored = daily_score(r, profile, tz=tz)
             if scored is not None:
                 scores.append(scored["score"])
             if (onset := resolve_sleep_onset(r)) is not None:

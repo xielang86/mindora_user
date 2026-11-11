@@ -370,6 +370,9 @@ class UserServer:
          "soe": resolve_sleep_onset_efficiency(r), "sequence_summaries": r.sequence_summaries}
         for r in records
       ]
+      if _switch("include_sleep_status") is False:
+        for record in profile_dict["sleep_data"]:
+          record.pop("sleep_status", None)
 
     # 运营/陪伴四件套：画像里只是副本，完整数据走 /footprint、/popup、/survey，
     # 所以这里缺省只回最新 1 条。各自按自己的时间戳排序后截尾。
