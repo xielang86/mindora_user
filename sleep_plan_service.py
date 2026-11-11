@@ -43,6 +43,7 @@ def custom_name_units(name: str) -> int:
 
   return sum(7 if is_wide(char) else 3 for char in name)
 
+
 # 额度表（§6②）：键为服务端等级（common/user_rights.py 的 free/pro/premium），
 # 文档里的 "basic（普通会员）" 对应服务端 pro。
 PLAN_QUOTA_BY_LEVEL = {"free": 0, "pro": 1, "premium": 5}
@@ -125,6 +126,8 @@ def has_3_consecutive_weekdays(weekdays) -> bool:
   s = set(weekdays)
   return any({d, d % 7 + 1, (d + 1) % 7 + 1} <= s for d in range(1, 8))
 
+def name_width(name: str) -> int:
+  return sum(2 if ord(c) >= 0x2E80 else 1 for c in name)
 
 def validate_full_plan(plan: SyncedSleepPlan) -> Optional[str]:
   """校验一条完整上报（非墓碑），返回 rejected reason 或 None。"""
