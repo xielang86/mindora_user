@@ -78,11 +78,9 @@ class UserProfileServ:
     "scene_preference": 100,
   }
 
-  # 场景使用 ↔ 睡眠记录的对齐窗口（"使用当晚"口径）：
-  # sleep_data 时间戳实测为次日早晨上传（约 04:47–09:14），场景使用发生在
-  # 前一晚（实测 15:00–18:30），两者间隔实测约 12.7–16 小时；取睡眠记录
-  # 时间戳往前回溯该窗口内的最近一次使用作为当晚生效场景
-  USAGE_SLEEP_LOOKBACK_SEC = 16 * 3600
+  MIN_SOP_USE_SECONDS = 5 * 60
+  # Same conservative pre-sleep interval used by the analysis sleep-onset link.
+  SOP_SLEEP_LEAD_SECONDS = 2 * 3600
 
   # ── 健康数据口径版本（健康数据同步接口_0814.md §8）─────────────────────
   # md §3 字段表全集（v2 现役口径）：一晚只有几~几十个点（已裁剪到睡眠跨度），
@@ -713,8 +711,16 @@ class UserProfileServ:
     不动 behaviors、不动版本登记。幂等；返回统计供调用方决定是否落盘。
     """
     stats: dict = {"synthesized": self._synthesize_sleep_data(profile)}
+    before = sum(len(rows) for rows in profile.mindora_record.values())
+    self._update_mindora_record(profile)
+    stats["mindora_records_added"] = sum(len(rows) for rows in profile.mindora_record.values()) - before
+    if stats["mindora_records_added"]:
+      self._update_scene_stats(profile)
     self._update_night_hr_range(profile)
     stats["scores_refreshed"] = refresh_score_cache(profile)
+    if stats["mindora_records_added"]:
+      self._update_best_scene_by_sleep_quality(profile)
+    rebuild_sop_tag_profile(profile)
     return stats
 
   def query_health_sync_days(
@@ -770,25 +776,59 @@ class UserProfileServ:
       cmd = event.get("cmd")
       event_type = event.get("event")
       if isinstance(cmd, str) and cmd.startswith(SCENE_CMD_PREFIXES) and event_type == "sop_start":
-        events.append((cmd, int(ts), event))
+        try:
+          started = int(ts)
+        except (TypeError, ValueError, OverflowError):
+          continue
+        if started > 0:
+          events.append((cmd, started, event))
     return events
 
-  def _update_mindora_record(self, profile: UserProfile, new_profile: UserProfile):
-    """Move SOP play counts from behaviors.plays into mindora_record.
+  @staticmethod
+  def _sleep_usage_windows(profile: UserProfile) -> list[tuple[int, int]]:
+    """Stage-defined nights; SleepResult.timestamp can be an upload timestamp."""
+    from sleep_metrics import score_stage_summary
+    windows = []
+    for night in profile.sleep_data or []:
+      summary = score_stage_summary(night) if night.sleep_status else None
+      if summary:
+        windows.append((int(summary["start_ts"]), int(summary["end_ts"])))
+    return windows
 
-    Stores lightweight (timestamp, duration) tuples instead of full event dicts
-    to keep storage and logs small.
+  def _update_mindora_record(self, profile: UserProfile):
+    """Count confirmed sleep-associated SOP uses from retained play events.
+
+    A play may arrive before its sleep data, so scan retained behaviors on every
+    update. Existing historical mindora_record entries are left untouched.
     """
-    plays = new_profile.behaviors.get("plays", [])
+    import math
+    windows = self._sleep_usage_windows(profile)
+    if not windows:
+      return
+    plays = profile.behaviors.get("plays", [])
     for cmd, ts, event in self._extract_sop_start_events(plays):
-      duration = event.get("duration") if isinstance(event, dict) else None
+      try:
+        duration = float(event.get("duration"))
+      except (TypeError, ValueError, OverflowError):
+        continue
+      if (not math.isfinite(duration) or duration < self.MIN_SOP_USE_SECONDS
+          or duration > 16 * 3600):
+        continue
+      if not any(start - self.SOP_SLEEP_LEAD_SECONDS <= ts < end for start, end in windows):
+        continue
+      duration = int(duration) if duration.is_integer() else duration
       record = profile.mindora_record.setdefault(cmd, [])
       # Retried start events must not inflate usage/tag evidence.
       existing = next((i for i, item in enumerate(record) if str(item[0]) == str(ts)), None)
       if existing is None:
         record.append((ts, duration))
-      elif duration is not None:
-        record[existing] = (ts, duration)
+      else:
+        try:
+          old_duration = float(record[existing][1])
+        except (IndexError, TypeError, ValueError, OverflowError):
+          old_duration = 0
+        if duration > old_duration:
+          record[existing] = (ts, duration)
       # keep the list sorted by timestamp and cap the length
       record.sort(key=lambda x: x[0])
       if len(record) > UserProfileServ.MAX_BEHAVIOR_LEN:
@@ -912,18 +952,9 @@ class UserProfileServ:
   def _pick_best_sleep_quality_scene(profile: UserProfile, days: int = 7) -> Optional[dict]:
     """Return the scene with the highest average displayable Mindora score.
 
-    For each sleep night in the last ``days`` days:
-      - Look at scene usages within USAGE_SLEEP_LOOKBACK_SEC before the sleep
-        record's timestamp (real data: sleep records are uploaded the next
-        morning ~04:47–09:14, scene usage happens the previous evening
-        ~15:00–18:30, an observed gap of ~12.7–16 h).
-      - Pick the scene usage closest to (but not after) the record timestamp
-        as the "effective" scene for that night.
-      - Attribute that night's versioned product score to that scene.
-
-    Note: first_sleep_time is NOT used for alignment — in real data it is None
-    for most records, which previously caused every night to be skipped and
-    best_sleep_quality_scene_7d to never be produced (weekly_best.score missing).
+    Match each usage to stage timestamps, not SleepResult.timestamp (upload time).
+    A usage starts within two hours before the first asleep stage or during the
+    night. The most recently started qualifying usage owns that night's score.
 
     The returned dict contains the scene with the highest average sleep_quality.
     """
@@ -960,25 +991,22 @@ class UserProfileServ:
     # Attribute only displayable product scores to the effective scene.
     # 不按记录条数切片（一晚可能多条记录，条数切片会缩短实际天数窗口），
     # 窗口完全由上面的 cutoff_ts（自然时间）控制
+    from sleep_metrics import score_stage_summary
     scene_qualities: dict[str, list[float]] = {}
     for record in profile.sleep_data:
-      if record.timestamp < cutoff_ts:
+      summary = score_stage_summary(record) if record.sleep_status else None
+      if not summary or summary["end_ts"] < cutoff_ts:
         continue
       scored = cached_daily_score(record, profile)
       if scored is None:
         continue
 
-      # Pick the scene usage closest to (but not after) the record timestamp,
-      # within the lookback window — i.e. the usage from "that night".
+      start, end = summary["start_ts"], summary["end_ts"]
       best_usage = None
-      best_delta = None
       for usage in usages:
-        delta = record.timestamp - usage["timestamp"]
-        if delta < 0 or delta > UserProfileServ.USAGE_SLEEP_LOOKBACK_SEC:
-          continue
-        if best_delta is None or delta < best_delta:
-          best_delta = delta
-          best_usage = usage
+        if start - UserProfileServ.SOP_SLEEP_LEAD_SECONDS <= usage["timestamp"] < end:
+          if best_usage is None or usage["timestamp"] > best_usage["timestamp"]:
+            best_usage = usage
 
       if best_usage is None:
         continue
@@ -1283,11 +1311,9 @@ class UserProfileServ:
       new_profile = self._new_profile_from_client(new_profile)
       new_profile.profile = self._merge_personal_profile(None, new_profile.profile)
       self._apply_health_schema_update(new_profile, new_profile, health_schema_version, timezone, purge=False)
-      # 新画像也要把本批 plays 的 sop_start 聚合进 mindora_record，
-      # 否则首包场景事件丢失，most_used_scene 永远为空
-      self._update_mindora_record(new_profile, new_profile)
-      self._update_scene_stats(new_profile)
       self._synthesize_sleep_data(new_profile)
+      self._update_mindora_record(new_profile)
+      self._update_scene_stats(new_profile)
       self._update_night_hr_range(new_profile)
       self._update_goal_achieved(new_profile)
       refresh_score_cache(new_profile)
@@ -1320,8 +1346,9 @@ class UserProfileServ:
     profile.sleep_data = self._merge_sleep_data(profile.sleep_data, new_profile.sleep_data)
     self._synthesize_sleep_data(profile)
 
-    # aggregate SOP play events into mindora_record so we can keep behaviors small
-    self._update_mindora_record(profile, new_profile)
+    # Associate retained plays after sleep_data is merged, including plays
+    # received before the corresponding sleep stages.
+    self._update_mindora_record(profile)
     self._update_scene_stats(profile)
     self._update_night_hr_range(profile)
     self._update_goal_achieved(profile)

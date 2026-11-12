@@ -38,8 +38,8 @@ from user_profile import short_scene_id, SleepResult, UserProfile
 from sleep_metrics import build_sleep_metrics
 from sleep_session_builder import (resolve_sleep_quality, resolve_sleep_structure_score,
                                    aggregate_sleep_quality, mean_sleep_duration)
-from analysis_score import daily_score, period_score
-from insight_rules import compute_baselines, compute_insight_indices
+from analysis_score import daily_score, period_score, SCORE_VERSION, INDEX_VERSION
+from insight_rules import compute_baselines, compute_insight_indices, compute_night_indices
 from analysis_builders import _week_top_scene, _week_scene_score
 
 ANALYSIS_TYPES = [
@@ -178,6 +178,9 @@ def run_checks(profile: dict, responses: dict[str, dict], date: str, has_sleep_s
   d = responses["analysis_overview"].get("data") or {}
   sc = (d.get("overall_score") or {}).get("score")
   check_sleep_eq("概览 overview", "overall_score.score", sc, daily_display["score"] if daily_display else None, "至少三个可计算维度")
+  if latest and latest.get("score_version") == SCORE_VERSION:
+    check_sleep_eq("画像↔分析", "sleep_quality=overview.overall_score", latest.get("sleep_quality"), sc,
+                   "同一 timestamp 的综合分与版本必须一致")
   if sc is None:
     c.add("概览 overview", "overall_score", "(缺省)", "➖ 窗口内无数据，app 应显示 --")
   wb = d.get("weekly_best") or {}
@@ -262,7 +265,14 @@ def run_checks(profile: dict, responses: dict[str, dict], date: str, has_sleep_s
                      for k in ("onset_efficiency", "sleep_structure", "night_fluctuation"))
   if has_scores:
     ss = d.get("score_summary") or {}
-    indices = compute_insight_indices(model_profile, compute_baselines(model_profile, tz))
+    indices = compute_night_indices(model_profile, latest_model)
+    if latest and latest.get("index_version") == INDEX_VERSION:
+      for field, response_field in (("soe", "efficiency_score"),
+                                    ("sleep_arch_index", "structure_score"),
+                                    ("night_var_index", "fluctuation_score")):
+        check_sleep_eq("画像↔分析", f"{field}=explore.{response_field}",
+                       latest.get(field), ss.get(response_field),
+                       "同一 timestamp 的夜级指数与版本必须一致")
     check_sleep_eq("探索 explore", "score_summary.score", ss.get("score"), daily_display["score"] if daily_display else None, "最新有效夜版本化产品分")
     check_sleep_eq("探索 explore", "score_summary.efficiency_score", ss.get("efficiency_score"), indices["onset_index"], "入睡表现指数")
     check_sleep_eq("探索 explore", "score_summary.structure_score", ss.get("structure_score"), indices["structure_index"], "睡眠结构指数")

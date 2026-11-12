@@ -859,7 +859,8 @@ class ProfileData(BaseModel):
   include_sop_tag_profile: bool = Field(False, description="query_profile 响应是否携带 sop_tag_profile，默认 False")
   include_sop_recommendation_details: bool = Field(False, description="query_profile 响应是否携带 sop_recommendation_details，默认 False")
   # mindora_record（场景/纯音乐播放历史，每个 cmd 最多 MAX_BEHAVIOR_LEN 条）是纯服务端
-  # 派生字段（由 behaviors.plays 的 sop_start 聚合而来，合并路径从不采信客户端回传值），
+  # 派生字段（由 behaviors.plays 中播放至少 5 分钟且关联睡眠阶段的 sop_start 聚合而来，
+  # 合并路径从不采信客户端回传值），
   # 设备端只展示 sleep_analysis.recent_scene/most_used_scene，不需要原始历史。
   include_mindora_record: bool = Field(True, description="query_profile 响应是否携带 mindora_record，默认 True；设备端可传 False 省流量")
   # analysis_reports（LLM 生成的日/周/月/总览文案报告）同式限量：各序列升序、最新在尾，
