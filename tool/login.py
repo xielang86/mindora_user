@@ -9,7 +9,8 @@ from enum import StrEnum
 import requests
 
 # DEFAULT_BASE_URL = os.getenv("AUTH_SERVER_URL", "http://127.0.0.1:9103/auth")
-DEFAULT_BASE_URL = os.getenv("AUTH_SERVER_URL", "https://api.mindora316.com/auth")
+# DEFAULT_BASE_URL = os.getenv("AUTH_SERVER_URL", "https://api.mindora316.com/auth")
+DEFAULT_BASE_URL = os.getenv("AUTH_SERVER_URL", "http://43.110.35.237:9103/auth")
 
 
 class AuthRequestType(StrEnum):
@@ -108,9 +109,16 @@ def print_response(label: str, response: requests.Response):
 def run_verify_code_flow(client: AuthClient, verify_code: str | None, delete_after: bool):
   send_response = client.send_verify_code()
   print_response("步骤 1: 发送验证码", send_response)
+  try:
+    send_code = send_response.json().get("code")
+  except (ValueError, AttributeError):
+    send_code = None
+  if not send_response.ok or send_code != 0:
+    print("验证码发送失败，登录流程已停止")
+    return
 
   if not verify_code:
-    verify_code = input("\n请输入服务端控制台显示的验证码: ").strip()
+    verify_code = input("\n请输入邮箱收到的验证码: ").strip()
 
   login_response, auth_response = client.login_with_verify_code(verify_code)
   print_response("步骤 2: 邮箱验证码登录", login_response)

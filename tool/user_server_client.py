@@ -1,6 +1,7 @@
 import argparse
 import datetime as dt
 import json
+import logging
 import os
 import time
 from typing import Any
@@ -25,6 +26,9 @@ class UserServerClient:
     timeout: int = 30,
     language: str = DEFAULT_LANGUAGE,
     timezone: str = DEFAULT_TIMEZONE,
+    use_env_proxy: bool = False,
+    connect_timeout: float | None = None,
+    connect_retries: int = 0,
   ):
     self.base_url = base_url.rstrip("/")
     self.jwt_token = jwt_token
@@ -32,8 +36,10 @@ class UserServerClient:
     self.timeout = timeout
     self.language = language
     self.timezone = timezone
+    self.connect_timeout = connect_timeout
+    self.connect_retries = max(0, connect_retries)
     self.session = requests.Session()
-    self.session.trust_env = False
+    self.session.trust_env = use_env_proxy
 
   def _auth_data(self) -> dict[str, Any]:
     if self.jwt_token:
@@ -42,28 +48,35 @@ class UserServerClient:
 
   def _post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
     url = f"{self.base_url}{path}"
-    try:
-      response = self.session.post(url, json=payload, timeout=self.timeout)
+    timeout = (self.connect_timeout, self.timeout) if self.connect_timeout is not None else self.timeout
+    for attempt in range(self.connect_retries + 1):
       try:
-        body: Any = response.json()
-      except ValueError:
-        body = response.text
+        response = self.session.post(url, json=payload, timeout=timeout)
+        try:
+          body: Any = response.json()
+        except ValueError:
+          body = response.text
 
-      return {
-        "status_code": response.status_code,
-        "ok": response.ok,
-        "url": url,
-        "request": payload,
-        "response": body,
-      }
-    except requests.exceptions.RequestException as exc:
-      return {
-        "status_code": None,
-        "ok": False,
-        "url": url,
-        "request": payload,
-        "response": {"error": str(exc)},
-      }
+        return {
+          "status_code": response.status_code,
+          "ok": response.ok,
+          "url": url,
+          "request": payload,
+          "response": body,
+        }
+      except requests.exceptions.RequestException as exc:
+        # ConnectTimeout 表示连接尚未建立，可以安全地重试；读超时可能已被服务端处理。
+        if isinstance(exc, requests.exceptions.ConnectTimeout) and attempt < self.connect_retries:
+          logging.warning("connect timeout for %s; retry %d/%d", url, attempt + 1, self.connect_retries)
+          time.sleep(min(attempt + 1, 2))
+          continue
+        return {
+          "status_code": None,
+          "ok": False,
+          "url": url,
+          "request": payload,
+          "response": {"error": str(exc)},
+        }
 
   def login_with_jwt(self, jwt_token: str | None = None) -> dict[str, Any]:
     token = jwt_token or self.jwt_token

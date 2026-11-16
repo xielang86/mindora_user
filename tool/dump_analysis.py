@@ -265,7 +265,11 @@ def run_checks(profile: dict, responses: dict[str, dict], date: str, has_sleep_s
                      for k in ("onset_efficiency", "sleep_structure", "night_fluctuation"))
   if has_scores:
     ss = d.get("score_summary") or {}
-    indices = compute_night_indices(model_profile, latest_model)
+    if latest_model is None and has_sleep_source:
+      c.add("探索 explore", "source.sleep_data", "无有效睡眠夜", "❌ 分析返回分数，但画像无可对账的有效睡眠夜")
+    indices = compute_night_indices(model_profile, latest_model) if latest_model else {
+      "onset_index": None, "structure_index": None, "stability_index": None,
+    }
     if latest and latest.get("index_version") == INDEX_VERSION:
       for field, response_field in (("soe", "efficiency_score"),
                                     ("sleep_arch_index", "structure_score"),
@@ -282,7 +286,8 @@ def run_checks(profile: dict, responses: dict[str, dict], date: str, has_sleep_s
     expected_hr = f"{int(hr_min)}-{int(hr_max)}bpm" if hr_min is not None and hr_max is not None else None
     check_sleep_eq("探索 explore", "night_fluctuation.heart_rate_range", nf.get("heart_rate_range"), expected_hr, "当夜 hr_min/hr_max")
     check_sleep_eq("探索 explore", "onset_efficiency.onset_minutes", (d.get("onset_efficiency") or {}).get("onset_minutes"),
-                   (build_sleep_metrics(latest_model, model_profile, tz) or {}).get("sleep_onset_minutes"), "与 Home/Day 同一入睡估算口径")
+                   (build_sleep_metrics(latest_model, model_profile, tz) or {}).get("sleep_onset_minutes") if latest_model else None,
+                   "与 Home/Day 同一入睡估算口径")
     sp = d.get("scene_preference") or {}
     if sp.get("scene_name") is not None or week_top is not None:
       check_sleep_eq("探索 explore", "scene_preference.scene_name", sp.get("scene_name"), week_top, "锚定 7 天使用最多场景")
@@ -378,6 +383,17 @@ def _unwrap(wrapped: dict) -> dict:
   return body if isinstance(body, dict) else {"code": -1, "error": body}
 
 
+def _fetch_error(name: str, wrapped: dict) -> str | None:
+  """返回传输或业务错误；对账只接受完整成功的响应。"""
+  body = wrapped.get("response")
+  code = body.get("code") if isinstance(body, dict) else None
+  data = body.get("data") if isinstance(body, dict) else None
+  if wrapped.get("ok") and code == 0 and isinstance(data, dict):
+    return None
+  detail = body.get("error") or body.get("msg") if isinstance(body, dict) else body
+  return f"{name}: HTTP={wrapped.get('status_code')} code={code} detail={str(detail)[:300]}"
+
+
 def _uid_from_jwt(token: str) -> str | None:
   """从 JWT payload 解析 uid（不验签，仅用于输出目录命名）。"""
   try:
@@ -393,6 +409,9 @@ def _uid_from_jwt(token: str) -> str | None:
 def main():
   parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
   parser.add_argument("--base-url", default=os.getenv("APP_SERVER_URL", "http://127.0.0.1:9001"))
+  parser.add_argument("--use-env-proxy", action="store_true", help="使用 HTTP_PROXY/HTTPS_PROXY 等环境代理")
+  parser.add_argument("--connect-timeout", type=float, default=6, help="建立 TCP 连接的超时秒数（默认 6）")
+  parser.add_argument("--connect-retries", type=int, default=2, help="连接超时重试次数（默认 2；不会重试读超时）")
   parser.add_argument("--host", default=None, help="user_server IP；传入后覆盖 --base-url")
   parser.add_argument("--port", type=int, default=9001)
   parser.add_argument("--jwt-token", default=os.getenv("JWT_TOKEN", ""))
@@ -409,6 +428,8 @@ def main():
   parser.add_argument("--sleep-data-count", type=int, default=30,
                       help="query_profile 携带最近 N 晚 sleep_data（默认 30；0=不拉）")
   args = parser.parse_args()
+  if args.connect_timeout <= 0 or args.connect_retries < 0:
+    parser.error("--connect-timeout must be positive and --connect-retries must be nonnegative")
 
   # uid 只用于输出目录命名/报告标注；带 jwt 时服务端按 token 里的 uid 取数，
   # 这里从 token payload 解析出真实 uid，避免目录名误标成默认 debug uid
@@ -421,30 +442,52 @@ def main():
     base_url = f"http://{args.host}:{args.port}" if args.host else args.base_url
   client = UserServerClient(
     base_url=base_url, jwt_token=args.jwt_token, uid=uid,
-    language=args.language, timezone=args.timezone,
+    language=args.language, timezone=args.timezone, use_env_proxy=args.use_env_proxy,
+    connect_timeout=args.connect_timeout, connect_retries=args.connect_retries,
   )
 
   out_dir = Path(args.out or f"out_analysis/{uid}_{int(time.time())}")
   out_dir.mkdir(parents=True, exist_ok=True)
 
   print(f"target: {base_url}  uid={uid}  date={args.date}")
-  profile_resp = _unwrap(client.query_profile(
+  profile_wrapped = client.query_profile(
     sleep_data_count=args.sleep_data_count, include_behaviors=False,
     include_sop_tag_profile=args.include_sop_tag_profile,
     include_sop_recommendation_details=args.include_sop_recommendation_details,
-  ))
-  profile = ((profile_resp.get("data") or {}).get("user_profile")) or {}
+  )
+  profile_resp = _unwrap(profile_wrapped)
+  fetch_errors = []
+  if error := _fetch_error("query_profile", profile_wrapped):
+    fetch_errors.append(error)
+  profile_data = profile_resp.get("data")
+  profile = profile_data.get("user_profile") if isinstance(profile_data, dict) else None
+  if profile_resp.get("code") == 0 and not isinstance(profile, dict):
+    fetch_errors.append("query_profile: response missing data.user_profile object")
+  profile = profile if isinstance(profile, dict) else {}
   (out_dir / "query_profile.json").write_text(json.dumps(profile_resp, ensure_ascii=False, indent=2))
 
   responses: dict[str, dict] = {}
   for rt in ANALYSIS_TYPES:
-    resp = _unwrap(client._analysis_request(rt, {"date": args.date}))
+    wrapped = client._analysis_request(rt, {"date": args.date})
+    resp = _unwrap(wrapped)
     responses[rt] = resp
     (out_dir / f"{rt}.json").write_text(json.dumps(resp, ensure_ascii=False, indent=2))
     code = resp.get("code")
-    print(f"  {rt}: code={code}, keys={sorted((resp.get('data') or {}).keys())}")
+    data = resp.get("data")
+    print(f"  {rt}: code={code}, keys={sorted(data) if isinstance(data, dict) else []}")
     if code != 0:
       print(f"    ⚠️ {json.dumps(resp, ensure_ascii=False)[:200]}")
+    if error := _fetch_error(rt, wrapped):
+      fetch_errors.append(error)
+
+  if fetch_errors:
+    error_path = out_dir / "FETCH_ERRORS.md"
+    error_path.write_text("# 数据拉取不完整，未进行对账\n\n" +
+                          "\n".join(f"- {error}" for error in fetch_errors) + "\n")
+    print(f"\n数据拉取不完整，未进行对账；错误详情: {error_path}", file=sys.stderr)
+    for error in fetch_errors:
+      print(f"  {error}", file=sys.stderr)
+    sys.exit(2)
 
   checker = run_checks(profile, responses, args.date, has_sleep_source=args.sleep_data_count > 0,
                        timezone=args.timezone, language=args.language)
