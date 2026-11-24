@@ -1,0 +1,254 @@
+[
+  {
+    "scenario_id": null,
+    "scenario_name": "sleep.scene.cocos_island_moonlight",
+    "stages": [
+      {
+        "cmd_name": "sleep.scene.cocos_island_moonlight",
+        "stage_name": null,
+        "audio_file": null,
+        "guide_file": null,
+        "light_scene": null,
+        "aroma_mode": null
+      }
+    ]
+  },
+  {
+    "scenario_id": null,
+    "scenario_name": "sleep.scene.amalfi_breeze",
+    "stages": [
+      {
+        "cmd_name": "sleep.scene.amalfi_breeze",
+        "stage_name": null,
+        "audio_file": null,
+        "guide_file": null,
+        "light_scene": null,
+        "aroma_mode": null
+      }
+    ]
+  },
+  {
+    "scenario_id": null,
+    "scenario_name": "sleep.scene.kyoto_forest",
+    "stages": [
+      {
+        "cmd_name": "sleep.scene.kyoto_forest",
+        "stage_name": null,
+        "audio_file": null,
+        "guide_file": null,
+        "light_scene": null,
+        "aroma_mode": null
+      }
+    ]
+  },
+  {
+    "scenario_id": null,
+    "scenario_name": "sleep.scene.andaman_rainforest_sanctuary",
+    "stages": [
+      {
+        "cmd_name": "sleep.scene.andaman_rainforest_sanctuary",
+        "stage_name": null,
+        "audio_file": null,
+        "guide_file": null,
+        "light_scene": null,
+        "aroma_mode": null
+      }
+    ]
+  },
+  {
+    "scenario_id": null,
+    "scenario_name": "sleep.scene.bhutan_misty_forest",
+    "stages": [
+      {
+        "cmd_name": "sleep.scene.bhutan_misty_forest",
+        "stage_name": null,
+        "audio_file": null,
+        "guide_file": null,
+        "light_scene": null,
+        "aroma_mode": null
+      }
+    ]
+  },
+  {
+    "scenario_id": null,
+    "scenario_name": "sleep.scene.sedona_red_rock_peace",
+    "stages": [
+      {
+        "cmd_name": "sleep.scene.sedona_red_rock_peace",
+        "stage_name": null,
+        "audio_file": null,
+        "guide_file": null,
+        "light_scene": null,
+        "aroma_mode": null
+      }
+    ]
+  },
+  {
+    "scenario_id": null,
+    "scenario_name": "sleep.scene.fogo_island_cookie_box",
+    "stages": [
+      {
+        "cmd_name": "sleep.scene.fogo_island_cookie_box",
+        "stage_name": null,
+        "audio_file": null,
+        "guide_file": null,
+        "light_scene": null,
+        "aroma_mode": null
+      }
+    ]
+  },
+  {
+    "scenario_id": null,
+    "scenario_name": "sleep.scene.seychelles_moonlight_lullaby",
+    "stages": [
+      {
+        "cmd_name": "sleep.scene.seychelles_moonlight_lullaby",
+        "stage_name": null,
+        "audio_file": null,
+        "guide_file": null,
+        "light_scene": null,
+        "aroma_mode": null
+      }
+    ]
+  },
+  {
+    "scenario_id": null,
+    "scenario_name": "sleep.pure_music.continous_rain",
+    "stages": [
+      {
+        "cmd_name": "sleep.pure_music.continous_rain",
+        "stage_name": null,
+        "audio_file": null,
+        "guide_file": null,
+        "light_scene": null,
+        "aroma_mode": null
+      }
+    ]
+  },
+  {
+    "scenario_id": null,
+    "scenario_name": "sleep.pure_music.jungle_rain",
+    "stages": [
+      {
+        "cmd_name": "sleep.pure_music.jungle_rain",
+        "stage_name": null,
+        "audio_file": null,
+        "guide_file": null,
+        "light_scene": null,
+        "aroma_mode": null
+      }
+    ]
+  },
+  {
+    "scenario_id": null,
+    "scenario_name": "sleep.pure_music.ocean_wave",
+    "stages": [
+      {
+        "cmd_name": "sleep.pure_music.ocean_wave",
+        "stage_name": null,
+        "audio_file": null,
+        "guide_file": null,
+        "light_scene": null,
+        "aroma_mode": null
+      }
+    ]
+  },
+  {
+    "scenario_id": null,
+    "scenario_name": "sleep.pure_music.babbling_brook",
+    "stages": [
+      {
+        "cmd_name": "sleep.pure_music.babbling_brook",
+        "stage_name": null,
+        "audio_file": null,
+        "guide_file": null,
+        "light_scene": null,
+        "aroma_mode": null
+      }
+    ]
+  },
+  {
+    "scenario_id": null,
+    "scenario_name": "sleep.pure_music.river_sound",
+    "stages": [
+      {
+        "cmd_name": "sleep.pure_music.river_sound",
+        "stage_name": null,
+        "audio_file": null,
+        "guide_file": null,
+        "light_scene": null,
+        "aroma_mode": null
+      }
+    ]
+  },
+  {
+    "scenario_id": null,
+    "scenario_name": "sleep.pure_music.birds_chirping",
+    "stages": [
+      {
+        "cmd_name": "sleep.pure_music.birds_chirping",
+        "stage_name": null,
+        "audio_file": null,
+        "guide_file": null,
+        "light_scene": null,
+        "aroma_mode": null
+      }
+    ]
+  },
+  {
+    "scenario_id": null,
+    "scenario_name": "sleep.pure_music.campfire",
+    "stages": [
+      {
+        "cmd_name": "sleep.pure_music.campfire",
+        "stage_name": null,
+        "audio_file": null,
+        "guide_file": null,
+        "light_scene": null,
+        "aroma_mode": null
+      }
+    ]
+  },
+  {
+    "scenario_id": null,
+    "scenario_name": "sleep.scene.bhutan_snow_peak_chant",
+    "stages": [
+      {
+        "cmd_name": "sleep.scene.bhutan_snow_peak_chant",
+        "stage_name": null,
+        "audio_file": null,
+        "guide_file": null,
+        "light_scene": null,
+        "aroma_mode": null
+      }
+    ]
+  },
+  {
+    "scenario_id": null,
+    "scenario_name": "sleep.scene.taupo_misty_valley",
+    "stages": [
+      {
+        "cmd_name": "sleep.scene.taupo_misty_valley",
+        "stage_name": null,
+        "audio_file": null,
+        "guide_file": null,
+        "light_scene": null,
+        "aroma_mode": null
+      }
+    ]
+  },
+  {
+    "scenario_id": null,
+    "scenario_name": "sleep.scene.golden_dune_mirage",
+    "stages": [
+      {
+        "cmd_name": "sleep.scene.golden_dune_mirage",
+        "stage_name": null,
+        "audio_file": null,
+        "guide_file": null,
+        "light_scene": null,
+        "aroma_mode": null
+      }
+    ]
+  }
+]

@@ -1,0 +1,19 @@
+[Unit]
+Description=Mindora auth_server (FastAPI, port 9103)
+After=network-online.target mysql.service redis-server.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/server/mindora_user
+EnvironmentFile=/etc/mindora/mindora.env
+EnvironmentFile=/etc/mindora/mindora-auth.env
+ExecStart=/root/server/mindora_py/bin/python /root/server/mindora_user/auth_server.py
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

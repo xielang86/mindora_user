@@ -24,6 +24,7 @@ from analysis_content import AnalysisContentService, explore_input_fingerprint, 
 from config import Config
 from common.jwt_keys import verify_token
 from profile_service import UserProfileServ
+from sop_ranking import short_play_refresh_due
 from profile_repository import PARTS, DEVICE_PARTS
 from user_profile import (
   UserProfile, ProfileRequest, ProfileResponse, ProfileData,
@@ -655,9 +656,8 @@ class UserServer:
     """三态开关 + 醒后自动触发的决策层。
 
     skip_* 语义：True=客户端要求跳过；False=客户端要求立即强制（跳过防抖）；
-    None=服务端自动——有未分析的新夜晚且活跃门通过（窗口内有 /analysis 请求
-    或 plays 事件）才调度，带防抖等零散包落地。纯设备后台同步、app 不活跃的
-    用户不做预生成（他们打开分析页时由读路径懒触发兜底）。
+    None=服务端自动。有未分析的新夜晚且活跃门通过时预生成分析；
+    当前推荐有新的重复短播时，也可独立刷新推荐。自动任务带防抖。
     """
     auto_needed, newest_ts = False, None
     if Config.LLM_ANALYSIS_AUTO_TRIGGER:
@@ -673,13 +673,15 @@ class UserServer:
     # 睡前建议独立按七天检查；即使本次没有新的睡眠夜晚，也可单独调度。
     run_advice = bool(profile is not None and bedtime_advice_due(profile, language=_profile_language(profile))
                       and getattr(self, "llm", None) and self.llm.enabled)
-    run_reco = skip_reco is False or (auto_needed and skip_reco is not True)
+    feedback_due = (skip_reco is None and Config.ENABLE_SLEEP_RECO
+                    and short_play_refresh_due(profile, int(time.time())))
+    run_reco = skip_reco is False or (skip_reco is None and (auto_needed or feedback_due))
     run_analysis = skip_analysis is False or (auto_needed and skip_analysis is not True)
     if not (run_reco or run_analysis or run_advice):
       return
 
     forced = skip_reco is False or skip_analysis is False
-    delay = 0 if forced or (run_advice and not auto_needed) else Config.LLM_ANALYSIS_DEBOUNCE_SECONDS
+    delay = 0 if forced or (run_advice and not auto_needed and not feedback_due) else Config.LLM_ANALYSIS_DEBOUNCE_SECONDS
     if auto_needed and newest_ts is not None:
       self._llm_last_attempt[uid] = newest_ts
     await self._schedule_llm_update_if_needed(uid, not run_reco, not run_analysis, delay=delay)

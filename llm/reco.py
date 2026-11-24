@@ -129,7 +129,6 @@ _SOP_SYSTEM_PROMPT = (
     "You are Mindora's sleep intervention recommender. "
     "Return ONLY JSON with the exact field names requested. "
     "Choose SOP process ids only from the given candidate list. "
-    "Do not choose any pure_music candidate. "
     "Do not invent new field names, do not add commentary, and do not include markdown fences."
 )
 
@@ -211,7 +210,7 @@ def _load_text(path: str) -> str:
         return ""
 
 
-def _build_prompt(profile: UserProfile) -> str:
+def _build_prompt(profile: UserProfile, candidates=_SCENARIO_CANDIDATES) -> str:
     knowledge = _load_text(_KNOWLEDGE_BASE_PATH)
     topology = _load_text(_TOPOLOGY_PATH)
     return f"""
@@ -228,7 +227,7 @@ Sleep strategy topology:
 {topology}
 
 Scenario candidates:
-{json.dumps(_SCENARIO_CANDIDATES, ensure_ascii=False, indent=2)}
+{json.dumps(candidates, ensure_ascii=False, indent=2)}
 
 Task:
 1. Read the user's CURRENT sleep analysis and advice above (onset / structure / night fluctuations / scene association). Pick scenarios that best match their current sleep pattern and the advice already given.
@@ -323,10 +322,11 @@ def _sleep_analysis_summary(profile: UserProfile, lang: str) -> str:
     return "\n".join(lines)
 
 
-def _build_sop_reco_prompt(profile: UserProfile, candidates: List[str]) -> str:
+def _build_sop_reco_prompt(profile: UserProfile, candidates: List[str], count: Optional[int] = None) -> str:
     from content_tags import candidate_metadata
     knowledge = _load_text(_KNOWLEDGE_BASE_PATH)
     topology = _load_text(_TOPOLOGY_PATH)
+    count = min(3, len(candidates)) if count is None else count
     return f"""
 User profile JSON:
 {_summarize_profile_for_prompt(profile)}
@@ -351,9 +351,9 @@ annotations, not user outcomes. Guide variants are not confirmed played.
 
 Task:
 1. Read the user's CURRENT sleep analysis and advice above (onset / structure / night fluctuations / scene association). Pick SOP processes that best match their current sleep pattern and the advice already given — e.g. slow onset → stronger relaxation/induction; frequent awakenings → steadier deep-stage sound; a well-associated scene → keep its acoustic style.
-2. Select the best 3 SOP process candidates from the provided candidate list, ordered by fit (first = best).
+2. Return exactly {count} distinct SOP process candidates from the list, ordered by fit (first = best).
 3. You may reorder candidates, but every returned value must come from the candidate list.
-4. Do not return any `sleep.pure_music.*` candidate. Restrict the result to guided `sleep.scene.*` candidates only.
+4. Consider both guided scenes and pure music. Pure music provides ambient sound without spoken guidance.
 5. Keep the output schema exactly compatible with this JSON structure:
 {{
   "scenarios": [
@@ -374,7 +374,7 @@ Task:
   ]
 }}
 6. Only set `cmd_name`; all other fields should be null.
-7. Return up to 3 SOP process ids in ranked order, or all candidates if fewer than 3 are available.
+7. Repeated short plays are a weak signal of lower interest. Interruption and automatic stops can also cause short plays.
 """
 
 
@@ -469,10 +469,6 @@ def _validate_scenarios(payload: Any) -> List[SleepScenario]:
     return scenarios
 
 
-def _fallback_scenarios() -> List[SleepScenario]:
-    return [SleepScenario.model_validate(item) for item in _SCENARIO_CANDIDATES[:2]]
-
-
 def _default_sop_candidates() -> List[str]:
     profile_candidates = [
         short_scene_id(key)
@@ -502,7 +498,7 @@ def _load_sop_candidate_scenarios() -> List[SleepScenario]:
             logging.warning("invalid SOP candidate in %s: %s item=%s", _SOP_CANDIDATES_PATH, e, item)
             continue
         cmd_name = _extract_sop_cmd_name(scenario)
-        if cmd_name is None or _is_pure_music_cmd(cmd_name):
+        if cmd_name is None:
             continue
         scenarios.append(scenario)
     return scenarios
@@ -549,10 +545,6 @@ def _extract_sop_cmd_name(item: Any) -> Optional[str]:
     return None
 
 
-def _is_pure_music_cmd(cmd_name: Optional[str]) -> bool:
-    return isinstance(cmd_name, str) and cmd_name.startswith("sleep.pure_music.")
-
-
 def _validate_sop_reco(payload: Any, candidates: List[SleepScenario]) -> List[SleepScenario]:
     if isinstance(payload, dict):
         payload = payload.get("scenarios", [])
@@ -562,15 +554,13 @@ def _validate_sop_reco(payload: Any, candidates: List[SleepScenario]) -> List[Sl
     candidate_map = {}
     for scenario in candidates:
         cmd_name = _extract_sop_cmd_name(scenario)
-        if cmd_name is not None and not _is_pure_music_cmd(cmd_name):
+        if cmd_name is not None:
             candidate_map[cmd_name] = scenario
 
     reco: List[SleepScenario] = []
     seen_cmd_names: set[str] = set()
     for item in payload:
         cmd_name = _extract_sop_cmd_name(item)
-        if cmd_name is None or _is_pure_music_cmd(cmd_name):
-            continue
         if cmd_name not in candidate_map or cmd_name in seen_cmd_names:
             continue
         reco.append(_clone_sleep_scenario(candidate_map[cmd_name]))
@@ -611,12 +601,35 @@ class RecommendationEngine:
 
     @staticmethod
     def generate(profile: UserProfile) -> List[SleepScenario]:
-        prompt = _build_prompt(profile)
-        scenarios, _route = _invoke_recommendation(prompt, _SYSTEM_PROMPT, "sleep_scenario_reco", _validate_scenarios, 2)
-        return scenarios if scenarios is not None else _fallback_scenarios()
+        from sop_ranking import recent_play_feedback, rules
+        from content_tags import canonical_cmd
+
+        feedback = recent_play_feedback(profile, int(time.time()))
+        threshold = rules()["play_feedback"]["minimum_short_plays"]
+        eligible = []
+        deferred = []
+        for candidate in _SCENARIO_CANDIDATES:
+            cmd = canonical_cmd(_extract_sop_cmd_name(candidate))
+            counts = feedback.get(cmd)
+            if counts and counts["short_plays"] >= threshold and counts["short_plays"] * 2 >= counts["plays"]:
+                deferred.append(candidate)
+            else:
+                eligible.append(candidate)
+        eligible.extend(deferred[:max(0, 2 - len(eligible))])
+        by_id = {candidate["scenario_id"]: SleepScenario.model_validate(candidate) for candidate in eligible}
+
+        def validate(payload):
+            selected_ids = dict.fromkeys(s.scenario_id for s in _validate_scenarios(payload))
+            return [by_id[scenario_id] for scenario_id in selected_ids if scenario_id in by_id]
+
+        scenarios, _route = _invoke_recommendation(
+            _build_prompt(profile, eligible), _SYSTEM_PROMPT, "sleep_scenario_reco", validate, 2
+        )
+        return scenarios if scenarios is not None else list(by_id.values())[:2]
 
     @staticmethod
-    def generate_sop_reco(profile: UserProfile, candidates: Optional[List[str]] = None) -> List[SleepScenario]:
+    def generate_sop_reco(profile: UserProfile, candidates: Optional[List[str]] = None,
+                          *, uid: Optional[str] = None) -> List[SleepScenario]:
         file_candidates = _load_sop_candidate_scenarios()
         candidate_scenarios = file_candidates
         if not candidate_scenarios:
@@ -626,39 +639,54 @@ class RecommendationEngine:
             candidate_scenarios = [_build_sop_reco_scenario(item) for item in _default_sop_candidates()]
 
         from content_tags import canonical_cmd
-        from sop_ranking import rank_sops, rules
+        from sop_ranking import exploration_candidate, rank_sops, rules
 
         # Normalize and deduplicate at the execution seam, including fallback inputs.
         unique = {}
         for scenario in candidate_scenarios:
             cmd = _extract_sop_cmd_name(scenario)
-            if cmd and not _is_pure_music_cmd(cmd) and canonical_cmd(cmd).startswith("sleep.scene."):
-                unique.setdefault(canonical_cmd(cmd), scenario)
+            if not cmd:
+                continue
+            canonical = canonical_cmd(cmd)
+            if canonical.startswith("sleep.pure_music.") and cmd != canonical:
+                scenario = _build_sop_reco_scenario(canonical)
+            if canonical.startswith(("sleep.scene.", "sleep.pure_music.")):
+                unique.setdefault(canonical, scenario)
         candidate_scenarios = list(unique.values())
         commands = [_extract_sop_cmd_name(s) for s in candidate_scenarios]
-        ranking = rank_sops(profile, commands)
+        now = int(time.time())
+        ranking = rank_sops(profile, commands, now=now)
         candidate_map = {_extract_sop_cmd_name(s): s for s in candidate_scenarios}
-        ranked_candidates = [candidate_map[row["cmd_name"]] for row in ranking]
+        explore = exploration_candidate(ranking, uid, now)
+        exploit = [row for row in ranking if row is not explore]
+        shortlist = exploit[:6]
+        count = min(2 if explore else 3, len(shortlist))
         details = {
-            "rules_version": rules()["version"], "generated_at": int(time.time()),
+            "rules_version": rules()["version"], "generated_at": now,
             "basis": "current_profile_snapshot", "ranking": ranking,
-            "historical": sorted([r for r in ranking if any(e["type"] in ("explicit_preference", "outcome_association")
+            "historical": sorted([r for r in ranking if any(e["type"] in ("explicit_preference", "outcome_association", "repeated_short_play")
                 for e in r["evidence"])], key=lambda r: -r["historical_score"])[:3],
-            "current": ranking[:3], "llm_route": None, "selection_method": "rules",
+            "current": [], "llm_route": None, "selection_method": "rules",
+            "exploration": {"slot": 3, "cmd_name": explore["cmd_name"]} if explore else None,
+            "llm_candidate_commands": [row["cmd_name"] for row in shortlist],
             "limitations": ["Outcome scores describe associations, not causal improvement.",
-                            "Exposure is not preference; unavailable feedback contributes zero.",
+                            "Recorded starts are not recommendation impressions. Short plays may reflect interruptions.",
                             "Profile goals are not a separately collected daily state."]}
         profile.sop_recommendation_details = details
         details["historical_status"] = "available" if details["historical"] else "insufficient_evidence"
-        if not ranked_candidates:
+        if not shortlist:
             return []
-        prompt = _build_sop_reco_prompt(profile, [row["cmd_name"] for row in ranking])
-        prompt += "\nRule ranking evidence (higher scores take priority):\n" + json.dumps(ranking, ensure_ascii=False)
-        prompt += f"\nReturn exactly {min(3, len(ranking))} distinct candidates. Use content fit to resolve equal rule scores."
+        prompt = _build_sop_reco_prompt(profile, details["llm_candidate_commands"], count)
+        prompt += "\nRule ranking evidence (higher scores take priority; use content fit to break ties):\n"
+        prompt += json.dumps(shortlist, ensure_ascii=False)
+        ranked_candidates = [candidate_map[row["cmd_name"]] for row in shortlist]
         proposed, route = _invoke_recommendation(prompt, _SOP_SYSTEM_PROMPT, "sleep_sop_reco",
-            lambda payload: _validate_sop_reco(payload, ranked_candidates), min(3, len(ranking)))
+            lambda payload: _validate_sop_reco(payload, ranked_candidates), count)
         if proposed is not None:
             llm_order = {_extract_sop_cmd_name(s): i for i, s in enumerate(proposed)}
             ranking = sorted(ranking, key=lambda r: (-r["score"], llm_order.get(r["cmd_name"], len(ranking))))
-            details.update(llm_route=route, selection_method="rules_with_llm_tiebreak", ranking=ranking, current=ranking[:3])
-        return [_clone_sleep_scenario(candidate_map[row["cmd_name"]]) for row in ranking[:3]]
+            exploit = [row for row in ranking if row is not explore]
+            details.update(llm_route=route, selection_method="rules_with_llm_tiebreak", ranking=ranking)
+        selected = exploit[:count] + ([explore] if explore else [])
+        details["current"] = selected
+        return [_clone_sleep_scenario(candidate_map[row["cmd_name"]]) for row in selected]

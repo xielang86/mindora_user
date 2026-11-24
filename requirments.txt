@@ -1,0 +1,13 @@
+aiohttp
+plyvel
+websockets
+pydantic[email]
+pyjwt
+pymysql
+redis
+python-dotenv
+DBUtils
+app-store-server-library
+requests
+cryptography
+langchain_core

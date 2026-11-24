@@ -1,0 +1,47 @@
+{
+  "version": "sop-tags-v2",
+  "play_feedback": {
+    "lookback_days": 14,
+    "minimum_duration_seconds": 3,
+    "short_duration_seconds": 30,
+    "minimum_short_plays": 2,
+    "short_play_weight": 8,
+    "maximum_penalty": 20,
+    "refresh_min_interval_seconds": 21600,
+    "refresh_max_event_age_seconds": 86400
+  },
+  "exploration": {
+    "probability": 0.25,
+    "max_score_gap": 12,
+    "device_commands": [
+      "sleep.scene.cocos_island_moonlight",
+      "sleep.scene.amalfi_breeze",
+      "sleep.scene.kyoto_forest",
+      "sleep.scene.andaman_rainforest_sanctuary",
+      "sleep.scene.bhutan_misty_forest",
+      "sleep.scene.sedona_red_rock_peace",
+      "sleep.scene.fogo_island_cookie_box",
+      "sleep.pure_music.continous_rain",
+      "sleep.pure_music.jungle_rain",
+      "sleep.pure_music.ocean_wave",
+      "sleep.pure_music.babbling_brook",
+      "sleep.pure_music.river_sound",
+      "sleep.pure_music.birds_chirping",
+      "sleep.pure_music.campfire"
+    ]
+  },
+  "minimum_outcome_samples": 3,
+  "minimum_baseline_nights": 3,
+  "goals": [
+    {"id": "sleep_onset", "profile_terms": ["sleep_type_ONSET", "入睡困难", "入睡时间", "入睡时长"], "tag_terms": ["guidance:呼吸", "guidance:身体扫描", "guidance:下沉入睡", "goal:平静入睡"], "weight": 12},
+    {"id": "relaxation", "profile_terms": ["压力", "紧张", "stress_level_high", "stress_level_severe"], "tag_terms": ["goal:减压", "goal:焦虑安抚", "goal:压力", "guidance:释放"], "weight": 12},
+    {"id": "sleep_continuity", "profile_terms": ["夜醒", "易醒", "sleep_type_MAINTENANCE"], "tag_terms": ["continuity:连续型", "continuity:连续稳定", "density_stimulation:低刺激", "goal:安全感"], "weight": 12}
+  ],
+  "sensitive_sound_terms": ["sensitivity_noise_sensitive", "sensitivity_sound_sensitive"],
+  "sensitive_sound_penalty": 10,
+  "sensitive_unknown_content_penalty": 25,
+  "stimulating_tag_terms": ["density_stimulation:中刺激", "density_stimulation:高刺激", "continuity:间歇", "continuity:点状"],
+  "outcome_scales": {"sleep_quality": 20, "onset_minutes": 20},
+  "outcome_weight": 15,
+  "preference_weight": 15
+}

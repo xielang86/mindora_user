@@ -1,0 +1,19 @@
+[Unit]
+Description=Mindora ops admin server (port 9200)
+# 依赖 auth（登录/角色校验）与 user_server（问卷记录/消息发布）
+After=network-online.target mindora-auth.service mindora-user.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/server/mindora_user
+EnvironmentFile=/etc/mindora/mindora.env
+ExecStart=/root/server/mindora_py/bin/python /root/server/mindora_user/ops_admin_server.py
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

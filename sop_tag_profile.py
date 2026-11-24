@@ -1,6 +1,28 @@
 """Rebuild bounded history evidence, keeping exposure, preference and outcomes separate."""
 from collections import defaultdict
 from content_tags import canonical_cmd, catalog_by_command
+from user_profile import SCENE_CMD_PREFIXES
+
+
+def sop_play_events(plays):
+    """Yield the command, start timestamp and payload of a reported SOP play."""
+    if not isinstance(plays, list):
+        return
+    for item in plays:
+        if not isinstance(item, (list, tuple)) or len(item) < 2:
+            continue
+        timestamp, event = item[:2]
+        if not isinstance(event, dict) or event.get("event") != "sop_start":
+            continue
+        cmd = event.get("cmd")
+        if not isinstance(cmd, str) or not cmd.startswith(SCENE_CMD_PREFIXES):
+            continue
+        try:
+            started = int(timestamp)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if started > 0:
+            yield cmd, started, event
 
 
 def rebuild_sop_tag_profile(profile):

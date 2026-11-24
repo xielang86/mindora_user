@@ -36,11 +36,11 @@ from engagement_service import EngagementService
 from profile_repository import ProfileRepository, PARTS, ANALYSIS_PARTS, ANALYSIS_PARTS_BY_TYPE
 from llm import SleepAnalysisLLM
 from user_profile import (
-  UserProfile, SleepScenario, Profile, SCENE_CMD_PREFIXES, short_scene_id,
+  UserProfile, SleepScenario, Profile, short_scene_id,
   ENGAGEMENT_RESPONSE_KEYS, keep_latest_engagement, active_sleep_plan,
   bedtime_advice_due,
 )
-from sop_tag_profile import rebuild_sop_tag_profile
+from sop_tag_profile import rebuild_sop_tag_profile, sop_play_events
 
 run_dir = os.getenv("RUN_DIR") or os.path.dirname(os.path.abspath(__file__))
 
@@ -756,35 +756,6 @@ class UserProfileServ:
     ]
 
   @staticmethod
-  def _extract_sop_start_events(plays: list) -> list[tuple[str, int, dict]]:
-    """Extract SOP start events from a plays list.
-
-    引导式场景（sleep.scene.）与纯音乐（sleep.pure_music. / 裸 pure_music.）都计入；
-    纯音乐不进推荐候选（reco.py 另有过滤），但播放统计与场景同口径。
-
-    Returns tuples of (cmd, timestamp, event_dict).
-    """
-    events: list[tuple[str, int, dict]] = []
-    if not isinstance(plays, list):
-      return events
-    for item in plays:
-      if not isinstance(item, (list, tuple)) or len(item) < 2:
-        continue
-      ts, event = item
-      if not isinstance(event, dict):
-        continue
-      cmd = event.get("cmd")
-      event_type = event.get("event")
-      if isinstance(cmd, str) and cmd.startswith(SCENE_CMD_PREFIXES) and event_type == "sop_start":
-        try:
-          started = int(ts)
-        except (TypeError, ValueError, OverflowError):
-          continue
-        if started > 0:
-          events.append((cmd, started, event))
-    return events
-
-  @staticmethod
   def _sleep_usage_windows(profile: UserProfile) -> list[tuple[int, int]]:
     """Stage-defined nights; SleepResult.timestamp can be an upload timestamp."""
     from sleep_metrics import score_stage_summary
@@ -806,7 +777,7 @@ class UserProfileServ:
     if not windows:
       return
     plays = profile.behaviors.get("plays", [])
-    for cmd, ts, event in self._extract_sop_start_events(plays):
+    for cmd, ts, event in sop_play_events(plays):
       try:
         duration = float(event.get("duration"))
       except (TypeError, ValueError, OverflowError):
@@ -1087,11 +1058,8 @@ class UserProfileServ:
     return sleep_scenarios
 
   def calc_standard_sop_reco(self, uid: str, new_profile: UserProfile, old_profile: UserProfile) -> List[SleepScenario]:
-    sop_reco = old_profile.standard_sop_reco
-    candidates = []
-    logging.info(f"Rerunning standard SOP recommendation for {uid} with candidates={candidates}")
-    sop_reco = RecommendationEngine.generate_sop_reco(new_profile, candidates)
-    return sop_reco
+    logging.info("Rerunning standard SOP recommendation for %s", uid)
+    return RecommendationEngine.generate_sop_reco(new_profile, uid=uid)
 
   # -------------------- 更新路径 --------------------
   @staticmethod

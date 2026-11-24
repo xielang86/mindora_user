@@ -1,0 +1,260 @@
+{
+  "next_query_after": 300,
+  "popups": [
+    {
+      "popup_id": "pop_20260730_survey_02",
+      "type": "survey",
+      "placement": "home",
+      "start_at": 1786000000,
+      "end_at": 1893456000,
+      "priority": 100,
+      "display_rule": {
+        "max_show_count": 3,
+        "cooldown_seconds": 86400,
+        "dismiss_stops": true
+      },
+      "action_type": "survey",
+      "action_payload": {
+        "survey_id": "sv_sleep_2026q3"
+      },
+      "image_url": "",
+      "push_message": true,
+      "i18n": {
+        "zh-Hans": {
+          "badge": "参与调研",
+          "badge_style": "purple",
+          "title": "帮助我们做得更好",
+          "subtitle": "完成 3 分钟睡眠体验问卷，提交后可获得会员积分。",
+          "action_text": "查看详情"
+        },
+        "en": {
+          "badge": "Survey",
+          "badge_style": "purple",
+          "title": "Help Us Improve",
+          "subtitle": "Take a 3-minute sleep experience survey and earn member points.",
+          "action_text": "View Details"
+        }
+      }
+    }
+  ],
+  "surveys": {
+    "sv_sleep_2026q3": {
+      "survey_id": "sv_sleep_2026q3",
+      "i18n": {
+        "zh-Hans": {
+          "title": "睡眠体验问卷",
+          "questions": [
+            {
+              "question_id": "q1",
+              "index": 1,
+              "type": "single_choice",
+              "title": "最近 7 天，你对自己的整体睡眠满意度如何？",
+              "hint": "请选择一个最符合你感受的答案",
+              "options": [
+                {
+                  "option_id": "o1",
+                  "text": "非常满意"
+                },
+                {
+                  "option_id": "o2",
+                  "text": "比较满意"
+                },
+                {
+                  "option_id": "o3",
+                  "text": "一般"
+                },
+                {
+                  "option_id": "o4",
+                  "text": "不太满意"
+                },
+                {
+                  "option_id": "o5",
+                  "text": "非常不满意"
+                }
+              ]
+            },
+            {
+              "question_id": "q2",
+              "index": 2,
+              "type": "single_choice",
+              "title": "最近 7 天，你对 Mindora 的整体满意度如何？",
+              "hint": "请选择一个最符合你感受的答案",
+              "options": [
+                {
+                  "option_id": "o1",
+                  "text": "非常满意"
+                },
+                {
+                  "option_id": "o2",
+                  "text": "比较满意"
+                },
+                {
+                  "option_id": "o3",
+                  "text": "一般"
+                },
+                {
+                  "option_id": "o4",
+                  "text": "不太满意"
+                },
+                {
+                  "option_id": "o5",
+                  "text": "非常不满意"
+                }
+              ]
+            },
+            {
+              "question_id": "q3",
+              "index": 3,
+              "type": "text",
+              "title": "你对 Mindora 有什么改进意见吗？",
+              "hint": "请填写你的建议",
+              "placeholder": "请输入…",
+              "required": false
+            }
+          ],
+          "reward": {
+            "gift_type": "physical",
+            "gift_name": "品牌睡眠好礼",
+            "desc": "礼品会在 10 个工作日内发出，我们会以邮件的方式通知您。",
+            "contact_email": "support@mindora316.com"
+          },
+          "reward_title": "问卷奖励"
+        },
+        "en": {
+          "title": "Sleep Experience Survey",
+          "questions": [
+            {
+              "question_id": "q1",
+              "index": 1,
+              "type": "single_choice",
+              "title": "Over the past 7 days, how satisfied are you with your overall sleep?",
+              "hint": "Pick the answer that best matches how you feel",
+              "options": [
+                {
+                  "option_id": "o1",
+                  "text": "Very satisfied"
+                },
+                {
+                  "option_id": "o2",
+                  "text": "Satisfied"
+                },
+                {
+                  "option_id": "o3",
+                  "text": "Neutral"
+                },
+                {
+                  "option_id": "o4",
+                  "text": "Dissatisfied"
+                },
+                {
+                  "option_id": "o5",
+                  "text": "Very dissatisfied"
+                }
+              ]
+            },
+            {
+              "question_id": "q2",
+              "index": 2,
+              "type": "single_choice",
+              "title": "Over the past 7 days, how satisfied are you with Mindora overall?",
+              "hint": "Pick the answer that best matches how you feel",
+              "options": [
+                {
+                  "option_id": "o1",
+                  "text": "Very satisfied"
+                },
+                {
+                  "option_id": "o2",
+                  "text": "Satisfied"
+                },
+                {
+                  "option_id": "o3",
+                  "text": "Neutral"
+                },
+                {
+                  "option_id": "o4",
+                  "text": "Dissatisfied"
+                },
+                {
+                  "option_id": "o5",
+                  "text": "Very dissatisfied"
+                }
+              ]
+            },
+            {
+              "question_id": "q3",
+              "index": 3,
+              "type": "text",
+              "title": "Any suggestions to help us improve Mindora?",
+              "hint": "Share your thoughts",
+              "placeholder": "Type here…",
+              "required": false
+            }
+          ],
+          "reward": {
+            "gift_type": "physical",
+            "gift_name": "Mindora Sleep Gift",
+            "desc": "Your gift will be shipped within 10 business days. We will notify you by email.",
+            "contact_email": "support@mindora316.com"
+          },
+          "reward_title": "Survey Reward"
+        }
+      }
+    },
+    "sv_202608_01": {
+      "survey_id": "sv_202608_01",
+      "i18n": {
+        "zh-Hans": {
+          "title": "测试0828",
+          "questions": [
+            {
+              "question_id": "q1",
+              "index": 1,
+              "type": "single_choice",
+              "title": "你是谁",
+              "options": [
+                {
+                  "option_id": "o1",
+                  "text": "super man"
+                },
+                {
+                  "option_id": "o2",
+                  "text": "shit"
+                }
+              ]
+            },
+            {
+              "question_id": "q2",
+              "index": 2,
+              "type": "multi_choice",
+              "title": "你从哪儿来",
+              "options": [
+                {
+                  "option_id": "o1",
+                  "text": "地狱"
+                },
+                {
+                  "option_id": "o2",
+                  "text": "绝情谷"
+                }
+              ]
+            },
+            {
+              "question_id": "q3",
+              "index": 3,
+              "type": "text",
+              "title": "你要去哪里",
+              "placeholder": "远方",
+              "required": false
+            }
+          ],
+          "reward": {
+            "gift_type": "virtual",
+            "gift_name": "智商卡",
+            "desc": "成功提升智商10个点"
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,279 @@
+{
+  "complete": {
+    "timestamp": 1790046904,
+    "onset": null,
+    "soe": null,
+    "sleep_quality": 95.2,
+    "sleep_arch_index": 88.0,
+    "night_var_index": 40.5,
+    "first_sleep_time": null,
+    "bed_time": "02:18",
+    "wake_time": "11:15",
+    "hr_min": 49.0,
+    "hr_max": 72.0,
+    "source": "healthkit",
+    "sleep_status": [
+      {
+        "start_time": 1790014727,
+        "duration": 3.5,
+        "sleep_type": "core"
+      },
+      {
+        "start_time": 1790014938,
+        "duration": 5.5,
+        "sleep_type": "awake"
+      },
+      {
+        "start_time": 1790015268,
+        "duration": 25.53,
+        "sleep_type": "core"
+      },
+      {
+        "start_time": 1790016800,
+        "duration": 1.5,
+        "sleep_type": "deep"
+      },
+      {
+        "start_time": 1790016890,
+        "duration": 3.5,
+        "sleep_type": "core"
+      },
+      {
+        "start_time": 1790017101,
+        "duration": 0.5,
+        "sleep_type": "deep"
+      },
+      {
+        "start_time": 1790017131,
+        "duration": 4.5,
+        "sleep_type": "core"
+      },
+      {
+        "start_time": 1790017401,
+        "duration": 12.52,
+        "sleep_type": "rem"
+      },
+      {
+        "start_time": 1790018152,
+        "duration": 19.02,
+        "sleep_type": "core"
+      },
+      {
+        "start_time": 1790019294,
+        "duration": 37.05,
+        "sleep_type": "deep"
+      },
+      {
+        "start_time": 1790021517,
+        "duration": 1.0,
+        "sleep_type": "awake"
+      },
+      {
+        "start_time": 1790021578,
+        "duration": 4.5,
+        "sleep_type": "core"
+      },
+      {
+        "start_time": 1790021848,
+        "duration": 12.02,
+        "sleep_type": "rem"
+      },
+      {
+        "start_time": 1790022569,
+        "duration": 3.0,
+        "sleep_type": "awake"
+      },
+      {
+        "start_time": 1790022749,
+        "duration": 55.07,
+        "sleep_type": "core"
+      },
+      {
+        "start_time": 1790026054,
+        "duration": 2.5,
+        "sleep_type": "deep"
+      },
+      {
+        "start_time": 1790026204,
+        "duration": 3.0,
+        "sleep_type": "awake"
+      },
+      {
+        "start_time": 1790026385,
+        "duration": 8.5,
+        "sleep_type": "core"
+      },
+      {
+        "start_time": 1790026895,
+        "duration": 18.02,
+        "sleep_type": "rem"
+      },
+      {
+        "start_time": 1790027977,
+        "duration": 54.57,
+        "sleep_type": "core"
+      },
+      {
+        "start_time": 1790031252,
+        "duration": 31.53,
+        "sleep_type": "rem"
+      },
+      {
+        "start_time": 1790033145,
+        "duration": 1.0,
+        "sleep_type": "awake"
+      },
+      {
+        "start_time": 1790033205,
+        "duration": 19.02,
+        "sleep_type": "core"
+      },
+      {
+        "start_time": 1790034346,
+        "duration": 2.0,
+        "sleep_type": "awake"
+      },
+      {
+        "start_time": 1790034467,
+        "duration": 31.53,
+        "sleep_type": "core"
+      },
+      {
+        "start_time": 1790036359,
+        "duration": 40.05,
+        "sleep_type": "rem"
+      },
+      {
+        "start_time": 1790038763,
+        "duration": 33.03,
+        "sleep_type": "core"
+      },
+      {
+        "start_time": 1790040746,
+        "duration": 27.53,
+        "sleep_type": "rem"
+      },
+      {
+        "start_time": 1790042399,
+        "duration": 3.0,
+        "sleep_type": "awake"
+      },
+      {
+        "start_time": 1790042579,
+        "duration": 62.58,
+        "sleep_type": "core"
+      },
+      {
+        "start_time": 1790046334,
+        "duration": 9.5,
+        "sleep_type": "rem"
+      }
+    ]
+  },
+  "missing_core": {
+    "timestamp": 1790046904,
+    "onset": 44.0,
+    "soe": 57.5,
+    "sleep_quality": 37.9,
+    "sleep_arch_index": 45.0,
+    "night_var_index": 35.2,
+    "first_sleep_time": "03:06",
+    "bed_time": "02:22",
+    "wake_time": "11:15",
+    "hr_min": null,
+    "hr_max": null,
+    "source": "healthkit",
+    "sleep_status": [
+      {
+        "start_time": 1790014938,
+        "duration": 5.5,
+        "sleep_type": "awake"
+      },
+      {
+        "start_time": 1790016800,
+        "duration": 1.5,
+        "sleep_type": "deep"
+      },
+      {
+        "start_time": 1790017101,
+        "duration": 0.5,
+        "sleep_type": "deep"
+      },
+      {
+        "start_time": 1790017401,
+        "duration": 12.52,
+        "sleep_type": "rem"
+      },
+      {
+        "start_time": 1790019294,
+        "duration": 37.05,
+        "sleep_type": "deep"
+      },
+      {
+        "start_time": 1790021517,
+        "duration": 1.0,
+        "sleep_type": "awake"
+      },
+      {
+        "start_time": 1790021848,
+        "duration": 12.02,
+        "sleep_type": "rem"
+      },
+      {
+        "start_time": 1790022569,
+        "duration": 3.0,
+        "sleep_type": "awake"
+      },
+      {
+        "start_time": 1790026054,
+        "duration": 2.5,
+        "sleep_type": "deep"
+      },
+      {
+        "start_time": 1790026204,
+        "duration": 3.0,
+        "sleep_type": "awake"
+      },
+      {
+        "start_time": 1790026895,
+        "duration": 18.02,
+        "sleep_type": "rem"
+      },
+      {
+        "start_time": 1790031252,
+        "duration": 31.53,
+        "sleep_type": "rem"
+      },
+      {
+        "start_time": 1790033145,
+        "duration": 1.0,
+        "sleep_type": "awake"
+      },
+      {
+        "start_time": 1790034346,
+        "duration": 2.0,
+        "sleep_type": "awake"
+      },
+      {
+        "start_time": 1790036359,
+        "duration": 40.05,
+        "sleep_type": "rem"
+      },
+      {
+        "start_time": 1790040746,
+        "duration": 27.53,
+        "sleep_type": "rem"
+      },
+      {
+        "start_time": 1790042399,
+        "duration": 3.0,
+        "sleep_type": "awake"
+      },
+      {
+        "start_time": 1790046334,
+        "duration": 9.5,
+        "sleep_type": "rem"
+      }
+    ]
+  }
+}

@@ -19,7 +19,6 @@ class BaseResponse(BaseModel):
 # -------------------------- 子模型定义（对应data下一级字段的嵌套结构） --------------------------
 # 播放统计（behaviors.plays → mindora_record）支持的内容 cmd 前缀：
 # 引导式场景 SOP（sleep.scene.）+ 纯音乐（sleep.pure_music.；裸 pure_music. 兼容端上早期上报）。
-# 推荐侧（llm/reco.py）仍只推引导式场景，不受此影响。
 SCENE_CMD_PREFIXES = ("sleep.scene.", "sleep.pure_music.", "pure_music.")
 
 def short_scene_id(scene_id: str) -> str:
