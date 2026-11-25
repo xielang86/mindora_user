@@ -11,11 +11,17 @@ UNIT_PATH=/etc/systemd/system/mindora-user.service
 PUBLIC_KEY_SOURCE="$SOURCE_DIR/jwt_public.pem"
 CHECK_ONLY=0
 LOCAL_MODE=0
+UPDATE_MODE=0
+CUSTOM_KEY=0
+SERVICE=mindora-user.service
 HOSTS=()
 
 usage() {
   echo "Usage: bash $0 --hosts IP1,IP2 [--public-key PATH] [--check]" >&2
   echo "       sudo bash $0 --local [--public-key PATH] [--check]" >&2
+  echo "       bash $0 --update --hosts IP1,IP2 [--check]" >&2
+  echo "       sudo bash $0 --update --local [--check]" >&2
+  echo "Update mode uses the existing installation. --update --check previews changes without applying them." >&2
 }
 
 while (($#)); do
@@ -23,6 +29,7 @@ while (($#)); do
     --public-key)
       (($# >= 2)) || { usage; exit 2; }
       PUBLIC_KEY_SOURCE=$2
+      CUSTOM_KEY=1
       shift 2
       ;;
     --hosts)
@@ -32,6 +39,7 @@ while (($#)); do
       shift 2
       ;;
     --local) LOCAL_MODE=1; shift ;;
+    --update) UPDATE_MODE=1; shift ;;
     --check) CHECK_ONLY=1; shift ;;
     -h|--help) usage; exit 0 ;;
     -*) usage; exit 2 ;;
@@ -43,9 +51,95 @@ if ((LOCAL_MODE)) && ((${#HOSTS[@]})); then
   echo '--local cannot be combined with target hosts.' >&2
   exit 2
 fi
-if ((!LOCAL_MODE)) && ((${#HOSTS[@]} == 0)) && ((!CHECK_ONLY)); then
+if ((!LOCAL_MODE)) && ((${#HOSTS[@]} == 0)) && ((!CHECK_ONLY || UPDATE_MODE)); then
   usage
   exit 2
+fi
+
+env_value() {
+  local name=$1 unit_file=${2:-"$SOURCE_DIR/systemd/$SERVICE"} file value result=""
+  while IFS= read -r file; do
+    [[ -f "$file" ]] || continue
+    value="$(awk -F= -v key="$name" '$1 == key {print substr($0, index($0, "=") + 1)}' "$file" | tail -n 1)"
+    if awk -F= -v key="$name" '$1 == key {found=1} END {exit !found}' "$file"; then
+      value="${value#\"}"
+      value="${value%\"}"
+      result="$value"
+    fi
+  done < <(sed -n 's/^EnvironmentFile=//p' "$unit_file")
+  printf '%s' "$result"
+}
+
+check_release() {
+  (cd "$1" && RUN_DIR="$1" "$2" -BI - <<'PY'
+import json
+import sys
+from pathlib import Path
+
+sys.path.insert(0, ".")
+import user_server
+from content_tags import catalog_by_command
+from llm.reco import _load_sop_candidate_scenarios
+from sop_ranking import rank_sops, rules
+from user_profile import UserProfile
+
+candidate_data = json.loads(Path("data/reco_candidates.json").read_text(encoding="utf-8"))
+candidates = _load_sop_candidate_scenarios()
+if not isinstance(candidate_data, list) or not candidate_data:
+    raise SystemExit("Expected a nonempty recommendation candidate list.")
+if not rules()["version"] or not catalog_by_command() or not candidates:
+    raise SystemExit("Recommendation rules, catalog or candidates are empty.")
+rank_sops(UserProfile(), [item.stages[0].cmd_name for item in candidates])
+PY
+  )
+}
+
+wait_for_service() {
+  local port=$1
+  for _ in {1..15}; do
+    if systemctl is-active --quiet "$SERVICE" && "$VENV_DIR/bin/python" - "$port" <<'PY'
+import http.client
+import sys
+
+connection = http.client.HTTPConnection("127.0.0.1", int(sys.argv[1]), timeout=1)
+try:
+    connection.request("GET", "/user_profile")
+    if connection.getresponse().status != 405:
+        sys.exit(1)
+except (OSError, http.client.HTTPException):
+    sys.exit(1)
+finally:
+    connection.close()
+PY
+    then
+      echo "$SERVICE is active; code=$APP_DIR python=$VENV_DIR/bin/python"
+      return 0
+    fi
+    sleep 1
+  done
+  systemctl status "$SERVICE" --no-pager || true
+  journalctl -u "$SERVICE" -n 40 --no-pager || true
+  echo "$SERVICE did not become ready." >&2
+  return 1
+}
+
+lock_deployment() {
+  exec 9>/run/lock/mindora-user-deploy.lock
+  flock -n 9 || { echo 'Another user-server deployment is in progress.' >&2; return 1; }
+}
+
+if ((UPDATE_MODE)); then
+  if ((CUSTOM_KEY)); then
+    echo '--public-key is only supported for full deployment.' >&2
+    exit 2
+  fi
+  source "$SOURCE_DIR/deploy_user_server_update.sh"
+  if ((LOCAL_MODE)); then
+    update_local
+  else
+    update_hosts
+  fi
+  exit 0
 fi
 
 for path in user_server.py requirments.txt \
@@ -137,20 +231,7 @@ python3.12 -c 'import sys; assert sys.version_info[:2] == (3, 12), sys.version'
 ((EUID == 0)) || { echo 'Run this script with sudo/root.' >&2; exit 1; }
 command -v systemctl >/dev/null || { echo 'systemctl is required.' >&2; exit 1; }
 command -v tar >/dev/null || { echo 'tar is required.' >&2; exit 1; }
-
-env_value() {
-  local name=$1 file value result=""
-  while IFS= read -r file; do
-    [[ -f "$file" ]] || continue
-    value="$(awk -F= -v key="$name" '$1 == key {print substr($0, index($0, "=") + 1)}' "$file" | tail -n 1)"
-    if awk -F= -v key="$name" '$1 == key {found=1} END {exit !found}' "$file"; then
-      value="${value#\"}"
-      value="${value%\"}"
-      result="$value"
-    fi
-  done < <(sed -n 's/^EnvironmentFile=//p' "$SOURCE_DIR/systemd/mindora-user.service")
-  printf '%s' "$result"
-}
+lock_deployment
 
 install -d -m 0755 "$ENV_DIR" "$APP_DIR/data" "$APP_DIR/user_server_logs"
 if [[ ! -e "$ENV_DIR/mindora.env" ]]; then
@@ -227,17 +308,7 @@ else
   DEPLOY_SOURCE="$SOURCE_DIR"
 fi
 
-# Check lazy recommendation dependencies from the package before stopping the service.
-(cd "$DEPLOY_SOURCE" && RUN_DIR="$DEPLOY_SOURCE" "$VENV_DIR/bin/python" -B - <<'PY'
-import user_server
-from content_tags import catalog_by_command
-from llm.reco import _load_sop_candidate_scenarios
-from sop_ranking import rules
-
-if not rules()["version"] or not catalog_by_command() or not _load_sop_candidate_scenarios():
-    raise SystemExit("Recommendation rules, catalog or candidates are empty.")
-PY
-)
+check_release "$DEPLOY_SOURCE" "$VENV_DIR/bin/python"
 
 if systemctl is-active --quiet mindora-user.service; then
   systemctl stop mindora-user.service
@@ -249,37 +320,15 @@ if [[ -d "$APP_DIR/data/userprofile_level_db" ]]; then
 fi
 
 if [[ "$(readlink -f "$DEPLOY_SOURCE")" != "$(readlink -f "$APP_DIR")" ]]; then
-  cp -a "$DEPLOY_SOURCE/." "$APP_DIR/"
+  tar -C "$DEPLOY_SOURCE" --exclude='./data/popup_survey_config.json' --exclude='./user_server_logs' -cf - . |
+    tar -C "$APP_DIR" --no-same-owner -xf -
+  if [[ ! -e "$APP_DIR/data/popup_survey_config.json" && ! -L "$APP_DIR/data/popup_survey_config.json" ]]; then
+    install -m 0644 "$DEPLOY_SOURCE/data/popup_survey_config.json" "$APP_DIR/data/popup_survey_config.json"
+  fi
 fi
 install -m 0644 "$PUBLIC_KEY_SOURCE" "$ENV_DIR/jwt_public.pem"
 install -m 0644 "$APP_DIR/systemd/mindora-user.service" "$UNIT_PATH"
 systemctl daemon-reload
 systemctl enable --now mindora-user.service
 PORT="$(env_value USER_SERVER_PORT)"
-PORT="${PORT:-9001}"
-for _ in {1..15}; do
-  if systemctl is-active --quiet mindora-user.service; then
-    if "$VENV_DIR/bin/python" - "$PORT" <<'PY'
-import http.client
-import sys
-connection = http.client.HTTPConnection("127.0.0.1", int(sys.argv[1]), timeout=1)
-try:
-    connection.request("GET", "/user_profile")
-    if connection.getresponse().status != 405:
-        sys.exit(1)
-except (OSError, http.client.HTTPException):
-    sys.exit(1)
-finally:
-    connection.close()
-PY
-    then
-      echo "mindora-user.service is active; code=$APP_DIR python=$VENV_DIR/bin/python"
-      exit 0
-    fi
-  fi
-  sleep 1
-done
-systemctl status mindora-user.service --no-pager || true
-journalctl -u mindora-user.service -n 40 --no-pager || true
-echo 'mindora-user.service did not stay active.' >&2
-exit 1
+wait_for_service "${PORT:-9001}"
