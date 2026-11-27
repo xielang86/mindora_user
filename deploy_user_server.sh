@@ -13,6 +13,7 @@ CHECK_ONLY=0
 LOCAL_MODE=0
 UPDATE_MODE=0
 CUSTOM_KEY=0
+LOCAL_TARGET=0
 SERVICE=mindora-user.service
 HOSTS=()
 
@@ -20,6 +21,7 @@ usage() {
   echo "Usage: bash $0 --hosts IP1,IP2 [--public-key PATH] [--check]" >&2
   echo "       sudo bash $0 --local [--public-key PATH] [--check]" >&2
   echo "       bash $0 --update --hosts IP1,IP2 [--check]" >&2
+  echo "       sudo bash $0 --update --hosts localhost [--check]" >&2
   echo "       sudo bash $0 --update --local [--check]" >&2
   echo "Update mode uses the existing installation. --update --check previews changes without applying them." >&2
 }
@@ -55,6 +57,19 @@ if ((!LOCAL_MODE)) && ((${#HOSTS[@]} == 0)) && ((!CHECK_ONLY || UPDATE_MODE)); t
   usage
   exit 2
 fi
+
+remote_hosts=()
+for host in "${HOSTS[@]}"; do
+  case "$host" in
+    localhost|127.0.0.1|::1) LOCAL_TARGET=1 ;;
+    *) remote_hosts+=("$host") ;;
+  esac
+done
+if ((LOCAL_TARGET && !UPDATE_MODE)); then
+  echo 'Loopback targets require --update.' >&2
+  exit 2
+fi
+HOSTS=("${remote_hosts[@]}")
 
 env_value() {
   local name=$1 unit_file=${2:-"$SOURCE_DIR/systemd/$SERVICE"} file value result=""
@@ -95,9 +110,9 @@ PY
 }
 
 wait_for_service() {
-  local port=$1
+  local port=$1 python=${2:-"$VENV_DIR/bin/python"}
   for _ in {1..15}; do
-    if systemctl is-active --quiet "$SERVICE" && "$VENV_DIR/bin/python" - "$port" <<'PY'
+    if systemctl is-active --quiet "$SERVICE" && "$python" - "$port" <<'PY'
 import http.client
 import sys
 
@@ -112,7 +127,7 @@ finally:
     connection.close()
 PY
     then
-      echo "$SERVICE is active; code=$APP_DIR python=$VENV_DIR/bin/python"
+      echo "$SERVICE is active; code=$APP_DIR python=$python"
       return 0
     fi
     sleep 1
@@ -134,7 +149,7 @@ if ((UPDATE_MODE)); then
     exit 2
   fi
   source "$SOURCE_DIR/deploy_user_server_update.sh"
-  if ((LOCAL_MODE)); then
+  if ((LOCAL_MODE || (LOCAL_TARGET && ${#HOSTS[@]} == 0))); then
     update_local
   else
     update_hosts

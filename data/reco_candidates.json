@@ -211,10 +211,10 @@
   },
   {
     "scenario_id": null,
-    "scenario_name": "sleep.scene.bhutan_snow_peak_chant",
+    "scenario_name": "sleep.scene.bhutan_snowpeak_chant",
     "stages": [
       {
-        "cmd_name": "sleep.scene.bhutan_snow_peak_chant",
+        "cmd_name": "sleep.scene.bhutan_snowpeak_chant",
         "stage_name": null,
         "audio_file": null,
         "guide_file": null,
@@ -225,10 +225,10 @@
   },
   {
     "scenario_id": null,
-    "scenario_name": "sleep.scene.taupo_misty_valley",
+    "scenario_name": "sleep.scene.taupo_mist_valley",
     "stages": [
       {
-        "cmd_name": "sleep.scene.taupo_misty_valley",
+        "cmd_name": "sleep.scene.taupo_mist_valley",
         "stage_name": null,
         "audio_file": null,
         "guide_file": null,
@@ -239,10 +239,10 @@
   },
   {
     "scenario_id": null,
-    "scenario_name": "sleep.scene.golden_dune_mirage",
+    "scenario_name": "sleep.scene.golden_dunes_mirage",
     "stages": [
       {
-        "cmd_name": "sleep.scene.golden_dune_mirage",
+        "cmd_name": "sleep.scene.golden_dunes_mirage",
         "stage_name": null,
         "audio_file": null,
         "guide_file": null,
